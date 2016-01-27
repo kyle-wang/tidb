@@ -39,7 +39,7 @@ var (
 
 // Error codes.
 const (
-	CodeInvalidOperation terror.ErrCode = iota + 1
+	CodeInvalidOperation terror.ErrCode = 1
 )
 
 // Eval evaluates an expression to a value.
@@ -61,6 +61,7 @@ func EvalBool(ctx context.Context, expr ast.ExprNode) (bool, error) {
 	if val == nil {
 		return false, nil
 	}
+
 	i, err := types.ToBool(val)
 	if err != nil {
 		return false, errors.Trace(err)
@@ -75,7 +76,7 @@ func boolToInt64(v bool) int64 {
 	return int64(0)
 }
 
-// Evaluator is a ast Visitor that evaluates an expression.
+// Evaluator is an ast Visitor that evaluates an expression.
 type Evaluator struct {
 	ctx context.Context
 	err error
@@ -89,72 +90,72 @@ func (e *Evaluator) Enter(in ast.Node) (out ast.Node, skipChildren bool) {
 // Leave implements ast.Visitor interface.
 func (e *Evaluator) Leave(in ast.Node) (out ast.Node, ok bool) {
 	switch v := in.(type) {
-	case *ast.ValueExpr:
-		ok = true
+	case *ast.AggregateFuncExpr:
+		ok = e.aggregateFunc(v)
 	case *ast.BetweenExpr:
 		ok = e.between(v)
 	case *ast.BinaryOperationExpr:
 		ok = e.binaryOperation(v)
 	case *ast.CaseExpr:
 		ok = e.caseExpr(v)
-	case *ast.WhenClause:
-		ok = true
-	case *ast.SubqueryExpr:
-		ok = e.subquery(v)
-	case *ast.CompareSubqueryExpr:
-		ok = e.compareSubquery(v)
 	case *ast.ColumnName:
 		ok = true
 	case *ast.ColumnNameExpr:
 		ok = e.columnName(v)
+	case *ast.CompareSubqueryExpr:
+		ok = e.compareSubquery(v)
 	case *ast.DefaultExpr:
 		ok = e.defaultExpr(v)
 	case *ast.ExistsSubqueryExpr:
 		ok = e.existsSubquery(v)
-	case *ast.PatternInExpr:
-		ok = e.patternIn(v)
-	case *ast.IsNullExpr:
-		ok = e.isNull(v)
-	case *ast.IsTruthExpr:
-		ok = e.isTruth(v)
-	case *ast.PatternLikeExpr:
-		ok = e.patternLike(v)
-	case *ast.ParamMarkerExpr:
-		ok = e.paramMarker(v)
-	case *ast.ParenthesesExpr:
-		ok = e.parentheses(v)
-	case *ast.PositionExpr:
-		ok = e.position(v)
-	case *ast.PatternRegexpExpr:
-		ok = e.patternRegexp(v)
-	case *ast.RowExpr:
-		ok = e.row(v)
-	case *ast.UnaryOperationExpr:
-		ok = e.unaryOperation(v)
-	case *ast.ValuesExpr:
-		ok = e.values(v)
-	case *ast.VariableExpr:
-		ok = e.variable(v)
 	case *ast.FuncCallExpr:
 		ok = e.funcCall(v)
-	case *ast.FuncExtractExpr:
-		ok = e.funcExtract(v)
-	case *ast.FuncConvertExpr:
-		ok = e.funcConvert(v)
 	case *ast.FuncCastExpr:
 		ok = e.funcCast(v)
+	case *ast.FuncConvertExpr:
+		ok = e.funcConvert(v)
+	case *ast.FuncDateArithExpr:
+		ok = e.funcDateArith(v)
+	case *ast.FuncExtractExpr:
+		ok = e.funcExtract(v)
+	case *ast.FuncLocateExpr:
+		ok = e.funcLocate(v)
 	case *ast.FuncSubstringExpr:
 		ok = e.funcSubstring(v)
 	case *ast.FuncSubstringIndexExpr:
 		ok = e.funcSubstringIndex(v)
-	case *ast.FuncLocateExpr:
-		ok = e.funcLocate(v)
 	case *ast.FuncTrimExpr:
 		ok = e.funcTrim(v)
-	case *ast.FuncDateArithExpr:
-		ok = e.funcDateArith(v)
-	case *ast.AggregateFuncExpr:
-		ok = e.aggregateFunc(v)
+	case *ast.IsNullExpr:
+		ok = e.isNull(v)
+	case *ast.IsTruthExpr:
+		ok = e.isTruth(v)
+	case *ast.ParamMarkerExpr:
+		ok = e.paramMarker(v)
+	case *ast.ParenthesesExpr:
+		ok = e.parentheses(v)
+	case *ast.PatternInExpr:
+		ok = e.patternIn(v)
+	case *ast.PatternLikeExpr:
+		ok = e.patternLike(v)
+	case *ast.PatternRegexpExpr:
+		ok = e.patternRegexp(v)
+	case *ast.PositionExpr:
+		ok = e.position(v)
+	case *ast.RowExpr:
+		ok = e.row(v)
+	case *ast.SubqueryExpr:
+		ok = e.subquery(v)
+	case *ast.UnaryOperationExpr:
+		ok = e.unaryOperation(v)
+	case *ast.ValueExpr:
+		ok = true
+	case *ast.ValuesExpr:
+		ok = e.values(v)
+	case *ast.VariableExpr:
+		ok = e.variable(v)
+	case *ast.WhenClause:
+		ok = true
 	}
 	out = in
 	return
@@ -193,7 +194,7 @@ func (e *Evaluator) caseExpr(v *ast.CaseExpr) bool {
 		for _, val := range v.WhenClauses {
 			cmp, err := types.Compare(target, val.Expr.GetValue())
 			if err != nil {
-				e.err = err
+				e.err = errors.Trace(err)
 				return false
 			}
 			if cmp == 0 {
@@ -204,6 +205,8 @@ func (e *Evaluator) caseExpr(v *ast.CaseExpr) bool {
 	}
 	if v.ElseClause != nil {
 		v.SetValue(v.ElseClause.GetValue())
+	} else {
+		v.SetValue(nil)
 	}
 	return true
 }
@@ -239,7 +242,7 @@ func (e *Evaluator) checkInList(not bool, in interface{}, list []interface{}) (i
 
 		r, err := types.Compare(in, v)
 		if err != nil {
-			return nil, err
+			return nil, errors.Trace(err)
 		}
 
 		if r == 0 {
@@ -270,7 +273,7 @@ func (e *Evaluator) patternIn(n *ast.PatternInExpr) bool {
 		}
 		r, err := types.Compare(n.Expr.GetValue(), v.GetValue())
 		if err != nil {
-			e.err = err
+			e.err = errors.Trace(err)
 			return false
 		}
 		if r == 0 {
@@ -306,7 +309,7 @@ func (e *Evaluator) isTruth(v *ast.IsTruthExpr) bool {
 	if !types.IsNil(val) {
 		ival, err := types.ToBool(val)
 		if err != nil {
-			e.err = err
+			e.err = errors.Trace(err)
 			return false
 		}
 		if ival == v.True {
@@ -359,7 +362,7 @@ func (e *Evaluator) unaryOperation(u *ast.UnaryOperationExpr) bool {
 	case opcode.Not:
 		n, err := types.ToBool(a)
 		if err != nil {
-			e.err = err
+			e.err = errors.Trace(err)
 		} else if n == 0 {
 			u.SetValue(int64(1))
 		} else {
@@ -369,7 +372,7 @@ func (e *Evaluator) unaryOperation(u *ast.UnaryOperationExpr) bool {
 		// for bit operation, we will use int64 first, then return uint64
 		n, err := types.ToInt64(a)
 		if err != nil {
-			e.err = err
+			e.err = errors.Trace(err)
 			return false
 		}
 		u.SetValue(uint64(^n))
@@ -462,14 +465,14 @@ func (e *Evaluator) unaryOperation(u *ast.UnaryOperationExpr) bool {
 			u.SetValue(mysql.ZeroDecimal.Sub(x.ToNumber()))
 		case string:
 			f, err := types.StrToFloat(x)
-			e.err = err
+			e.err = errors.Trace(err)
 			u.SetValue(-f)
 		case mysql.Decimal:
 			f, _ := x.Float64()
 			u.SetValue(mysql.NewDecimalFromFloat(-f))
 		case []byte:
 			f, err := types.StrToFloat(string(x))
-			e.err = err
+			e.err = errors.Trace(err)
 			u.SetValue(-f)
 		case mysql.Hex:
 			u.SetValue(-x.ToNumber())
@@ -951,5 +954,46 @@ func parseDayInterval(value interface{}) (int64, error) {
 }
 
 func (e *Evaluator) aggregateFunc(v *ast.AggregateFuncExpr) bool {
-	return true
+	name := strings.ToLower(v.F)
+	switch name {
+	case ast.AggFuncAvg:
+		e.evalAggAvg(v)
+	case ast.AggFuncCount:
+		e.evalAggCount(v)
+	case ast.AggFuncFirstRow, ast.AggFuncMax, ast.AggFuncMin, ast.AggFuncSum:
+		e.evalAggSetValue(v)
+	case ast.AggFuncGroupConcat:
+		e.evalAggGroupConcat(v)
+	}
+	return e.err == nil
+}
+
+func (e *Evaluator) evalAggCount(v *ast.AggregateFuncExpr) {
+	ctx := v.GetContext()
+	v.SetValue(ctx.Count)
+}
+
+func (e *Evaluator) evalAggSetValue(v *ast.AggregateFuncExpr) {
+	ctx := v.GetContext()
+	v.SetValue(ctx.Value)
+}
+
+func (e *Evaluator) evalAggAvg(v *ast.AggregateFuncExpr) {
+	ctx := v.GetContext()
+	switch x := ctx.Value.(type) {
+	case float64:
+		ctx.Value = x / float64(ctx.Count)
+	case mysql.Decimal:
+		ctx.Value = x.Div(mysql.NewDecimalFromUint(uint64(ctx.Count), 0))
+	}
+	v.SetValue(ctx.Value)
+}
+
+func (e *Evaluator) evalAggGroupConcat(v *ast.AggregateFuncExpr) {
+	ctx := v.GetContext()
+	if ctx.Buffer != nil {
+		v.SetValue(ctx.Buffer.String())
+	} else {
+		v.SetValue(nil)
+	}
 }

@@ -15,8 +15,10 @@ package plan
 
 import (
 	"fmt"
+	"math"
 	"sort"
 
+	"github.com/juju/errors"
 	"github.com/pingcap/tidb/ast"
 	"github.com/pingcap/tidb/parser/opcode"
 	"github.com/pingcap/tidb/util/types"
@@ -161,6 +163,9 @@ func (r *rangeBuilder) buildFromBinop(x *ast.BinaryOperationExpr) []rangePoint {
 		value = x.R.GetValue()
 		op = x.Op
 	}
+	if value == nil {
+		return nil
+	}
 	switch op {
 	case opcode.EQ:
 		startPoint := rangePoint{value: value, start: true}
@@ -208,7 +213,31 @@ func (r *rangeBuilder) buildFromIn(x *ast.PatternInExpr) []rangePoint {
 	if sorter.err != nil {
 		r.err = sorter.err
 	}
-	return rangePoints
+	// check duplicates
+	hasDuplicate := false
+	isStart := false
+	for _, v := range rangePoints {
+		if isStart == v.start {
+			hasDuplicate = true
+			break
+		}
+		isStart = v.start
+	}
+	if !hasDuplicate {
+		return rangePoints
+	}
+	// remove duplicates
+	distinctRangePoints := make([]rangePoint, 0, len(rangePoints))
+	isStart = false
+	for i := 0; i < len(rangePoints); i++ {
+		current := rangePoints[i]
+		if isStart == current.start {
+			continue
+		}
+		distinctRangePoints = append(distinctRangePoints, current)
+		isStart = current.start
+	}
+	return distinctRangePoints
 }
 
 func (r *rangeBuilder) buildFromBetween(x *ast.BetweenExpr) []rangePoint {
@@ -270,7 +299,11 @@ func (r *rangeBuilder) buildFromPatternLike(x *ast.PatternLikeExpr) []rangePoint
 		r.err = ErrUnsupportedType.Gen("NOT LIKE is not supported.")
 		return fullRange
 	}
-	pattern := x.Pattern.GetValue().(string)
+	pattern, err := types.ToString(x.Pattern.GetValue())
+	if err != nil {
+		r.err = errors.Trace(err)
+		return fullRange
+	}
 	lowValue := make([]byte, 0, len(pattern))
 	// unscape the pattern
 	var exclude bool
@@ -424,4 +457,51 @@ func (r *rangeBuilder) appendIndexRange(origin *IndexRange, rangePoints []rangeP
 		newRanges = append(newRanges, ir)
 	}
 	return newRanges
+}
+
+func (r *rangeBuilder) buildTableRanges(rangePoints []rangePoint) []TableRange {
+	tableRanges := make([]TableRange, 0, len(rangePoints)/2)
+	for i := 0; i < len(rangePoints); i += 2 {
+		startPoint := rangePoints[i]
+		if startPoint.value == nil || startPoint.value == MinNotNullVal {
+			startPoint.value = math.MinInt64
+		}
+		startInt, err := types.ToInt64(startPoint.value)
+		if err != nil {
+			r.err = errors.Trace(err)
+			return tableRanges
+		}
+		cmp, err := types.Compare(startInt, startPoint.value)
+		if err != nil {
+			r.err = errors.Trace(err)
+			return tableRanges
+		}
+		if cmp < 0 || (cmp == 0 && startPoint.excl) {
+			startInt++
+		}
+		endPoint := rangePoints[i+1]
+		if endPoint.value == nil {
+			endPoint.value = math.MinInt64
+		} else if endPoint.value == MaxVal {
+			endPoint.value = math.MaxInt64
+		}
+		endInt, err := types.ToInt64(endPoint.value)
+		if err != nil {
+			r.err = errors.Trace(err)
+			return tableRanges
+		}
+		cmp, err = types.Compare(endInt, endPoint.value)
+		if err != nil {
+			r.err = errors.Trace(err)
+			return tableRanges
+		}
+		if cmp > 0 || (cmp == 0 && endPoint.excl) {
+			endInt--
+		}
+		if startInt > endInt {
+			continue
+		}
+		tableRanges = append(tableRanges, TableRange{LowVal: startInt, HighVal: endInt})
+	}
+	return tableRanges
 }

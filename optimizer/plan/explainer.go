@@ -15,6 +15,7 @@ package plan
 
 import (
 	"fmt"
+	"math"
 	"strings"
 )
 
@@ -37,23 +38,31 @@ func (e *explainer) Enter(in Plan) (Plan, bool) {
 func (e *explainer) Leave(in Plan) (Plan, bool) {
 	var str string
 	switch x := in.(type) {
-	case *TableScan:
-		str = fmt.Sprintf("Table(%s)", x.Table.Name.L)
+	case *CheckTable:
+		str = "CheckTable"
 	case *IndexScan:
 		str = fmt.Sprintf("Index(%s.%s)", x.Table.Name.L, x.Index.Name.L)
-	case *Filter:
-		str = "Filter"
-	case *SelectFields:
-		str = "Fields"
-	case *Sort:
-		if x.Bypass {
-			return in, true
-		}
-		str = "Sort"
-	case *SelectLock:
-		str = "Lock"
 	case *Limit:
 		str = "Limit"
+	case *SelectFields:
+		str = "Fields"
+	case *SelectLock:
+		str = "Lock"
+	case *ShowDDL:
+		str = "ShowDDL"
+	case *Sort:
+		str = "Sort"
+	case *TableScan:
+		if len(x.Ranges) > 0 {
+			ran := x.Ranges[0]
+			if ran.LowVal != math.MinInt64 || ran.HighVal != math.MaxInt64 {
+				str = fmt.Sprintf("Range(%s)", x.Table.Name.L)
+			} else {
+				str = fmt.Sprintf("Table(%s)", x.Table.Name.L)
+			}
+		} else {
+			str = fmt.Sprintf("Table(%s)", x.Table.Name.L)
+		}
 	default:
 		e.err = ErrUnsupportedType.Gen("Unknown plan type %T", in)
 		return in, false

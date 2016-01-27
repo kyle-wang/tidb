@@ -14,6 +14,8 @@
 package executor
 
 import (
+	"math"
+
 	"github.com/pingcap/tidb/ast"
 	"github.com/pingcap/tidb/column"
 	"github.com/pingcap/tidb/context"
@@ -43,38 +45,79 @@ func (b *executorBuilder) build(p plan.Plan) Executor {
 	switch v := p.(type) {
 	case nil:
 		return nil
-	case *plan.TableScan:
-		return b.buildTableScan(v)
+	case *plan.Aggregate:
+		return b.buildAggregate(v)
+	case *plan.CheckTable:
+		return b.buildCheckTable(v)
+	case *plan.Deallocate:
+		return b.buildDeallocate(v)
+	case *plan.Execute:
+		return b.buildExecute(v)
+	case *plan.Having:
+		return b.buildHaving(v)
 	case *plan.IndexScan:
 		return b.buildIndexScan(v)
-	case *plan.Filter:
-		return b.buildFilter(v)
-	case *plan.SelectLock:
-		return b.buildSelectLock(v)
-	case *plan.SelectFields:
-		return b.buildSelectFields(v)
-	case *plan.Sort:
-		return b.buildSort(v)
 	case *plan.Limit:
 		return b.buildLimit(v)
 	case *plan.Prepare:
 		return b.buildPrepare(v)
-	case *plan.Execute:
-		return b.buildExecute(v)
-	case *plan.Deallocate:
-		return &DeallocateExec{ctx: b.ctx, Name: v.Name}
+	case *plan.SelectFields:
+		return b.buildSelectFields(v)
+	case *plan.SelectLock:
+		return b.buildSelectLock(v)
+	case *plan.ShowDDL:
+		return b.buildShowDDL(v)
+	case *plan.Sort:
+		return b.buildSort(v)
+	case *plan.TableScan:
+		return b.buildTableScan(v)
 	default:
 		b.err = ErrUnknownPlan.Gen("Unknown Plan %T", p)
 		return nil
 	}
 }
 
+func (b *executorBuilder) buildFilter(src Executor, conditions []ast.ExprNode) Executor {
+	if len(conditions) == 0 {
+		return src
+	}
+	return &FilterExec{
+		Src:       src,
+		Condition: b.joinConditions(conditions),
+		ctx:       b.ctx,
+	}
+}
+
 func (b *executorBuilder) buildTableScan(v *plan.TableScan) Executor {
 	table, _ := b.is.TableByID(v.Table.ID)
-	return &TableScanExec{
-		t:      table,
+	e := &TableScanExec{
+		t:          table,
+		fields:     v.Fields(),
+		ctx:        b.ctx,
+		ranges:     v.Ranges,
+		seekHandle: math.MinInt64,
+	}
+	return b.buildFilter(e, v.FilterConditions)
+}
+
+func (b *executorBuilder) buildShowDDL(v *plan.ShowDDL) Executor {
+	return &ShowDDLExec{
 		fields: v.Fields(),
 		ctx:    b.ctx,
+	}
+}
+
+func (b *executorBuilder) buildCheckTable(v *plan.CheckTable) Executor {
+	return &CheckTableExec{
+		tables: v.Tables,
+		ctx:    b.ctx,
+	}
+}
+
+func (b *executorBuilder) buildDeallocate(v *plan.Deallocate) Executor {
+	return &DeallocateExec{
+		ctx:  b.ctx,
+		Name: v.Name,
 	}
 }
 
@@ -105,7 +148,7 @@ func (b *executorBuilder) buildIndexScan(v *plan.IndexScan) Executor {
 	for i, val := range v.Ranges {
 		e.Ranges[i] = b.buildIndexRange(e, val)
 	}
-	return e
+	return b.buildFilter(e, v.FilterConditions)
 }
 
 func (b *executorBuilder) buildIndexRange(scan *IndexScanExec, v *plan.IndexRange) *IndexRangeExec {
@@ -129,16 +172,6 @@ func (b *executorBuilder) joinConditions(conditions []ast.ExprNode) ast.ExprNode
 		R:  b.joinConditions(conditions[1:]),
 	}
 	return condition
-}
-
-func (b *executorBuilder) buildFilter(v *plan.Filter) Executor {
-	src := b.build(v.Src())
-	e := &FilterExec{
-		Src:       src,
-		Condition: b.joinConditions(v.Conditions),
-		ctx:       b.ctx,
-	}
-	return e
 }
 
 func (b *executorBuilder) buildSelectLock(v *plan.SelectLock) Executor {
@@ -168,11 +201,25 @@ func (b *executorBuilder) buildSelectFields(v *plan.SelectFields) Executor {
 	return e
 }
 
+func (b *executorBuilder) buildAggregate(v *plan.Aggregate) Executor {
+	src := b.build(v.Src())
+	e := &AggregateExec{
+		Src:          src,
+		ResultFields: v.Fields(),
+		ctx:          b.ctx,
+		AggFuncs:     v.AggFuncs,
+		GroupByItems: v.GroupByItems,
+	}
+	return e
+}
+
+func (b *executorBuilder) buildHaving(v *plan.Having) Executor {
+	src := b.build(v.Src())
+	return b.buildFilter(src, v.Conditions)
+}
+
 func (b *executorBuilder) buildSort(v *plan.Sort) Executor {
 	src := b.build(v.Src())
-	if v.Bypass && !v.ByItems[0].Desc {
-		return src
-	}
 	e := &SortExec{
 		Src:     src,
 		ByItems: v.ByItems,

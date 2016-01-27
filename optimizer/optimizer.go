@@ -22,52 +22,40 @@ import (
 	"github.com/pingcap/tidb/infoschema"
 	"github.com/pingcap/tidb/mysql"
 	"github.com/pingcap/tidb/optimizer/plan"
+	"github.com/pingcap/tidb/perfschema"
 	"github.com/pingcap/tidb/terror"
 )
 
-// Optimize do optimization and create a Plan.
+// Optimize does optimization and creates a Plan.
 // The node must be prepared first.
 func Optimize(ctx context.Context, node ast.Node) (plan.Plan, error) {
-	// We have to inter type again because after parameter is set, the expression type may change.
+	// We have to infer type again because after parameter is set, the expression type may change.
 	if err := InferType(node); err != nil {
 		return nil, errors.Trace(err)
 	}
-	if err := preEvaluate(ctx, node); err != nil {
+	if err := logicOptimize(ctx, node); err != nil {
 		return nil, errors.Trace(err)
 	}
 	p, err := plan.BuildPlan(node)
 	if err != nil {
 		return nil, errors.Trace(err)
 	}
-	bestCost := plan.EstimateCost(p)
-	bestPlan := p
-
-	alts, err := plan.Alternatives(p)
+	err = plan.Refine(p)
 	if err != nil {
 		return nil, errors.Trace(err)
 	}
-	for _, alt := range alts {
-		cost := plan.EstimateCost(alt)
-		if cost < bestCost {
-			bestCost = cost
-			bestPlan = alt
-		}
-	}
-	return bestPlan, nil
+	return p, nil
 }
 
 // Prepare prepares a raw statement parsed from parser.
-// The statement must be prepared before it can be passed to optimize function
-// We pass InfoSchema instead of get from Context in case it is changed after resolving name.
+// The statement must be prepared before it can be passed to optimize function.
+// We pass InfoSchema instead of getting from Context in case it is changed after resolving name.
 func Prepare(is infoschema.InfoSchema, ctx context.Context, node ast.Node) error {
 	if err := Validate(node, true); err != nil {
 		return errors.Trace(err)
 	}
 	ast.SetFlag(node)
-	if err := ResolveName(node, is, ctx); err != nil {
-		return errors.Trace(err)
-	}
-	if err := InferType(node); err != nil {
+	if err := Preprocess(node, is, ctx); err != nil {
 		return errors.Trace(err)
 	}
 	return nil
@@ -78,11 +66,10 @@ type supportChecker struct {
 }
 
 func (c *supportChecker) Enter(in ast.Node) (ast.Node, bool) {
-	switch in.(type) {
-	case *ast.SubqueryExpr, *ast.AggregateFuncExpr, *ast.GroupByClause, *ast.HavingClause:
+	switch x := in.(type) {
+	case *ast.SubqueryExpr:
 		c.unsupported = true
 	case *ast.Join:
-		x := in.(*ast.Join)
 		if x.Right != nil {
 			c.unsupported = true
 		} else {
@@ -95,11 +82,12 @@ func (c *supportChecker) Enter(in ast.Node) (ast.Node, bool) {
 					c.unsupported = true
 				} else if strings.EqualFold(tn.Schema.O, infoschema.Name) {
 					c.unsupported = true
+				} else if strings.EqualFold(tn.Schema.O, perfschema.Name) {
+					c.unsupported = true
 				}
 			}
 		}
 	case *ast.SelectStmt:
-		x := in.(*ast.SelectStmt)
 		if x.Distinct {
 			c.unsupported = true
 		}
@@ -116,7 +104,8 @@ func (c *supportChecker) Leave(in ast.Node) (ast.Node, bool) {
 // TODO: 1. insert/update/delete. 2. join tables. 3. subquery. 4. group by and aggregate function.
 func IsSupported(node ast.Node) bool {
 	switch node.(type) {
-	case *ast.SelectStmt, *ast.PrepareStmt, *ast.ExecuteStmt, *ast.DeallocateStmt:
+	case *ast.SelectStmt, *ast.PrepareStmt, *ast.ExecuteStmt, *ast.DeallocateStmt,
+		*ast.AdminStmt:
 	default:
 		return false
 	}
@@ -128,25 +117,31 @@ func IsSupported(node ast.Node) bool {
 
 // Optimizer error codes.
 const (
-	CodeOneColumn     terror.ErrCode = 1
-	CodeSameColumns                  = 2
-	CodeMultiWildCard                = 3
-	CodeUnsupported                  = 4
+	CodeOneColumn           terror.ErrCode = 1
+	CodeSameColumns         terror.ErrCode = 2
+	CodeMultiWildCard       terror.ErrCode = 3
+	CodeUnsupported         terror.ErrCode = 4
+	CodeInvalidGroupFuncUse terror.ErrCode = 5
+	CodeIllegalReference    terror.ErrCode = 6
 )
 
 // Optimizer base errors.
 var (
-	ErrOneColumn     = terror.ClassOptimizer.New(CodeOneColumn, "Operand should contain 1 column(s)")
-	ErrSameColumns   = terror.ClassOptimizer.New(CodeSameColumns, "Operands should contain same columns")
-	ErrMultiWildCard = terror.ClassOptimizer.New(CodeMultiWildCard, "wildcard field exist more than once")
-	ErrUnSupported   = terror.ClassOptimizer.New(CodeUnsupported, "unsupported")
+	ErrOneColumn           = terror.ClassOptimizer.New(CodeOneColumn, "Operand should contain 1 column(s)")
+	ErrSameColumns         = terror.ClassOptimizer.New(CodeSameColumns, "Operands should contain same columns")
+	ErrMultiWildCard       = terror.ClassOptimizer.New(CodeMultiWildCard, "wildcard field exist more than once")
+	ErrUnSupported         = terror.ClassOptimizer.New(CodeUnsupported, "unsupported")
+	ErrInvalidGroupFuncUse = terror.ClassOptimizer.New(CodeInvalidGroupFuncUse, "Invalid use of group function")
+	ErrIllegalReference    = terror.ClassOptimizer.New(CodeIllegalReference, "Illegal reference")
 )
 
 func init() {
 	mySQLErrCodes := map[terror.ErrCode]uint16{
-		CodeOneColumn:     mysql.ErrOperandColumns,
-		CodeSameColumns:   mysql.ErrOperandColumns,
-		CodeMultiWildCard: mysql.ErrParse,
+		CodeOneColumn:           mysql.ErrOperandColumns,
+		CodeSameColumns:         mysql.ErrOperandColumns,
+		CodeMultiWildCard:       mysql.ErrParse,
+		CodeInvalidGroupFuncUse: mysql.ErrInvalidGroupFuncUse,
+		CodeIllegalReference:    mysql.ErrIllegalReference,
 	}
 	terror.ErrClassToMySQLCodes[terror.ClassOptimizer] = mySQLErrCodes
 }
