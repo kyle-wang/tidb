@@ -57,8 +57,11 @@ type ValueExpr struct {
 
 // NewValueExpr creates a ValueExpr with value, and sets default field type.
 func NewValueExpr(value interface{}) *ValueExpr {
+	if ve, ok := value.(*ValueExpr); ok {
+		return ve
+	}
 	ve := &ValueExpr{}
-	ve.Data = types.RawData(value)
+	ve.SetValue(value)
 	if _, ok := value.(UnquoteString); ok {
 		ve.Type = types.NewFieldType(mysql.TypeVarchar)
 		ve.Type.Charset = mysql.DefaultCharset
@@ -706,7 +709,7 @@ func (n *UnaryOperationExpr) Accept(v Visitor) (Node, bool) {
 type ValuesExpr struct {
 	exprNode
 	// model.CIStr is column name.
-	Column *ColumnName
+	Column *ColumnNameExpr
 }
 
 // Accept implements Node Accept interface.
@@ -720,7 +723,7 @@ func (n *ValuesExpr) Accept(v Visitor) (Node, bool) {
 	if !ok {
 		return n, false
 	}
-	n.Column = node.(*ColumnName)
+	n.Column = node.(*ColumnNameExpr)
 	return v.Leave(n)
 }
 

@@ -318,9 +318,7 @@ func (s *testPlanSuite) TestBestPlan(c *C) {
 		c.Assert(err, IsNil)
 
 		err = Refine(p)
-		explainStr, err := Explain(p)
-		c.Assert(err, IsNil)
-		c.Assert(explainStr, Equals, ca.best, Commentf("for %s cost %v", ca.sql, EstimateCost(p)))
+		c.Assert(ToString(p), Equals, ca.best, Commentf("for %s cost %v", ca.sql, EstimateCost(p)))
 	}
 }
 
@@ -570,6 +568,28 @@ func (s *testPlanSuite) TestJoinPath(c *C) {
 				on t1.i1 = 1 and t1.c1 = t2.i2`,
 			"InnerJoin{Index(t1.i1)->OuterJoin{InnerJoin{Index(t2.i2)->Index(t3.i3)}->Index(t4.i4)}}->Fields",
 		},
+		{
+			`select * from
+				t1 join (
+					t2 left join (
+						t3 join t4
+						on t3.i3 = t4.c4
+					)
+					on t2.i2 = t3.c3
+				)
+				on t1.i1 = t2.c2`,
+			"InnerJoin{OuterJoin{Table(t2)->InnerJoin{Table(t4)->Index(t3.i3)}}->Index(t1.i1)}->Fields",
+		},
+		{
+			`select * from
+				t1 join (
+					(t2 join t3
+						on t2.i2 = t3.i3
+					)
+				) on t1.i1 = t2.i2
+				where t1.i1 = 1`,
+			"InnerJoin{Index(t1.i1)->Index(t2.i2)->Index(t3.i3)}->Fields",
+		},
 	}
 	for _, ca := range cases {
 		comment := Commentf("for %s", ca.sql)
@@ -580,9 +600,7 @@ func (s *testPlanSuite) TestJoinPath(c *C) {
 		ast.SetFlag(stmt)
 		p, err := BuildPlan(stmt, nil)
 		c.Assert(err, IsNil)
-		expl, err := Explain(p)
-		c.Assert(err, IsNil)
-		c.Assert(expl, Equals, ca.explain, comment)
+		c.Assert(ToString(p), Equals, ca.explain, comment)
 	}
 }
 
@@ -612,4 +630,52 @@ func (s *testPlanSuite) TestMultiColumnIndex(c *C) {
 		c.Assert(idxScan.AccessEqualCount, Equals, ca.accessEqualCount)
 		c.Assert(idxScan.Ranges[0].LowVal, HasLen, ca.usedColumnCount)
 	}
+}
+
+func (s *testPlanSuite) TestVisitCount(c *C) {
+	sqls := []string{
+		"select t1.c1, t2.c2 from t1, t2",
+		"select * from t1 left join t2 on t1.c1 = t2.c1",
+		"select * from t1 group by t1.c1 having sum(t1.c2) = 1",
+		"select * from t1 where t1.c1 > 2 order by t1.c2 limit 100",
+		"insert t1 values (1), (2)",
+		"delete from t1 where false",
+		"truncate table t1",
+		"do 1",
+		"show databases",
+	}
+	for _, sql := range sqls {
+		stmt, err := parser.ParseOneStmt(sql, "", "")
+		c.Assert(err, IsNil, Commentf(sql))
+		ast.SetFlag(stmt)
+		mockJoinResolve(c, stmt)
+		b := &planBuilder{}
+		p := b.build(stmt)
+		c.Assert(b.err, IsNil)
+		visitor := &countVisitor{}
+		for i := 0; i < 5; i++ {
+			visitor.skipAt = i
+			visitor.enterCount = 0
+			visitor.leaveCount = 0
+			p.Accept(visitor)
+			c.Assert(visitor.enterCount, Equals, visitor.leaveCount, Commentf(sql))
+		}
+	}
+}
+
+type countVisitor struct {
+	skipAt     int
+	enterCount int
+	leaveCount int
+}
+
+func (s *countVisitor) Enter(in Plan) (Plan, bool) {
+	skip := s.skipAt == s.enterCount
+	s.enterCount++
+	return in, skip
+}
+
+func (s *countVisitor) Leave(in Plan) (Plan, bool) {
+	s.leaveCount++
+	return in, true
 }

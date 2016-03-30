@@ -16,6 +16,10 @@
 			"Rev": "3dd7008ac1529aca1bcd8a9db75228a71ba23cac"
 		},
 		{
+			"ImportPath": "github.com/golang/protobuf/proto",
+			"Rev": "c75fbf01dc6cb73649c4cd4326182c3e44aa9dbb"
+		},
+		{
 			"ImportPath": "github.com/golang/snappy",
 			"Rev": "723cc1e459b8eea2dea4583200fd60757d40097a"
 		},
@@ -34,6 +38,10 @@
 		{
 			"ImportPath": "github.com/peterh/liner",
 			"Rev": "1bb0d1c1a25ed393d8feb09bab039b2b1b1fbced"
+		},
+		{
+			"ImportPath": "github.com/petar/GoLLRB/llrb",
+			"Rev": "53be0d36a84c2a886ca057d34b6aa4468df9ccb4"
 		},
 		{
 			"ImportPath": "github.com/pingcap/check",

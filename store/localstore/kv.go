@@ -142,7 +142,7 @@ func (s *dbStore) scheduler() {
 		go s.seekWorker(wgSeekWorkers, seekCh)
 	}
 
-	segmentIndex := 0
+	segmentIndex := int64(0)
 
 	tick := time.NewTicker(time.Second)
 	defer tick.Stop()
@@ -174,7 +174,7 @@ func (s *dbStore) scheduler() {
 	}
 }
 
-func (s *dbStore) cleanRecentUpdates(segmentIndex int) {
+func (s *dbStore) cleanRecentUpdates(segmentIndex int64) {
 	m, err := s.recentUpdates.GetSegment(segmentIndex)
 	if err != nil {
 		log.Error(err)
@@ -283,6 +283,8 @@ type dbStore struct {
 
 	mu     sync.Mutex
 	closed bool
+
+	pd localPD
 }
 
 type storeCache struct {
@@ -354,8 +356,14 @@ func (d Driver) Open(path string) (kv.Storage, error) {
 	s.recentUpdates, err = segmentmap.NewSegmentMap(100)
 	if err != nil {
 		return nil, errors.Trace(err)
-
 	}
+	regionServers := buildLocalRegionServers(s)
+	var infos []*regionInfo
+	for _, rs := range regionServers {
+		ri := &regionInfo{startKey: rs.startKey, endKey: rs.endKey, rs: rs}
+		infos = append(infos, ri)
+	}
+	s.pd.SetRegionInfo(infos)
 	mc.cache[engineSchema] = s
 	s.compactor.Start()
 	s.wg.Add(1)

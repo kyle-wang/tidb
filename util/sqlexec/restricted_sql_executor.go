@@ -14,17 +14,9 @@
 package sqlexec
 
 import (
+	"github.com/pingcap/tidb/ast"
 	"github.com/pingcap/tidb/context"
-	"github.com/pingcap/tidb/rset"
 )
-
-// RestrictedSQLExecutorKeyType is a dummy type to avoid naming collision in session.
-type RestrictedSQLExecutorKeyType struct{}
-
-// String implements Stringer interface.
-func (k *RestrictedSQLExecutorKeyType) String() string {
-	return "restricted_sql_executor"
-}
 
 // RestrictedSQLExecutor is an interface provides executing restricted sql statement.
 // Why we need this interface?
@@ -40,5 +32,5 @@ func (k *RestrictedSQLExecutorKeyType) String() string {
 // This is implemented in session.go.
 type RestrictedSQLExecutor interface {
 	// ExecRestrictedSQL run sql statement in ctx with some restriction.
-	ExecRestrictedSQL(ctx context.Context, sql string) (rset.Recordset, error)
+	ExecRestrictedSQL(ctx context.Context, sql string) (ast.RecordSet, error)
 }

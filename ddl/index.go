@@ -16,30 +16,28 @@ package ddl
 import (
 	"github.com/juju/errors"
 	"github.com/ngaut/log"
+	"github.com/pingcap/tidb/ast"
+	"github.com/pingcap/tidb/infoschema"
 	"github.com/pingcap/tidb/kv"
 	"github.com/pingcap/tidb/meta"
 	"github.com/pingcap/tidb/model"
 	"github.com/pingcap/tidb/mysql"
-	"github.com/pingcap/tidb/parser/coldef"
 	"github.com/pingcap/tidb/table"
 	"github.com/pingcap/tidb/table/tables"
 	"github.com/pingcap/tidb/terror"
 	"github.com/pingcap/tidb/util"
+	"github.com/pingcap/tidb/util/types"
 )
 
-func buildIndexInfo(tblInfo *model.TableInfo, unique bool, indexName model.CIStr, indexID int64, idxColNames []*coldef.IndexColName) (*model.IndexInfo, error) {
-	for _, col := range tblInfo.Columns {
-		if col.Name.L == indexName.L {
-			return nil, errors.Errorf("CREATE INDEX: index name collision with existing column: %s", indexName)
-		}
-	}
-
+func buildIndexInfo(tblInfo *model.TableInfo, unique bool, indexName model.CIStr, indexID int64,
+	idxColNames []*ast.IndexColName) (*model.IndexInfo, error) {
 	// build offsets
 	idxColumns := make([]*model.IndexColumn, 0, len(idxColNames))
 	for _, ic := range idxColNames {
-		col := findCol(tblInfo.Columns, ic.ColumnName)
+		col := findCol(tblInfo.Columns, ic.Column.Name.O)
 		if col == nil {
-			return nil, errors.Errorf("CREATE INDEX: column does not exist: %s", ic.ColumnName)
+			return nil, infoschema.ErrColumnNotExists.Gen("CREATE INDEX: column does not exist: %s",
+				ic.Column.Name.O)
 		}
 
 		idxColumns = append(idxColumns, &model.IndexColumn{
@@ -67,7 +65,6 @@ func addIndexColumnFlag(tblInfo *model.TableInfo, indexInfo *model.IndexInfo) {
 	} else {
 		tblInfo.Columns[col.Offset].Flag |= mysql.MultipleKeyFlag
 	}
-
 }
 
 func dropIndexColumnFlag(tblInfo *model.TableInfo, indexInfo *model.IndexInfo) {
@@ -104,7 +101,7 @@ func (d *ddl) onCreateIndex(t *meta.Meta, job *model.Job) error {
 		unique      bool
 		indexName   model.CIStr
 		indexID     int64
-		idxColNames []*coldef.IndexColName
+		idxColNames []*ast.IndexColName
 	)
 
 	err = job.DecodeArgs(&unique, &indexName, &indexID, &idxColNames)
@@ -119,7 +116,7 @@ func (d *ddl) onCreateIndex(t *meta.Meta, job *model.Job) error {
 			if idx.State == model.StatePublic {
 				// we already have a index with same index name
 				job.State = model.JobCancelled
-				return errors.Errorf("CREATE INDEX: index already exist %s", indexName)
+				return infoschema.ErrIndexExists.Gen("CREATE INDEX: index already exist %s", indexName)
 			}
 
 			indexInfo = idx
@@ -171,7 +168,7 @@ func (d *ddl) onCreateIndex(t *meta.Meta, job *model.Job) error {
 		}
 
 		var tbl table.Table
-		tbl, err = d.getTable(t, schemaID, tblInfo)
+		tbl, err = d.getTable(schemaID, tblInfo)
 		if err != nil {
 			return errors.Trace(err)
 		}
@@ -200,7 +197,7 @@ func (d *ddl) onCreateIndex(t *meta.Meta, job *model.Job) error {
 		job.State = model.JobDone
 		return nil
 	default:
-		return errors.Errorf("invalid index state %v", tblInfo.State)
+		return ErrInvalidIndexState.Gen("invalid index state %v", tblInfo.State)
 	}
 }
 
@@ -226,7 +223,7 @@ func (d *ddl) onDropIndex(t *meta.Meta, job *model.Job) error {
 
 	if indexInfo == nil {
 		job.State = model.JobCancelled
-		return errors.Errorf("index %s doesn't exist", indexName)
+		return ErrCantDropFieldOrKey.Gen("index %s doesn't exist", indexName)
 	}
 
 	_, err = t.GenSchemaVersion()
@@ -255,7 +252,7 @@ func (d *ddl) onDropIndex(t *meta.Meta, job *model.Job) error {
 		return errors.Trace(err)
 	case model.StateDeleteReorganization:
 		// reorganization -> absent
-		tbl, err := d.getTable(t, schemaID, tblInfo)
+		tbl, err := d.getTable(schemaID, tblInfo)
 		if err != nil {
 			return errors.Trace(err)
 		}
@@ -291,7 +288,7 @@ func (d *ddl) onDropIndex(t *meta.Meta, job *model.Job) error {
 		job.State = model.JobDone
 		return nil
 	default:
-		return errors.Errorf("invalid table state %v", tblInfo.State)
+		return ErrInvalidTableState.Gen("invalid table state %v", tblInfo.State)
 	}
 }
 
@@ -308,20 +305,18 @@ func checkRowExist(txn kv.Transaction, t table.Table, handle int64) (bool, error
 	return true, nil
 }
 
-func fetchRowColVals(txn kv.Transaction, t table.Table, handle int64, indexInfo *model.IndexInfo) ([]interface{}, error) {
+func fetchRowColVals(txn kv.Transaction, t table.Table, handle int64, indexInfo *model.IndexInfo) ([]types.Datum, error) {
 	// fetch datas
 	cols := t.Cols()
-	var vals []interface{}
+	vals := make([]types.Datum, 0, len(indexInfo.Columns))
 	for _, v := range indexInfo.Columns {
-		var val interface{}
-
 		col := cols[v.Offset]
 		k := t.RecordKey(handle, col)
 		data, err := txn.Get(k)
 		if err != nil {
 			return nil, errors.Trace(err)
 		}
-		val, err = t.DecodeValue(data, col)
+		val, err := tables.DecodeValue(data, &col.FieldType)
 		if err != nil {
 			return nil, errors.Trace(err)
 		}
@@ -436,7 +431,7 @@ func (d *ddl) backfillTableIndex(t table.Table, indexInfo *model.IndexInfo, hand
 				return nil
 			}
 
-			var vals []interface{}
+			var vals []types.Datum
 			vals, err = fetchRowColVals(txn, t, handle, indexInfo)
 			if err != nil {
 				return errors.Trace(err)

@@ -14,6 +14,7 @@
 package ast
 
 import (
+	"github.com/pingcap/tidb/model"
 	"github.com/pingcap/tidb/util/types"
 )
 
@@ -198,6 +199,30 @@ func (n *ColumnOption) Accept(v Visitor) (Node, bool) {
 	return v.Leave(n)
 }
 
+// IndexOption is the index options.
+//    KEY_BLOCK_SIZE [=] value
+//  | index_type
+//  | WITH PARSER parser_name
+//  | COMMENT 'string'
+// See: http://dev.mysql.com/doc/refman/5.7/en/create-table.html
+type IndexOption struct {
+	node
+
+	KeyBlockSize uint64
+	Tp           model.IndexType
+	Comment      string
+}
+
+// Accept implements Node Accept interface.
+func (n *IndexOption) Accept(v Visitor) (Node, bool) {
+	newNode, skipChildren := v.Enter(n)
+	if skipChildren {
+		return v.Leave(newNode)
+	}
+	n = newNode.(*IndexOption)
+	return v.Leave(n)
+}
+
 // ConstraintType is the type for Constraint.
 type ConstraintType int
 
@@ -226,6 +251,9 @@ type Constraint struct {
 
 	// Used for foreign key.
 	Refer *ReferenceDef
+
+	// Index Options
+	Option *IndexOption
 }
 
 // Accept implements Node Accept interface.
@@ -248,6 +276,13 @@ func (n *Constraint) Accept(v Visitor) (Node, bool) {
 			return n, false
 		}
 		n.Refer = node.(*ReferenceDef)
+	}
+	if n.Option != nil {
+		node, ok := n.Option.Accept(v)
+		if !ok {
+			return n, false
+		}
+		n.Option = node.(*IndexOption)
 	}
 	return v.Leave(n)
 }
@@ -428,6 +463,17 @@ const (
 	TableOptionMaxRows
 	TableOptionMinRows
 	TableOptionDelayKeyWrite
+	TableOptionRowFormat
+)
+
+// RowFormat types
+const (
+	RowFormatDefault uint64 = iota + 1
+	RowFormatDynamic
+	RowFormatFixed
+	RowFormatCompressed
+	RowFormatRedundant
+	RowFormatCompact
 )
 
 // TableOption is used for parsing table option from SQL.

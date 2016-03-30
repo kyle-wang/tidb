@@ -100,6 +100,8 @@ func (v *typeInferrer) Leave(in ast.Node) (out ast.Node, ok bool) {
 		v.unaryOperation(x)
 	case *ast.ValueExpr:
 		v.handleValueExpr(x)
+	case *ast.ValuesExpr:
+		v.handleValuesExpr(x)
 	case *ast.VariableExpr:
 		x.SetType(types.NewFieldType(mysql.TypeVarString))
 		x.Type.Charset = v.defaultCharset
@@ -230,6 +232,10 @@ func (v *typeInferrer) handleValueExpr(x *ast.ValueExpr) {
 	x.SetType(tp)
 }
 
+func (v *typeInferrer) handleValuesExpr(x *ast.ValuesExpr) {
+	x.SetType(x.Column.GetType())
+}
+
 func (v *typeInferrer) getFsp(x *ast.FuncCallExpr) int {
 	if len(x.Args) == 1 {
 		a := x.Args[0].GetValue()
@@ -257,19 +263,22 @@ func (v *typeInferrer) handleFuncCallExpr(x *ast.FuncCallExpr) {
 	case "curtime", "current_time":
 		tp = types.NewFieldType(mysql.TypeDuration)
 		tp.Decimal = v.getFsp(x)
-	case "current_timestamp":
+	case "current_timestamp", "date_arith":
 		tp = types.NewFieldType(mysql.TypeDatetime)
 	case "microsecond", "second", "minute", "hour", "day", "week", "month", "year",
 		"dayofweek", "dayofmonth", "dayofyear", "weekday", "weekofyear", "yearweek",
-		"found_rows", "length":
+		"found_rows", "length", "extract", "locate":
 		tp = types.NewFieldType(mysql.TypeLonglong)
 	case "now", "sysdate":
 		tp = types.NewFieldType(mysql.TypeDatetime)
 		tp.Decimal = v.getFsp(x)
 	case "dayname", "version", "database", "user", "current_user",
-		"concat", "concat_ws", "left", "lower", "repeat", "replace", "upper":
+		"concat", "concat_ws", "left", "lower", "repeat", "replace", "upper", "convert",
+		"substring", "substring_index", "trim":
 		tp = types.NewFieldType(mysql.TypeVarString)
 		chs = v.defaultCharset
+	case "strcmp":
+		tp = types.NewFieldType(mysql.TypeLonglong)
 	case "connection_id":
 		tp = types.NewFieldType(mysql.TypeLonglong)
 		tp.Flag |= mysql.UnsignedFlag
