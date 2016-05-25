@@ -14,11 +14,15 @@
 package variable
 
 import (
-	"github.com/juju/errors"
 	"github.com/pingcap/tidb/context"
+	"github.com/pingcap/tidb/terror"
 )
 
-// RetryInfo saves retry infomation.
+const codeCantGetValidID terror.ErrCode = 1
+
+var errCantGetValidID = terror.ClassVariable.New(codeCantGetValidID, "cannot get valid auto-increment id in retry")
+
+// RetryInfo saves retry information.
 type RetryInfo struct {
 	Retrying         bool
 	currRetryOff     int
@@ -46,7 +50,7 @@ func (r *RetryInfo) ResetOffset() {
 // GetCurrAutoIncrementID gets current AutoIncrementID.
 func (r *RetryInfo) GetCurrAutoIncrementID() (int64, error) {
 	if r.currRetryOff >= len(r.autoIncrementIDs) {
-		return 0, errors.New("cannot get valid auto-increment id in retry")
+		return 0, errCantGetValidID
 	}
 	id := r.autoIncrementIDs[r.currRetryOff]
 	r.currRetryOff++
@@ -66,7 +70,7 @@ type SessionVars struct {
 	// prepared statement auto increment id
 	preparedStmtID uint32
 
-	// retry infomation
+	// retry information
 	RetryInfo *RetryInfo
 
 	// following variables are special for current session

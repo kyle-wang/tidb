@@ -18,12 +18,12 @@ import (
 
 	"github.com/juju/errors"
 	"github.com/pingcap/tidb/ast"
-	"github.com/pingcap/tidb/column"
 	"github.com/pingcap/tidb/context"
 	"github.com/pingcap/tidb/infoschema"
 	"github.com/pingcap/tidb/model"
 	"github.com/pingcap/tidb/mysql"
 	"github.com/pingcap/tidb/sessionctx/db"
+	"github.com/pingcap/tidb/table"
 	"github.com/pingcap/tidb/util/types"
 )
 
@@ -34,6 +34,13 @@ func ResolveName(node ast.Node, info infoschema.InfoSchema, ctx context.Context)
 	resolver := nameResolver{Info: info, Ctx: ctx, DefaultSchema: model.NewCIStr(defaultSchema)}
 	node.Accept(&resolver)
 	return errors.Trace(resolver.Err)
+}
+
+// MockResolveName only serves for test.
+func MockResolveName(node ast.Node, info infoschema.InfoSchema, defaultSchema string) error {
+	resolver := nameResolver{Info: info, Ctx: nil, DefaultSchema: model.NewCIStr(defaultSchema)}
+	node.Accept(&resolver)
+	return resolver.Err
 }
 
 // nameResolver is the visitor to resolve table name and column name.
@@ -78,7 +85,7 @@ type resolverContext struct {
 	// When visiting TableRefs, tables in this context are not available
 	// because it is being collected.
 	inTableRefs bool
-	// When visiting on conditon only tables in current join node are available.
+	// When visiting on condition only tables in current join node are available.
 	inOnCondition bool
 	// When visiting field list, fieldList in this context are not available.
 	inFieldList bool
@@ -289,7 +296,7 @@ func (nr *nameResolver) Leave(inNode ast.Node) (node ast.Node, ok bool) {
 		if nr.useOuterContext {
 			// TODO: check this
 			// If there is a deep nest of subquery, there may be something wrong.
-			v.UseOuterContext = true
+			v.Correlated = true
 			nr.useOuterContext = false
 		}
 	case *ast.TruncateTableStmt:
@@ -609,6 +616,7 @@ func (nr *nameResolver) resolveColumnInTableSources(cn *ast.ColumnNameExpr, tabl
 	if matchedResultField != nil {
 		// Bind column.
 		cn.Refer = matchedResultField
+		matchedResultField.Referenced = true
 		return true
 	}
 	return false
@@ -638,6 +646,7 @@ func (nr *nameResolver) resolveColumnInResultFields(ctx *resolverContext, cn *as
 			if rf.Column.Name.L == "" {
 				// This is not a real table column, resolve it directly.
 				cn.Refer = rf
+				rf.Referenced = true
 				return true
 			}
 			if matched == nil {
@@ -664,6 +673,7 @@ func (nr *nameResolver) resolveColumnInResultFields(ctx *resolverContext, cn *as
 		}
 		// Bind column.
 		cn.Refer = matched
+		matched.Referenced = true
 		return true
 	}
 	return false
@@ -714,6 +724,7 @@ func (nr *nameResolver) createResultFields(field *ast.SelectField) (rfs []*ast.R
 
 		}
 		for _, trf := range tableRfs {
+			trf.Referenced = true
 			// Convert it to ColumnNameExpr
 			cn := &ast.ColumnName{
 				Schema: trf.DBName,
@@ -799,6 +810,7 @@ func (nr *nameResolver) handlePosition(pos *ast.PositionExpr) {
 	}
 	nf.Expr = expr
 	pos.Refer = &nf
+	pos.Refer.Referenced = true
 	if nr.currentContext().inGroupBy {
 		// make sure item is not aggregate function
 		if ast.HasAggFlag(pos.Refer.Expr) {
@@ -859,7 +871,7 @@ func (nr *nameResolver) fillShowFields(s *ast.ShowStmt) {
 			mysql.TypeDatetime, mysql.TypeDatetime, mysql.TypeDatetime, mysql.TypeVarchar, mysql.TypeVarchar,
 			mysql.TypeVarchar, mysql.TypeVarchar}
 	case ast.ShowColumns:
-		names = column.ColDescFieldNames(s.Full)
+		names = table.ColDescFieldNames(s.Full)
 	case ast.ShowWarnings:
 		names = []string{"Level", "Code", "Message"}
 		ftypes = []byte{mysql.TypeVarchar, mysql.TypeLong, mysql.TypeVarchar}

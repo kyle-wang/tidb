@@ -18,6 +18,7 @@ import (
 
 	. "github.com/pingcap/check"
 	"github.com/pingcap/tidb/store/localstore/engine"
+	"github.com/pingcap/tidb/util/testleak"
 )
 
 func TestT(t *testing.T) {
@@ -30,7 +31,7 @@ type testSuite struct {
 	db engine.DB
 }
 
-func (s *testSuite) SetUpSuite(c *C) {
+func (s *testSuite) SetUpTest(c *C) {
 	var (
 		d   MemoryDriver
 		err error
@@ -39,11 +40,12 @@ func (s *testSuite) SetUpSuite(c *C) {
 	c.Assert(err, IsNil)
 }
 
-func (s *testSuite) TearDownSuite(c *C) {
+func (s *testSuite) TearDownTest(c *C) {
 	s.db.Close()
 }
 
 func (s *testSuite) TestGetSet(c *C) {
+	defer testleak.AfterTest(c)()
 	db := s.db
 
 	b := db.NewBatch()
@@ -73,6 +75,7 @@ func (s *testSuite) TestGetSet(c *C) {
 }
 
 func (s *testSuite) TestSeek(c *C) {
+	defer testleak.AfterTest(c)()
 	b := s.db.NewBatch()
 	b.Put([]byte("a"), []byte("1"))
 	b.Put([]byte("b"), []byte("2"))
@@ -105,20 +108,41 @@ func (s *testSuite) TestSeek(c *C) {
 	c.Assert(v, IsNil)
 }
 
-func (s *testSuite) TestMultiSeek(c *C) {
+func (s *testSuite) TestPrevSeek(c *C) {
+	defer testleak.AfterTest(c)()
 	b := s.db.NewBatch()
-	b.Put([]byte("a"), []byte("1"))
-	b.Put([]byte("b"), []byte("2"))
+	b.Put([]byte("b"), []byte("1"))
+	b.Put([]byte("c"), []byte("2"))
 	err := s.db.Commit(b)
 	c.Assert(err, IsNil)
 
-	m := s.db.MultiSeek([][]byte{[]byte("z"), []byte("a"), []byte("a1")})
-	c.Assert(m, HasLen, 3)
-	c.Assert(m[0].Err, NotNil)
-	c.Assert(m[1].Err, IsNil)
-	c.Assert(m[1].Key, BytesEquals, []byte("a"))
-	c.Assert(m[1].Value, BytesEquals, []byte("1"))
-	c.Assert(m[2].Err, IsNil)
-	c.Assert(m[2].Key, BytesEquals, []byte("b"))
-	c.Assert(m[2].Value, BytesEquals, []byte("2"))
+	k, v, err := s.db.SeekReverse(nil)
+	c.Assert(err, IsNil)
+	c.Assert(k, BytesEquals, []byte("c"))
+	c.Assert(v, BytesEquals, []byte("2"))
+
+	k, v, err = s.db.SeekReverse([]byte("d"))
+	c.Assert(err, IsNil)
+	c.Assert(k, BytesEquals, []byte("c"))
+	c.Assert(v, BytesEquals, []byte("2"))
+
+	k, v, err = s.db.SeekReverse([]byte("c"))
+	c.Assert(err, IsNil)
+	c.Assert(k, BytesEquals, []byte("b"))
+	c.Assert(v, BytesEquals, []byte("1"))
+
+	k, v, err = s.db.SeekReverse([]byte("bb"))
+	c.Assert(err, IsNil)
+	c.Assert(k, BytesEquals, []byte("b"))
+	c.Assert(v, BytesEquals, []byte("1"))
+
+	k, v, err = s.db.SeekReverse([]byte("b"))
+	c.Assert(err, NotNil)
+	c.Assert(string(k), Equals, "")
+	c.Assert(string(v), Equals, "")
+
+	k, v, err = s.db.SeekReverse([]byte("a"))
+	c.Assert(err, NotNil)
+	c.Assert(k, IsNil)
+	c.Assert(v, IsNil)
 }

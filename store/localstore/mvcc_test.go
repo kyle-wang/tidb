@@ -29,9 +29,9 @@ type testMvccSuite struct {
 	s kv.Storage
 }
 
-func createMemStore() kv.Storage {
+func createMemStore(suffix int) kv.Storage {
 	// avoid cache
-	path := fmt.Sprintf("memory://%d", time.Now().UnixNano())
+	path := fmt.Sprintf("memory://%d", suffix)
 	d := Driver{
 		goleveldb.MemoryDriver{},
 	}
@@ -81,7 +81,7 @@ func (t *testMvccSuite) scanRawEngine(c *C, f func([]byte, []byte)) {
 
 func (t *testMvccSuite) SetUpTest(c *C) {
 	// create new store
-	t.s = createMemStore()
+	t.s = createMemStore(time.Now().Nanosecond())
 	t.addDirtyData()
 	// insert test data
 	txn, err := t.s.Begin()
@@ -132,7 +132,7 @@ func (t *testMvccSuite) TestMvccPutAndDel(c *C) {
 	})
 	txn, _ = t.s.Begin()
 	txn.Set(encodeInt(0), []byte("v"))
-	v, err = txn.Get(encodeInt(0))
+	_, err = txn.Get(encodeInt(0))
 	c.Assert(err, IsNil)
 	txn.Commit()
 
@@ -191,7 +191,7 @@ func (t *testMvccSuite) TestSnapshotGet(c *C) {
 	// Get version not exists
 	minVerSnapshot, err := t.s.GetSnapshot(kv.MinVersion)
 	c.Assert(err, IsNil)
-	b, err = minVerSnapshot.Get(testKey)
+	_, err = minVerSnapshot.Get(testKey)
 	c.Assert(err, NotNil)
 }
 
@@ -255,6 +255,64 @@ func (t *testMvccSuite) TestMvccSeek(c *C) {
 	c.Assert(v, BytesEquals, encodeInt(2))
 }
 
+func (t *testMvccSuite) TestReverseMvccSeek(c *C) {
+	s := t.getSnapshot(c, kv.MaxVersion)
+	k, v, err := s.reverseMvccSeek(encodeInt(1024))
+	c.Assert(err, IsNil)
+	c.Assert([]byte(k), BytesEquals, encodeInt(4))
+	c.Assert(v, BytesEquals, encodeInt(4))
+
+	k, v, err = s.reverseMvccSeek(encodeInt(0))
+	c.Assert(err, NotNil)
+
+	k, v, err = s.reverseMvccSeek(append(encodeInt(1), byte(0)))
+	c.Assert(err, IsNil)
+	c.Assert([]byte(k), BytesEquals, encodeInt(1))
+
+	s = t.getSnapshot(c, kv.Version{Ver: 1})
+	k, v, err = s.reverseMvccSeek(encodeInt(1024))
+	c.Assert(err, NotNil)
+
+	v0, err := globalVersionProvider.CurrentVersion()
+	c.Assert(err, IsNil)
+
+	txn, err := t.s.Begin()
+	c.Assert(err, IsNil)
+	err = txn.Set(encodeInt(3), encodeInt(1003))
+	c.Assert(err, IsNil)
+	err = txn.Commit()
+	c.Assert(err, IsNil)
+	v1, err := globalVersionProvider.CurrentVersion()
+	c.Assert(err, IsNil)
+
+	txn, err = t.s.Begin()
+	c.Assert(err, IsNil)
+	err = txn.Delete(encodeInt(4))
+	c.Assert(err, IsNil)
+	err = txn.Commit()
+	c.Assert(err, IsNil)
+	v2, err := globalVersionProvider.CurrentVersion()
+	c.Assert(err, IsNil)
+
+	s = t.getSnapshot(c, v2)
+	k, v, err = s.reverseMvccSeek(encodeInt(5))
+	c.Assert(err, IsNil)
+	c.Assert([]byte(k), BytesEquals, encodeInt(3))
+	c.Assert(v, BytesEquals, encodeInt(1003))
+
+	s = t.getSnapshot(c, v1)
+	k, v, err = s.reverseMvccSeek(encodeInt(5))
+	c.Assert(err, IsNil)
+	c.Assert([]byte(k), BytesEquals, encodeInt(4))
+	c.Assert(v, BytesEquals, encodeInt(4))
+
+	s = t.getSnapshot(c, v0)
+	k, v, err = s.reverseMvccSeek(encodeInt(4))
+	c.Assert(err, IsNil)
+	c.Assert([]byte(k), BytesEquals, encodeInt(3))
+	c.Assert(v, BytesEquals, encodeInt(3))
+}
+
 func (t *testMvccSuite) TestMvccSuiteGetLatest(c *C) {
 	// update some new data
 	for i := 0; i < 10; i++ {
@@ -295,7 +353,7 @@ func (t *testMvccSuite) TestMvccSuiteGetLatest(c *C) {
 }
 
 func (t *testMvccSuite) TestBufferedIterator(c *C) {
-	s := createMemStore()
+	s := createMemStore(time.Now().Nanosecond())
 	tx, _ := s.Begin()
 	tx.Set([]byte{0x0, 0x0}, []byte("1"))
 	tx.Set([]byte{0x0, 0xff}, []byte("2"))
@@ -334,6 +392,37 @@ func (t *testMvccSuite) TestBufferedIterator(c *C) {
 	c.Assert(err, IsNil)
 	c.Assert(it.Valid(), IsTrue)
 	c.Assert(it.Value(), DeepEquals, []byte("2"))
+	tx.Commit()
+
+	tx, _ = s.Begin()
+	iter, err = tx.SeekReverse(nil)
+	c.Assert(err, IsNil)
+	cnt = 0
+	for iter.Valid() {
+		err = iter.Next()
+		c.Assert(err, IsNil)
+		cnt++
+	}
+	tx.Commit()
+	c.Assert(cnt, Equals, 6)
+
+	tx, _ = s.Begin()
+	it, err = tx.SeekReverse([]byte{0xff, 0xff, 0xff})
+	c.Assert(err, IsNil)
+	c.Assert(it.Valid(), IsTrue)
+	c.Assert(string(it.Key()), Equals, "\xff\xff\xee\xff")
+	tx.Commit()
+
+	// no such key
+	tx, _ = s.Begin()
+	it, err = tx.SeekReverse([]byte{0x0, 0x0})
+	c.Assert(err, IsNil)
+	c.Assert(it.Valid(), IsFalse)
+
+	it, err = tx.SeekReverse([]byte{0x0, 0xee})
+	c.Assert(err, IsNil)
+	c.Assert(it.Valid(), IsTrue)
+	c.Assert(it.Value(), DeepEquals, []byte("1"))
 	tx.Commit()
 }
 

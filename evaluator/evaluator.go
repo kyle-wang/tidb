@@ -36,22 +36,18 @@ const (
 	CodeInvalidOperation terror.ErrCode = 1
 )
 
-// Eval evaluates an expression to a value.
-func Eval(ctx context.Context, expr ast.ExprNode) (interface{}, error) {
-	e := &Evaluator{ctx: ctx}
-	expr.Accept(e)
-	if e.err != nil {
-		return nil, errors.Trace(e.err)
+// Eval evaluates an expression to a datum.
+func Eval(ctx context.Context, expr ast.ExprNode) (d types.Datum, err error) {
+	if ast.IsEvaluated(expr) {
+		return *expr.GetDatum(), nil
 	}
-	return expr.GetValue(), nil
-}
-
-// EvalDatum evaluates an expression to a datum.
-func EvalDatum(ctx context.Context, expr ast.ExprNode) (d types.Datum, err error) {
 	e := &Evaluator{ctx: ctx}
 	expr.Accept(e)
 	if e.err != nil {
 		return d, errors.Trace(e.err)
+	}
+	if ast.IsPreEvaluable(expr) && (expr.GetFlag()&ast.FlagHasFunc == 0) {
+		expr.SetFlag(expr.GetFlag() | ast.FlagPreEvaluated)
 	}
 	return *expr.GetDatum(), nil
 }
@@ -62,11 +58,11 @@ func EvalBool(ctx context.Context, expr ast.ExprNode) (bool, error) {
 	if err != nil {
 		return false, errors.Trace(err)
 	}
-	if val == nil {
+	if val.Kind() == types.KindNull {
 		return false, nil
 	}
 
-	i, err := types.ToBool(val)
+	i, err := val.ToBool()
 	if err != nil {
 		return false, errors.Trace(err)
 	}
@@ -82,24 +78,12 @@ func boolToInt64(v bool) int64 {
 
 // Evaluator is an ast Visitor that evaluates an expression.
 type Evaluator struct {
-	ctx          context.Context
-	err          error
-	multipleRows bool
-	existRow     bool
+	ctx context.Context
+	err error
 }
 
 // Enter implements ast.Visitor interface.
 func (e *Evaluator) Enter(in ast.Node) (out ast.Node, skipChildren bool) {
-	switch v := in.(type) {
-	case *ast.SubqueryExpr:
-		if v.Evaluated && !v.UseOuterContext {
-			return in, true
-		}
-	case *ast.PatternInExpr, *ast.CompareSubqueryExpr:
-		e.multipleRows = true
-	case *ast.ExistsSubqueryExpr:
-		e.existRow = true
-	}
 	return in, false
 }
 
@@ -119,12 +103,10 @@ func (e *Evaluator) Leave(in ast.Node) (out ast.Node, ok bool) {
 	case *ast.ColumnNameExpr:
 		ok = e.columnName(v)
 	case *ast.CompareSubqueryExpr:
-		e.multipleRows = false
 		ok = e.compareSubquery(v)
 	case *ast.DefaultExpr:
 		ok = e.defaultExpr(v)
 	case *ast.ExistsSubqueryExpr:
-		e.existRow = false
 		ok = e.existsSubquery(v)
 	case *ast.FuncCallExpr:
 		ok = e.funcCall(v)
@@ -139,7 +121,6 @@ func (e *Evaluator) Leave(in ast.Node) (out ast.Node, ok bool) {
 	case *ast.ParenthesesExpr:
 		ok = e.parentheses(v)
 	case *ast.PatternInExpr:
-		e.multipleRows = false
 		ok = e.patternIn(v)
 	case *ast.PatternLikeExpr:
 		ok = e.patternLike(v)
@@ -151,8 +132,6 @@ func (e *Evaluator) Leave(in ast.Node) (out ast.Node, ok bool) {
 		ok = e.row(v)
 	case *ast.SubqueryExpr:
 		ok = e.subqueryExpr(v)
-	case ast.SubqueryExec:
-		ok = e.subqueryExec(v)
 	case *ast.UnaryOperationExpr:
 		ok = e.unaryOperation(v)
 	case *ast.ValueExpr:
@@ -182,8 +161,10 @@ func (e *Evaluator) between(v *ast.BetweenExpr) bool {
 		l = &ast.BinaryOperationExpr{Op: opcode.GE, L: v.Expr, R: v.Left}
 		r = &ast.BinaryOperationExpr{Op: opcode.LE, L: v.Expr, R: v.Right}
 	}
-
+	ast.MergeChildrenFlags(l, v.Expr, v.Left)
+	ast.MergeChildrenFlags(l, v.Expr, v.Right)
 	ret := &ast.BinaryOperationExpr{Op: op, L: l, R: r}
+	ast.MergeChildrenFlags(ret, l, r)
 	ret.Accept(e)
 	if e.err != nil {
 		return false
@@ -334,40 +315,47 @@ func (e *Evaluator) existsSubquery(v *ast.ExistsSubqueryExpr) bool {
 // Evaluate SubqueryExpr.
 // Get the value from v.SubQuery and set it to v.
 func (e *Evaluator) subqueryExpr(v *ast.SubqueryExpr) bool {
-	if v.SubqueryExec != nil {
-		v.SetDatum(*v.SubqueryExec.GetDatum())
+	if v.Evaluated && !v.Correlated {
+		// Subquery do not use outer context should only evaluate once.
+		return true
 	}
-	v.Evaluated = true
-	return true
-}
-
-// Do the real work to evaluate subquery.
-func (e *Evaluator) subqueryExec(v ast.SubqueryExec) bool {
-	rowCount := 2
-	if e.multipleRows {
-		rowCount = -1
-	} else if e.existRow {
-		rowCount = 1
-	}
-	rows, err := v.EvalRows(e.ctx, rowCount)
+	err := EvalSubquery(e.ctx, v)
 	if err != nil {
 		e.err = errors.Trace(err)
 		return false
 	}
-	if e.multipleRows || e.existRow {
-		v.GetDatum().SetInterface(types.MakeDatums(rows...))
-		return true
-	}
-	switch len(rows) {
-	case 0:
-		v.GetDatum().SetNull()
-	case 1:
-		v.SetDatum(types.NewDatum(rows[0]))
-	default:
-		e.err = errors.New("Subquery returns more than 1 row")
-		return false
-	}
 	return true
+}
+
+// EvalSubquery evaluates a subquery.
+func EvalSubquery(ctx context.Context, v *ast.SubqueryExpr) error {
+	if v.SubqueryExec != nil {
+		rowCount := 2
+		if v.MultiRows {
+			rowCount = -1
+		} else if v.Exists {
+			rowCount = 1
+		}
+		rows, err := v.SubqueryExec.EvalRows(ctx, rowCount)
+		if err != nil {
+			return errors.Trace(err)
+		}
+		if v.MultiRows || v.Exists {
+			v.GetDatum().SetRow(rows)
+			v.Evaluated = true
+			return nil
+		}
+		switch len(rows) {
+		case 0:
+			v.SetNull()
+		case 1:
+			v.SetDatum(rows[0])
+		default:
+			return errors.New("Subquery returns more than 1 row")
+		}
+	}
+	v.Evaluated = true
+	return nil
 }
 
 func (e *Evaluator) checkInList(not bool, in types.Datum, list []types.Datum) (d types.Datum) {
@@ -425,10 +413,7 @@ func (e *Evaluator) patternIn(n *ast.PatternInExpr) bool {
 		n.SetDatum(x)
 		return true
 	}
-	se := n.Sel.(*ast.SubqueryExpr)
-	sel := se.SubqueryExec
-
-	res := sel.GetDatum().GetRow()
+	res := n.Sel.GetDatum().GetRow()
 	x := e.checkInList(n.Not, lhs, res)
 	if e.err != nil {
 		return false
@@ -592,6 +577,16 @@ func (e *Evaluator) variable(v *ast.VariableExpr) bool {
 	sessionVars := variable.GetSessionVars(e.ctx)
 	globalVars := variable.GetGlobalVarAccessor(e.ctx)
 	if !v.IsSystem {
+		if v.Value != nil && v.Value.GetDatum().Kind() != types.KindNull {
+			strVal, err := v.Value.GetDatum().ToString()
+			if err != nil {
+				e.err = errors.Trace(err)
+				return false
+			}
+			sessionVars.Users[name] = strings.ToLower(strVal)
+			v.SetString(strVal)
+			return true
+		}
 		// user vars
 		if value, ok := sessionVars.Users[name]; ok {
 			v.SetString(value)

@@ -116,10 +116,14 @@ func (e *SimpleExec) executeSet(s *ast.SetStmt) error {
 				return errors.Trace(err)
 			}
 
-			if value == nil {
+			if value.Kind() == types.KindNull {
 				delete(sessionVars.Users, name)
 			} else {
-				sessionVars.Users[name] = fmt.Sprintf("%v", value)
+				svalue, err1 := value.ToString()
+				if err1 != nil {
+					return errors.Trace(err1)
+				}
+				sessionVars.Users[name] = fmt.Sprintf("%v", svalue)
 			}
 			continue
 		}
@@ -141,10 +145,10 @@ func (e *SimpleExec) executeSet(s *ast.SetStmt) error {
 			if err != nil {
 				return errors.Trace(err)
 			}
-			if value == nil {
-				value = ""
+			if value.Kind() == types.KindNull {
+				value.SetString("")
 			}
-			svalue, err := types.ToString(value)
+			svalue, err := value.ToString()
 			if err != nil {
 				return errors.Trace(err)
 			}
@@ -159,10 +163,14 @@ func (e *SimpleExec) executeSet(s *ast.SetStmt) error {
 			}
 			if value, err := evaluator.Eval(e.ctx, v.Value); err != nil {
 				return errors.Trace(err)
-			} else if value == nil {
+			} else if value.Kind() == types.KindNull {
 				sessionVars.Systems[name] = ""
 			} else {
-				sessionVars.Systems[name] = fmt.Sprintf("%v", value)
+				svalue, err := value.ToString()
+				if err != nil {
+					return errors.Trace(err)
+				}
+				sessionVars.Systems[name] = fmt.Sprintf("%v", svalue)
 			}
 		}
 	}
@@ -209,13 +217,13 @@ func (e *SimpleExec) executeBegin(s *ast.BeginStmt) error {
 }
 
 func (e *SimpleExec) executeCommit(s *ast.CommitStmt) error {
-	err := e.ctx.FinishTxn(false)
+	err := e.ctx.CommitTxn()
 	variable.GetSessionVars(e.ctx).SetStatusFlag(mysql.ServerStatusInTrans, false)
 	return errors.Trace(err)
 }
 
 func (e *SimpleExec) executeRollback(s *ast.RollbackStmt) error {
-	err := e.ctx.FinishTxn(true)
+	err := e.ctx.RollbackTxn()
 	variable.GetSessionVars(e.ctx).SetStatusFlag(mysql.ServerStatusInTrans, false)
 	return errors.Trace(err)
 }

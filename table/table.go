@@ -19,7 +19,6 @@ package table
 
 import (
 	"github.com/juju/errors"
-	"github.com/pingcap/tidb/column"
 	"github.com/pingcap/tidb/context"
 	"github.com/pingcap/tidb/evaluator"
 	"github.com/pingcap/tidb/kv"
@@ -30,24 +29,24 @@ import (
 )
 
 // RecordIterFunc is used for low-level record iteration.
-type RecordIterFunc func(h int64, rec []types.Datum, cols []*column.Col) (more bool, err error)
+type RecordIterFunc func(h int64, rec []types.Datum, cols []*Column) (more bool, err error)
 
 // Table is used to retrieve and modify rows in table.
 type Table interface {
 	// IterRecords iterates records in the table and calls fn.
-	IterRecords(ctx context.Context, startKey kv.Key, cols []*column.Col, fn RecordIterFunc) error
+	IterRecords(ctx context.Context, startKey kv.Key, cols []*Column, fn RecordIterFunc) error
 
 	// RowWithCols returns a row that contains the given cols.
-	RowWithCols(ctx context.Context, h int64, cols []*column.Col) ([]types.Datum, error)
+	RowWithCols(ctx context.Context, h int64, cols []*Column) ([]types.Datum, error)
 
 	// Row returns a row for all columns.
 	Row(ctx context.Context, h int64) ([]types.Datum, error)
 
 	// Cols returns the columns of the table which is used in select.
-	Cols() []*column.Col
+	Cols() []*Column
 
 	// Indices returns the indices of the table.
-	Indices() []*column.IndexedCol
+	Indices() []*IndexedColumn
 
 	// RecordPrefix returns the record key prefix.
 	RecordPrefix() kv.Key
@@ -59,7 +58,7 @@ type Table interface {
 	FirstKey() kv.Key
 
 	// RecordKey returns the key in KV storage for the column.
-	RecordKey(h int64, col *column.Col) kv.Key
+	RecordKey(h int64, col *Column) kv.Key
 
 	// Truncate truncates the table.
 	Truncate(ctx context.Context) (err error)
@@ -112,7 +111,7 @@ func GetColDefaultValue(ctx context.Context, col *model.ColumnInfo) (types.Datum
 		if err != nil {
 			return types.Datum{}, true, errors.Errorf("Field '%s' get default value fail - %s", col.Name, errors.Trace(err))
 		}
-		return types.NewDatum(value), true, nil
+		return value, true, nil
 	} else if col.Tp == mysql.TypeEnum {
 		// For enum type, if no default value and not null is set,
 		// the default value is the first element of the enum list
@@ -123,3 +122,6 @@ func GetColDefaultValue(ctx context.Context, col *model.ColumnInfo) (types.Datum
 
 	return types.NewDatum(col.DefaultValue), true, nil
 }
+
+// MockTableFromMeta only serves for test.
+var MockTableFromMeta func(tableInfo *model.TableInfo) Table

@@ -17,6 +17,7 @@ import (
 	"testing"
 
 	. "github.com/pingcap/check"
+	"github.com/pingcap/tidb/util/testleak"
 )
 
 func TestT(t *testing.T) {
@@ -29,6 +30,7 @@ type testStringUtilSuite struct {
 }
 
 func (s *testStringUtilSuite) TestRemoveUselessBackslash(c *C) {
+	defer testleak.AfterTest(c)()
 	table := []struct {
 		str    string
 		expect string
@@ -42,6 +44,24 @@ func (s *testStringUtilSuite) TestRemoveUselessBackslash(c *C) {
 
 	for _, t := range table {
 		x := RemoveUselessBackslash(t.str)
+		c.Assert(x, Equals, t.expect)
+	}
+}
+
+func (s *testStringUtilSuite) TestReverse(c *C) {
+	defer testleak.AfterTest(c)()
+	table := []struct {
+		str    string
+		expect string
+	}{
+		{"zxcf", "fcxz"},
+		{"abc", "cba"},
+		{"Hello, 世界", "界世 ,olleH"},
+		{"", ""},
+	}
+
+	for _, t := range table {
+		x := Reverse(t.str)
 		c.Assert(x, Equals, t.expect)
 	}
 }

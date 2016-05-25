@@ -52,12 +52,12 @@ func (ts *testDatumSuite) TestToBool(c *C) {
 	testDatumToBool(c, int(0), 0)
 	testDatumToBool(c, int64(0), 0)
 	testDatumToBool(c, uint64(0), 0)
-	testDatumToBool(c, float32(0), 0)
-	testDatumToBool(c, float64(0), 0)
+	testDatumToBool(c, float32(0.1), 0)
+	testDatumToBool(c, float64(0.1), 0)
 	testDatumToBool(c, "", 0)
-	testDatumToBool(c, "0", 0)
+	testDatumToBool(c, "0.1", 0)
 	testDatumToBool(c, []byte{}, 0)
-	testDatumToBool(c, []byte("0"), 0)
+	testDatumToBool(c, []byte("0.1"), 0)
 	testDatumToBool(c, mysql.Hex{Value: 0}, 0)
 	testDatumToBool(c, mysql.Bit{Value: 0, Width: 8}, 0)
 	testDatumToBool(c, mysql.Enum{Name: "a", Value: 1}, 1)
@@ -73,9 +73,9 @@ func (ts *testDatumSuite) TestToBool(c *C) {
 
 	ft := NewFieldType(mysql.TypeNewDecimal)
 	ft.Decimal = 5
-	v, err := Convert(3.1415926, ft)
+	v, err := Convert(0.1415926, ft)
 	c.Assert(err, IsNil)
-	testDatumToBool(c, v, 1)
+	testDatumToBool(c, v, 0)
 	d := NewDatum(&invalidMockType{})
 	_, err = d.ToBool()
 	c.Assert(err, NotNil)
@@ -150,4 +150,28 @@ func (ts *testTypeConvertSuite) TestToInt64(c *C) {
 
 	_, err = ToInt64(&invalidMockType{})
 	c.Assert(err, NotNil)
+}
+
+func (ts *testTypeConvertSuite) TestToFloat32(c *C) {
+	ft := NewFieldType(mysql.TypeFloat)
+	var datum = NewFloat64Datum(281.37)
+	converted, err := datum.ConvertTo(ft)
+	c.Assert(err, IsNil)
+	c.Assert(converted.Kind(), Equals, KindFloat32)
+	c.Assert(converted.GetFloat32(), Equals, float32(281.37))
+
+	datum.SetString("281.37")
+	converted, err = datum.ConvertTo(ft)
+	c.Assert(err, IsNil)
+	c.Assert(converted.Kind(), Equals, KindFloat32)
+	c.Assert(converted.GetFloat32(), Equals, float32(281.37))
+
+	ft = NewFieldType(mysql.TypeDouble)
+	datum = NewFloat32Datum(281.37)
+	converted, err = datum.ConvertTo(ft)
+	c.Assert(err, IsNil)
+	c.Assert(converted.Kind(), Equals, KindFloat64)
+	// Convert to float32 and convert back to float64, we will get a different value.
+	c.Assert(converted.GetFloat64(), Not(Equals), 281.37)
+	c.Assert(converted.GetFloat64(), Equals, datum.GetFloat64())
 }

@@ -18,6 +18,8 @@ import (
 	"github.com/pingcap/tidb/ast"
 	"github.com/pingcap/tidb/evaluator"
 	"github.com/pingcap/tidb/util/mock"
+	"github.com/pingcap/tidb/util/testleak"
+	"github.com/pingcap/tidb/util/testutil"
 	"github.com/pingcap/tidb/util/types"
 )
 
@@ -59,6 +61,7 @@ func (m *mockExec) Close() error {
 }
 
 func (s *testAggFuncSuite) TestCount(c *C) {
+	defer testleak.AfterTest(c)()
 	// Compose aggregate exec for "select c1, count(c2) from t";
 	// c1  c2
 	// 1	1
@@ -95,6 +98,8 @@ func (s *testAggFuncSuite) TestCount(c *C) {
 		AggFuncs: []*ast.AggregateFuncExpr{fc1, fc2},
 		Src:      src,
 	}
+	ast.SetFlag(fc1)
+	ast.SetFlag(fc2)
 	var (
 		row *Row
 		cnt int
@@ -113,16 +118,16 @@ func (s *testAggFuncSuite) TestCount(c *C) {
 	ctx := mock.NewContext()
 	val, err := evaluator.Eval(ctx, fc1)
 	c.Assert(err, IsNil)
-	c.Assert(val, Equals, int64(1))
+	c.Assert(val, testutil.DatumEquals, types.NewDatum(int64(1)))
 	val, err = evaluator.Eval(ctx, fc2)
 	c.Assert(err, IsNil)
-	c.Assert(val, Equals, int64(2))
+	c.Assert(val, testutil.DatumEquals, types.NewDatum(int64(2)))
 
 	agg.Close()
 	val, err = evaluator.Eval(ctx, fc1)
 	c.Assert(err, IsNil)
-	c.Assert(val, IsNil)
+	c.Assert(val.Kind(), Equals, types.KindNull)
 	val, err = evaluator.Eval(ctx, fc2)
 	c.Assert(err, IsNil)
-	c.Assert(val, Equals, int64(0))
+	c.Assert(val, testutil.DatumEquals, types.NewDatum(int64(0)))
 }

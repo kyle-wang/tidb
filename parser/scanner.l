@@ -291,6 +291,7 @@ and		{a}{n}{d}
 any 		{a}{n}{y}
 as		{a}{s}
 asc		{a}{s}{c}
+ascii		{a}{s}{c}{i}{i}
 auto_increment	{a}{u}{t}{o}_{i}{n}{c}{r}{e}{m}{e}{n}{t}
 avg		{a}{v}{g}
 avg_row_length	{a}{v}{g}_{r}{o}{w}_{l}{e}{n}{g}{t}{h}
@@ -350,11 +351,13 @@ desc		{d}{e}{s}{c}
 describe	{d}{e}{s}{c}{r}{i}{b}{e}
 distinct	{d}{i}{s}{t}{i}{n}{c}{t}
 div		{d}{i}{v}
+disable		{d}{i}{s}{a}{b}{l}{e}
 do		{d}{o}
 dual 		{d}{u}{a}{l}
 duplicate	{d}{u}{p}{l}{i}{c}{a}{t}{e}
 dynamic		{d}{y}{n}{a}{m}{i}{c}
 else		{e}{l}{s}{e}
+enable		{e}{n}{a}{b}{l}{e}
 end		{e}{n}{d}
 engine		{e}{n}{g}{i}{n}{e}
 engines		{e}{n}{g}{i}{n}{e}{s}
@@ -367,6 +370,7 @@ fields		{f}{i}{e}{l}{d}{s}
 first		{f}{i}{r}{s}{t}
 fixed		{f}{i}{x}{e}{d}
 for		{f}{o}{r}
+force		{f}{o}{r}{c}{e}
 foreign		{f}{o}{r}{e}{i}{g}{n}
 found_rows	{f}{o}{u}{n}{d}_{r}{o}{w}{s}
 from		{f}{r}{o}{m}
@@ -392,9 +396,11 @@ insert		{i}{n}{s}{e}{r}{t}
 interval	{i}{n}{t}{e}{r}{v}{a}{l}
 into		{i}{n}{t}{o}
 is		{i}{s}
+isnull		{i}{s}{n}{u}{l}{l}
 isolation	{i}{s}{o}{l}{a}{t}{i}{o}{n}
 join		{j}{o}{i}{n}
 key		{k}{e}{y}
+keys		{k}{e}{y}{s}
 key_block_size	{k}{e}{y}_{b}{l}{o}{c}{k}_{s}{i}{z}{e}
 leading		{l}{e}{a}{d}{i}{n}{g}
 left		{l}{e}{f}{t}
@@ -406,7 +412,9 @@ local		{l}{o}{c}{a}{l}
 locate		{l}{o}{c}{a}{t}{e}
 lock		{l}{o}{c}{k}
 lower		{l}{o}{w}{e}{r}
+lcase		{l}{c}{a}{s}{e}
 low_priority	{l}{o}{w}_{p}{r}{i}{o}{r}{i}{t}{y}
+ltrim		{l}{t}{r}{i}{m}
 max_rows	{m}{a}{x}_{r}{o}{w}{s}
 microsecond	{m}{i}{c}{r}{o}{s}{e}{c}{o}{n}{d}
 minute		{m}{i}{n}{u}{t}{e}
@@ -440,11 +448,14 @@ references	{r}{e}{f}{e}{r}{e}{n}{c}{e}{s}
 regexp		{r}{e}{g}{e}{x}{p}
 replace		{r}{e}{p}{l}{a}{c}{e}
 redundant	{r}{e}{d}{u}{n}{d}{a}{n}{t}
+reverse		{r}{e}{v}{e}{r}{s}{e}
 right		{r}{i}{g}{h}{t}
 rlike		{r}{l}{i}{k}{e}
 rollback	{r}{o}{l}{l}{b}{a}{c}{k}
+round		{r}{o}{u}{n}{d}
 row 		{r}{o}{w}
 row_format	{r}{o}{w}_{f}{o}{r}{m}{a}{t}
+rtrim		{r}{t}{r}{i}{m}
 schema		{s}{c}{h}{e}{m}{a}
 schemas		{s}{c}{h}{e}{m}{a}{s}
 second		{s}{e}{c}{o}{n}{d}
@@ -483,6 +494,8 @@ unlock		{u}{n}{l}{o}{c}{k}
 nullif		{n}{u}{l}{l}{i}{f}
 update		{u}{p}{d}{a}{t}{e}
 upper		{u}{p}{p}{e}{r}
+ucase		{u}{c}{a}{s}{e}
+utc_date	{u}{t}{c}_{d}{a}{t}{e}
 value		{v}{a}{l}{u}{e}
 values		{v}{a}{l}{u}{e}{s}
 variables	{v}{a}{r}{i}{a}{b}{l}{e}{s}
@@ -502,6 +515,8 @@ false		{f}{a}{l}{s}{e}
 true		{t}{r}{u}{e}
 
 calc_found_rows	{s}{q}{l}_{c}{a}{l}{c}_{f}{o}{u}{n}{d}_{r}{o}{w}{s}
+sql_cache	{s}{q}{l}_{c}{a}{c}{h}{e}
+sql_no_cache	{s}{q}{l}_{n}{o}_{c}{a}{c}{h}{e}
 
 current_ts	{c}{u}{r}{r}{e}{n}{t}_{t}{i}{m}{e}{s}{t}{a}{m}{p}
 localtime	{l}{o}{c}{a}{l}{t}{i}{m}{e}
@@ -575,6 +590,11 @@ day_minute		{d}{a}{y}_{m}{i}{n}{u}{t}{e}
 day_hour		{d}{a}{y}_{h}{o}{u}{r}
 year_month		{y}{e}{a}{r}_{m}{o}{n}{t}{h}
 
+restrict	{r}{e}{s}{t}{r}{i}{c}{t}
+cascade		{c}{a}{s}{c}{a}{d}{e}
+no		{n}{o}
+action		{a}{c}{t}{i}{o}{n}
+
 %yyc c
 %yyn c = l.next()
 %yyt l.sc
@@ -634,6 +654,7 @@ year_month		{y}{e}{a}{r}_{m}{o}{n}{t}{h}
 "<<"			return lsh
 "<="			return le
 "=" 			return eq
+":="			return assignmentEq
 ">="			return ge
 "!="			return neq
 "<>"			return neq
@@ -660,6 +681,8 @@ year_month		{y}{e}{a}{r}_{m}{o}{n}{t}{h}
 			return any
 {asc}			return asc
 {as}			return as
+{ascii}			lval.item = string(l.val)
+			return ascii
 {auto_increment}	lval.item = string(l.val)
 			return autoIncrement
 {avg}			lval.item = string(l.val)
@@ -763,6 +786,8 @@ year_month		{y}{e}{a}{r}_{m}{o}{n}{t}{h}
 {desc}			return desc
 {describe}		return describe
 {drop}			return drop
+{disable}		lval.item = string(l.val)
+			return disable
 {distinct}		return distinct
 {div}			return div
 {do}			lval.item = string(l.val)
@@ -773,6 +798,8 @@ year_month		{y}{e}{a}{r}_{m}{o}{n}{t}{h}
 {dynamic}		lval.item = string(l.val)
 			return dynamic
 {else}			return elseKwd
+{enable}		lval.item = string(l.val)
+			return enable
 {end}			lval.item = string(l.val)
 			return end
 {engine}		lval.item = string(l.val)
@@ -795,6 +822,7 @@ year_month		{y}{e}{a}{r}_{m}{o}{n}{t}{h}
 {fixed}			lval.item = string(l.val)
 			return fixed
 {for}			return forKwd
+{force}			return force
 {foreign}		return foreign
 {found_rows}		lval.item = string(l.val)
 			return foundRows
@@ -826,6 +854,8 @@ year_month		{y}{e}{a}{r}_{m}{o}{n}{t}{h}
 			return ifKwd
 {ifnull}		lval.item = string(l.val)
 			return ifNull
+{isnull}		lval.item = string(l.val)
+			return isNull
 {ignore}		return ignore
 {index}			return index
 {inner} 		return inner
@@ -840,6 +870,7 @@ year_month		{y}{e}{a}{r}_{m}{o}{n}{t}{h}
 {key}			return key
 {key_block_size}	lval.item = string(l.val)
 			return keyBlockSize
+{keys}			return keys
 {leading}		return leading
 {left}			lval.item = string(l.val)
 			return left
@@ -856,7 +887,11 @@ year_month		{y}{e}{a}{r}_{m}{o}{n}{t}{h}
 {lock}			return lock
 {lower}			lval.item = string(l.val)
 			return lower
+{lcase}			lval.item = string(l.val)
+			return lcase
 {low_priority}		return lowPriority
+{ltrim}			lval.item = string(l.val)
+			return ltrim
 {max}			lval.item = string(l.val)
 			return max
 {max_rows}		lval.item = string(l.val)
@@ -911,6 +946,8 @@ redundant		lval.item = string(l.val)
 {right}			return right
 {rollback}		lval.item = string(l.val)
 			return rollback
+{round}			lval.item = string(l.val)
+			return round
 {row}			lval.item = string(l.val)
 			return row
 {row_format}		lval.item = string(l.val)
@@ -942,12 +979,18 @@ redundant		lval.item = string(l.val)
 			return replace
 {references}		return references
 {rlike}			return rlike
+{rtrim}			lval.item = string(l.val)
+			return rtrim
+{reverse}		lval.item = string(l.val)
+			return reverse
 
 {sys_var}		lval.item = string(l.val)
 			return sysVar
 
 {user_var}		lval.item = string(l.val)
 			return userVar
+{utc_date}		lval.item = string(l.val)
+			return utcDate
 {second}		lval.item = string(l.val)
 			return second
 {second_microsecond}	lval.item= string(l.val)
@@ -997,6 +1040,8 @@ redundant		lval.item = string(l.val)
 {update}		return update
 {upper}			lval.item = string(l.val)
 			return upper
+{ucase}			lval.item = string(l.val)
+			return ucase
 {use}			return use
 {user}			lval.item = string(l.val)
 			return user
@@ -1024,7 +1069,16 @@ redundant		lval.item = string(l.val)
 			return yearweek
 {year_month}		lval.item = string(l.val)
 			return yearMonth
-			
+
+{restrict}		lval.item = string(l.val)
+			return restrict
+{cascade}		lval.item = string(l.val)
+			return cascade
+{no}			lval.item = string(l.val)
+			return no
+{action}		lval.item = string(l.val)
+			return action
+
 {signed}		lval.item = string(l.val)
 			return signed
 {unsigned}		return unsigned
@@ -1039,6 +1093,10 @@ redundant		lval.item = string(l.val)
 
 {calc_found_rows}	lval.item = string(l.val)
 			return calcFoundRows
+{sql_cache}		lval.item = string(l.val)
+			return sqlCache
+{sql_no_cache}		lval.item = string(l.val)
+			return sqlNoCache
 
 {current_ts}		lval.item = string(l.val)
 			return currentTs
@@ -1223,8 +1281,14 @@ func (l *lexer) hex(lval *yySymType) int {
 	s := string(l.val)
 	h, err := mysql.ParseHex(s)
 	if err != nil {
-		l.errf("hexadecimal literal: %v", err)
-		return int(unicode.ReplacementChar)
+		// If parse hexadecimal literal to numerical value error, we should treat it as a string.
+		hexStr, err1 := mysql.ParseHexStr(s)
+		if err1 != nil {
+			l.errf("hex literal: %v", err)
+			return int(unicode.ReplacementChar)
+		}
+		lval.item = hexStr
+		return stringLit 
 	}
 	lval.item = h
 	return hexLit

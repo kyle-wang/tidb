@@ -24,7 +24,7 @@ import (
 	"github.com/pingcap/tidb/mysql"
 	"github.com/pingcap/tidb/util/codec"
 	"github.com/pingcap/tidb/util/types"
-	"github.com/pingcap/tidb/xapi/tipb"
+	"github.com/pingcap/tipb/go-tipb"
 )
 
 var (
@@ -85,6 +85,9 @@ func DecodeRowKey(key kv.Key) (handle int64, err error) {
 
 // DecodeValues decodes a byte slice into datums with column types.
 func DecodeValues(data []byte, fts []*types.FieldType, inIndex bool) ([]types.Datum, error) {
+	if data == nil {
+		return nil, nil
+	}
 	values, err := codec.Decode(data)
 	if err != nil {
 		return nil, errors.Trace(err)
@@ -128,13 +131,16 @@ func unflatten(datum types.Datum, ft *types.FieldType) (types.Datum, error) {
 		if err != nil {
 			return datum, errors.Trace(err)
 		}
-		datum.SetMysqlTime(&t)
+		datum.SetMysqlTime(t)
 		return datum, nil
 	case mysql.TypeDuration:
 		dur := mysql.Duration{Duration: time.Duration(datum.GetInt64())}
 		datum.SetValue(dur)
 		return datum, nil
 	case mysql.TypeNewDecimal:
+		if datum.Kind() == types.KindMysqlDecimal {
+			return datum, nil
+		}
 		dec, err := mysql.ParseDecimal(datum.GetString())
 		if err != nil {
 			return datum, errors.Trace(err)
@@ -161,6 +167,26 @@ func unflatten(datum types.Datum, ft *types.FieldType) (types.Datum, error) {
 		return datum, nil
 	}
 	return datum, nil
+}
+
+// DecodeColumnValue decodes data to a Datum according to the column info.
+func DecodeColumnValue(data []byte, col *tipb.ColumnInfo) (types.Datum, error) {
+	_, d, err := codec.DecodeOne(data)
+	if err != nil {
+		return types.Datum{}, errors.Trace(err)
+	}
+	ft := &types.FieldType{
+		Tp:      byte(col.GetTp()),
+		Flen:    int(col.GetColumnLen()),
+		Decimal: int(col.GetDecimal()),
+		Elems:   col.Elems,
+		Collate: mysql.Collations[uint8(col.GetCollation())],
+	}
+	colDatum, err := unflatten(d, ft)
+	if err != nil {
+		return types.Datum{}, errors.Trace(err)
+	}
+	return colDatum, nil
 }
 
 // EncodeIndexSeekKey encodes an index value to kv.Key.
@@ -200,6 +226,7 @@ func columnToProto(c *model.ColumnInfo) *tipb.ColumnInfo {
 		Collation: proto.Int32(collationToProto(c.FieldType.Collate)),
 		ColumnLen: proto.Int32(int32(c.FieldType.Flen)),
 		Decimal:   proto.Int32(int32(c.FieldType.Decimal)),
+		Flag:      proto.Int32(int32(c.Flag)),
 		Elems:     c.Elems,
 	}
 	t := int32(c.FieldType.Tp)
@@ -215,23 +242,19 @@ func collationToProto(c string) int32 {
 	return int32(mysql.DefaultCollationID)
 }
 
-// TableToProto converts a model.TableInfo to a tipb.TableInfo.
-func TableToProto(t *model.TableInfo) *tipb.TableInfo {
-	pt := &tipb.TableInfo{
-		TableId: proto.Int64(t.ID),
-	}
-	cols := make([]*tipb.ColumnInfo, 0, len(t.Columns))
-	for _, c := range t.Columns {
+// ColumnsToProto converts a slice of model.ColumnInfo to a slice of tipb.ColumnInfo.
+func ColumnsToProto(columns []*model.ColumnInfo, pkIsHandle bool) []*tipb.ColumnInfo {
+	cols := make([]*tipb.ColumnInfo, 0, len(columns))
+	for _, c := range columns {
 		col := columnToProto(c)
-		if t.PKIsHandle && mysql.HasPriKeyFlag(c.Flag) {
+		if pkIsHandle && mysql.HasPriKeyFlag(c.Flag) {
 			col.PkHandle = proto.Bool(true)
 		} else {
 			col.PkHandle = proto.Bool(false)
 		}
 		cols = append(cols, col)
 	}
-	pt.Columns = cols
-	return pt
+	return cols
 }
 
 // ProtoColumnsToFieldTypes converts tipb column info slice to FieldTyps slice.
@@ -294,6 +317,14 @@ func EncodeIndexRanges(tid, idxID int64, rans []*tipb.KeyRange) []kv.KeyRange {
 		keyRanges = append(keyRanges, nr)
 	}
 	return keyRanges
+}
+
+// TruncateToRowKeyLen truncates the key to row key length if the key is longer than row key.
+func TruncateToRowKeyLen(key kv.Key) kv.Key {
+	if len(key) > recordRowKeyLen {
+		return key[:recordRowKeyLen]
+	}
+	return key
 }
 
 type keyRangeSorter struct {

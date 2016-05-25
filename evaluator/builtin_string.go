@@ -26,6 +26,7 @@ import (
 	"github.com/pingcap/tidb/ast"
 	"github.com/pingcap/tidb/context"
 	"github.com/pingcap/tidb/util/charset"
+	"github.com/pingcap/tidb/util/stringutil"
 	"github.com/pingcap/tidb/util/types"
 	"golang.org/x/text/transform"
 )
@@ -42,6 +43,25 @@ func builtinLength(args []types.Datum, _ context.Context) (d types.Datum, err er
 			return d, errors.Trace(err)
 		}
 		d.SetInt64(int64(len(s)))
+		return d, nil
+	}
+}
+
+// See: https://dev.mysql.com/doc/refman/5.7/en/string-functions.html#function_ascii
+func builtinASCII(args []types.Datum, _ context.Context) (d types.Datum, err error) {
+	switch args[0].Kind() {
+	case types.KindNull:
+		return d, nil
+	default:
+		s, err := args[0].ToString()
+		if err != nil {
+			return d, errors.Trace(err)
+		}
+		if len(s) == 0 {
+			d.SetInt64(0)
+			return d, nil
+		}
+		d.SetInt64(int64(s[0]))
 		return d, nil
 	}
 }
@@ -146,6 +166,22 @@ func builtinLower(args []types.Datum, _ context.Context) (d types.Datum, err err
 			return d, errors.Trace(err)
 		}
 		d.SetString(strings.ToLower(s))
+		return d, nil
+	}
+}
+
+// See: https://dev.mysql.com/doc/refman/5.7/en/string-functions.html#function_reverse
+func builtinReverse(args []types.Datum, _ context.Context) (d types.Datum, err error) {
+	x := args[0]
+	switch x.Kind() {
+	case types.KindNull:
+		return d, nil
+	default:
+		s, err := x.ToString()
+		if err != nil {
+			return d, errors.Trace(err)
+		}
+		d.SetString(stringutil.Reverse(s))
 		return d, nil
 	}
 }
@@ -256,12 +292,12 @@ func builtinSubstring(args []types.Datum, _ context.Context) (d types.Datum, err
 	}
 	pos := args[1].GetInt64()
 
-	length := int64(-1)
+	length, hasLen := int64(-1), false
 	if len(args) == 3 {
 		if args[2].Kind() != types.KindInt64 {
 			return d, errors.Errorf("Substring invalid pos args, need int but get %T", args[2].GetValue())
 		}
-		length = args[2].GetInt64()
+		length, hasLen = args[2].GetInt64(), true
 	}
 	// The forms without a len argument return a substring from string str starting at position pos.
 	// The forms with a len argument return a substring len characters long from string str, starting at position pos.
@@ -273,17 +309,20 @@ func builtinSubstring(args []types.Datum, _ context.Context) (d types.Datum, err
 	} else {
 		pos--
 	}
-	if pos > int64(len(str)) || pos <= int64(0) {
+	if pos > int64(len(str)) || pos < int64(0) {
 		pos = int64(len(str))
 	}
-	end := int64(len(str))
-	if length != int64(-1) {
-		end = pos + length
+	if hasLen {
+		if end := pos + length; end < pos {
+			d.SetString("")
+		} else if end > int64(len(str)) {
+			d.SetString(str[pos:])
+		} else {
+			d.SetString(str[pos:end])
+		}
+	} else {
+		d.SetString(str[pos:])
 	}
-	if end > int64(len(str)) {
-		end = int64(len(str))
-	}
-	d.SetString(str[pos:end])
 	return d, nil
 }
 
@@ -439,6 +478,23 @@ func builtinTrim(args []types.Datum, _ context.Context) (d types.Datum, err erro
 	}
 	d.SetString(result)
 	return d, nil
+}
+
+// For LTRIM & RTRIM
+// See: https://dev.mysql.com/doc/refman/5.7/en/string-functions.html#function_ltrim
+// See: https://dev.mysql.com/doc/refman/5.7/en/string-functions.html#function_rtrim
+func trimFn(fn func(string, string) string, cutset string) BuiltinFunc {
+	return func(args []types.Datum, ctx context.Context) (d types.Datum, err error) {
+		if args[0].Kind() == types.KindNull {
+			return d, nil
+		}
+		str, err := args[0].ToString()
+		if err != nil {
+			return d, errors.Trace(err)
+		}
+		d.SetString(fn(str, cutset))
+		return d, nil
+	}
 }
 
 func trimLeft(str, remstr string) string {

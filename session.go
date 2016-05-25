@@ -52,10 +52,11 @@ import (
 type Session interface {
 	Status() uint16                              // Flag of current status, such as autocommit
 	LastInsertID() uint64                        // Last inserted auto_increment id
-	AffectedRows() uint64                        // Affected rows by lastest executed stmt
+	AffectedRows() uint64                        // Affected rows by latest executed stmt
 	Execute(sql string) ([]ast.RecordSet, error) // Execute a sql statement
 	String() string                              // For debug
-	FinishTxn(rollback bool) error
+	CommitTxn() error
+	RollbackTxn() error
 	// For execute prepare statement in binary protocol
 	PrepareStmt(sql string) (stmtID uint32, paramCount int, fields []*ast.ResultField, err error)
 	// Execute a prepared statement
@@ -110,7 +111,6 @@ const unlimitedRetryCnt = -1
 
 type session struct {
 	txn         kv.Transaction // Current transaction
-	args        []interface{}  // Statment execution args, this should be cleaned up after exec
 	values      map[fmt.Stringer]interface{}
 	store       kv.Storage
 	sid         int64
@@ -155,14 +155,19 @@ func (s *session) SetConnectionID(connectionID uint64) {
 	variable.GetSessionVars(s).ConnectionID = connectionID
 }
 
-func (s *session) FinishTxn(rollback bool) error {
+func (s *session) finishTxn(rollback bool) error {
 	// transaction has already been committed or rolled back
 	if s.txn == nil {
 		return nil
 	}
 	defer func() {
+		s.ClearValue(executor.DirtyDBKey)
 		s.txn = nil
 		variable.GetSessionVars(s).SetStatusFlag(mysql.ServerStatusInTrans, false)
+		// Update tps metrics
+		if !variable.GetSessionVars(s).RetryInfo.Retrying {
+			tpsMetrics.Add(1)
+		}
 	}()
 
 	if rollback {
@@ -185,6 +190,14 @@ func (s *session) FinishTxn(rollback bool) error {
 	s.resetHistory()
 	s.cleanRetryInfo()
 	return nil
+}
+
+func (s *session) CommitTxn() error {
+	return s.finishTxn(false)
+}
+
+func (s *session) RollbackTxn() error {
+	return s.finishTxn(true)
 }
 
 func (s *session) String() string {
@@ -224,7 +237,7 @@ func (s *session) Retry() error {
 	retryCnt := 0
 	for {
 		s.resetHistory()
-		s.FinishTxn(true)
+		s.RollbackTxn()
 		success := true
 		variable.GetSessionVars(s).RetryInfo.ResetOffset()
 		for _, sr := range nh.history {
@@ -241,7 +254,7 @@ func (s *session) Retry() error {
 			}
 		}
 		if success {
-			err = s.FinishTxn(false)
+			err = s.CommitTxn()
 			if !kv.IsRetryableError(err) {
 				break
 			}
@@ -368,6 +381,7 @@ func (s *session) Execute(sql string) ([]ast.RecordSet, error) {
 		return nil, errors.Trace(err)
 	}
 	var rs []ast.RecordSet
+	ph := sessionctx.GetDomain(s).PerfSchema()
 	for i, rst := range rawStmts {
 		st, err1 := Compile(s, rst)
 		if err1 != nil {
@@ -376,9 +390,9 @@ func (s *session) Execute(sql string) ([]ast.RecordSet, error) {
 			return nil, errors.Trace(err1)
 		}
 		id := variable.GetSessionVars(s).ConnectionID
-		s.stmtState = perfschema.PerfHandle.StartStatement(sql, id, perfschema.CallerNameSessionExecute, rawStmts[i])
+		s.stmtState = ph.StartStatement(sql, id, perfschema.CallerNameSessionExecute, rawStmts[i])
 		r, err := runStmt(s, st)
-		perfschema.PerfHandle.EndStatement(s.stmtState)
+		ph.EndStatement(s.stmtState)
 		if err != nil {
 			log.Warnf("session:%v, err:%v", s, err)
 			return nil, errors.Trace(err)
@@ -485,7 +499,7 @@ func (s *session) GetTxn(forceNew bool) (kv.Transaction, error) {
 		return s.txn, nil
 	}
 	if forceNew {
-		err = s.FinishTxn(false)
+		err = s.CommitTxn()
 		if err != nil {
 			return nil, errors.Trace(err)
 		}
@@ -516,7 +530,7 @@ func (s *session) ClearValue(key fmt.Stringer) {
 
 // Close function does some clean work when session end.
 func (s *session) Close() error {
-	return s.FinishTxn(true)
+	return s.RollbackTxn()
 }
 
 func (s *session) getPassword(name, host string) (string, error) {
@@ -574,6 +588,13 @@ const (
 	retryEmptyHistoryList = "RetryEmptyHistoryList"
 )
 
+func chooseMinLease(n1 time.Duration, n2 time.Duration) time.Duration {
+	if n1 <= n2 {
+		return n1
+	}
+	return n2
+}
+
 // CreateSession creates a new session environment.
 func CreateSession(store kv.Storage) (Session, error) {
 	s := &session{
@@ -606,7 +627,7 @@ func CreateSession(store kv.Storage) (Session, error) {
 		// bootstrap quickly, after bootstrapped, we will reset the lease time.
 		// TODO: Using a bootstap tool for doing this may be better later.
 		if !localstore.IsLocalStore(store) {
-			sessionctx.GetDomain(s).SetLease(100 * time.Millisecond)
+			sessionctx.GetDomain(s).SetLease(chooseMinLease(100*time.Millisecond, schemaLease))
 		}
 
 		s.initing = true

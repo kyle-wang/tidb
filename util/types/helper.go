@@ -20,15 +20,27 @@ import (
 	"github.com/pingcap/tidb/mysql"
 )
 
-// RoundFloat rounds float val to the nearest integer value with float64 format, like GNU rint function.
-// RoundFloat uses default rounding mode, see http://www.gnu.org/software/libc/manual/html_node/Rounding.html
-// so we will choose the even number if the result is midway between two representable value.
-// e.g, 1.5 -> 2, 2.5 -> 2.
+// RoundFloat rounds float val to the nearest integer value with float64 format, like MySQL Round function.
+// RoundFloat uses default rounding mode, see https://dev.mysql.com/doc/refman/5.7/en/precision-math-rounding.html
+// so rounding use "round half away from zero".
+// e.g, 1.5 -> 2, -1.5 -> -2.
 func RoundFloat(f float64) float64 {
-	if math.Remainder(f, 1.0) < 0 {
-		return math.Ceil(f)
+	if math.Abs(f) < 0.5 {
+		return 0
 	}
-	return math.Floor(f)
+
+	return math.Trunc(f + math.Copysign(0.5, f))
+}
+
+// Round rounds the argument f to dec decimal places.
+// dec defaults to 0 if not specified. dec can be negative
+// to cause dec digits left of the decimal point of the
+// value f to become zero.
+func Round(f float64, dec int) float64 {
+	shift := math.Pow10(dec)
+	f = f * shift
+	f = RoundFloat(f)
+	return f / shift
 }
 
 func getMaxFloat(flen int, decimal int) float64 {

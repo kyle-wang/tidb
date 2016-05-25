@@ -21,7 +21,6 @@ import (
 
 	"github.com/juju/errors"
 	"github.com/pingcap/tidb/ast"
-	"github.com/pingcap/tidb/column"
 	"github.com/pingcap/tidb/context"
 	"github.com/pingcap/tidb/infoschema"
 	"github.com/pingcap/tidb/model"
@@ -194,7 +193,7 @@ func (e *ShowExec) fetchShowColumns() error {
 			continue
 		}
 
-		desc := column.NewColDesc(col)
+		desc := table.NewColDesc(col)
 
 		// The FULL keyword causes the output to include the column collation and comments,
 		// as well as the privileges you have for each column.
@@ -318,6 +317,10 @@ func (e *ShowExec) fetchShowStatus() error {
 		if e.GlobalScope && v.Scope == variable.ScopeSession {
 			continue
 		}
+		switch v.Value.(type) {
+		case []interface{}, nil:
+			v.Value = fmt.Sprintf("%v", v.Value)
+		}
 		value, err := types.ToString(v.Value)
 		if err != nil {
 			return errors.Trace(err)
@@ -337,6 +340,7 @@ func (e *ShowExec) fetchShowCreateTable() error {
 	// TODO: let the result more like MySQL.
 	var buf bytes.Buffer
 	buf.WriteString(fmt.Sprintf("CREATE TABLE `%s` (\n", tb.Meta().Name.O))
+	var pkCol *table.Column
 	for i, col := range tb.Cols() {
 		buf.WriteString(fmt.Sprintf("  `%s` %s", col.Name.O, col.GetTypeDesc()))
 		if mysql.HasAutoIncrementFlag(col.Flag) {
@@ -345,22 +349,35 @@ func (e *ShowExec) fetchShowCreateTable() error {
 			if mysql.HasNotNullFlag(col.Flag) {
 				buf.WriteString(" NOT NULL")
 			}
-			switch col.DefaultValue {
-			case nil:
-				buf.WriteString(" DEFAULT NULL")
-			case "CURRENT_TIMESTAMP":
-				buf.WriteString(" DEFAULT CURRENT_TIMESTAMP")
-			default:
-				buf.WriteString(fmt.Sprintf(" DEFAULT '%v'", col.DefaultValue))
+			if !mysql.HasNoDefaultValueFlag(col.Flag) {
+				switch col.DefaultValue {
+				case nil:
+					buf.WriteString(" DEFAULT NULL")
+				case "CURRENT_TIMESTAMP":
+					buf.WriteString(" DEFAULT CURRENT_TIMESTAMP")
+				default:
+					buf.WriteString(fmt.Sprintf(" DEFAULT '%v'", col.DefaultValue))
+				}
 			}
-
 			if mysql.HasOnUpdateNowFlag(col.Flag) {
 				buf.WriteString(" ON UPDATE CURRENT_TIMESTAMP")
 			}
 		}
+		if len(col.Comment) > 0 {
+			buf.WriteString(fmt.Sprintf(" COMMENT '%s'", col.Comment))
+		}
 		if i != len(tb.Cols())-1 {
 			buf.WriteString(",\n")
 		}
+		if tb.Meta().PKIsHandle && mysql.HasPriKeyFlag(col.Flag) {
+			pkCol = col
+		}
+	}
+
+	if pkCol != nil {
+		// If PKIsHanle, pk info is not in tb.Indices(). We should handle it here.
+		buf.WriteString(",\n")
+		buf.WriteString(fmt.Sprintf(" PRIMARY KEY (`%s`) ", pkCol.Name.O))
 	}
 
 	if len(tb.Indices()) > 0 {
@@ -385,13 +402,47 @@ func (e *ShowExec) fetchShowCreateTable() error {
 			buf.WriteString(",\n")
 		}
 	}
+
+	for _, fk := range tb.Meta().ForeignKeys {
+		if fk.State != model.StatePublic {
+			continue
+		}
+
+		buf.WriteString("\n")
+		cols := make([]string, 0, len(fk.Cols))
+		for _, c := range fk.Cols {
+			cols = append(cols, c.L)
+		}
+
+		refCols := make([]string, 0, len(fk.RefCols))
+		for _, c := range fk.Cols {
+			refCols = append(refCols, c.L)
+		}
+
+		buf.WriteString(fmt.Sprintf("  CONSTRAINT `%s` FOREIGN KEY (`%s`)", fk.Name.L, strings.Join(cols, "`,`")))
+		buf.WriteString(fmt.Sprintf(" REFERENCES `%s` (`%s`)", fk.RefTable.L, strings.Join(refCols, "`,`")))
+
+		if ast.ReferOptionType(fk.OnDelete) != ast.ReferOptionNoOption {
+			buf.WriteString(fmt.Sprintf(" ON DELETE %s", ast.ReferOptionType(fk.OnDelete)))
+		}
+
+		if ast.ReferOptionType(fk.OnUpdate) != ast.ReferOptionNoOption {
+			buf.WriteString(fmt.Sprintf(" ON UPDATE %s", ast.ReferOptionType(fk.OnUpdate)))
+		}
+	}
 	buf.WriteString("\n")
 
 	buf.WriteString(") ENGINE=InnoDB")
 	if s := tb.Meta().Charset; len(s) > 0 {
 		buf.WriteString(fmt.Sprintf(" DEFAULT CHARSET=%s", s))
-	} else {
-		buf.WriteString(" DEFAULT CHARSET=latin1")
+	}
+
+	if tb.Meta().AutoIncID > 0 {
+		buf.WriteString(fmt.Sprintf(" AUTO_INCREMENT=%d", tb.Meta().AutoIncID))
+	}
+
+	if len(tb.Meta().Comment) > 0 {
+		buf.WriteString(fmt.Sprintf(" COMMENT='%s'", tb.Meta().Comment))
 	}
 
 	data := types.MakeDatums(tb.Meta().Name.O, buf.String())

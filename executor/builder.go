@@ -19,7 +19,6 @@ import (
 	"github.com/juju/errors"
 	"github.com/ngaut/log"
 	"github.com/pingcap/tidb/ast"
-	"github.com/pingcap/tidb/column"
 	"github.com/pingcap/tidb/context"
 	"github.com/pingcap/tidb/infoschema"
 	"github.com/pingcap/tidb/kv"
@@ -28,8 +27,8 @@ import (
 	"github.com/pingcap/tidb/parser/opcode"
 	"github.com/pingcap/tidb/sessionctx/autocommit"
 	"github.com/pingcap/tidb/sessionctx/variable"
+	"github.com/pingcap/tidb/table"
 	"github.com/pingcap/tidb/util/types"
-	"github.com/pingcap/tidb/xapi"
 )
 
 // executorBuilder builds an Executor from a Plan.
@@ -68,7 +67,7 @@ func (b *executorBuilder) build(p plan.Plan) Executor {
 	case *plan.Explain:
 		return b.buildExplain(v)
 	case *plan.Filter:
-		src := b.build(v.Src())
+		src := b.build(v.GetChildByIndex(0))
 		return b.buildFilter(src, v.Conditions)
 	case *plan.Having:
 		return b.buildHaving(v)
@@ -96,16 +95,91 @@ func (b *executorBuilder) build(p plan.Plan) Executor {
 		return b.buildSimple(v)
 	case *plan.Sort:
 		return b.buildSort(v)
+	case *plan.TableDual:
+		return b.buildTableDual(v)
 	case *plan.TableScan:
 		return b.buildTableScan(v)
 	case *plan.Union:
 		return b.buildUnion(v)
 	case *plan.Update:
 		return b.buildUpdate(v)
+	case *plan.Join:
+		return b.buildJoin(v)
 	default:
 		b.err = ErrUnknownPlan.Gen("Unknown Plan %T", p)
 		return nil
 	}
+}
+
+// compose CNF items into a balance deep CNF tree, which benefits a lot for pb decoder/encoder.
+func composeCondition(conditions []ast.ExprNode) ast.ExprNode {
+	length := len(conditions)
+	if length == 0 {
+		return nil
+	} else if length == 1 {
+		return conditions[0]
+	} else {
+		return &ast.BinaryOperationExpr{Op: opcode.AndAnd, L: composeCondition(conditions[:length/2]), R: composeCondition(conditions[length/2:])}
+	}
+}
+
+//TODO: select join algorithm during cbo phase.
+func (b *executorBuilder) buildJoin(v *plan.Join) Executor {
+	e := &HashJoinExec{
+		otherFilter: composeCondition(v.OtherConditions),
+		prepared:    false,
+		fields:      v.Fields(),
+		ctx:         b.ctx,
+	}
+	var leftHashKey, rightHashKey []ast.ExprNode
+	for _, eqCond := range v.EqualConditions {
+		binop, ok := eqCond.(*ast.BinaryOperationExpr)
+		if ok && binop.Op == opcode.EQ {
+			ln, lOK := binop.L.(*ast.ColumnNameExpr)
+			rn, rOK := binop.R.(*ast.ColumnNameExpr)
+			if lOK && rOK {
+				leftHashKey = append(leftHashKey, ln)
+				rightHashKey = append(rightHashKey, rn)
+				continue
+			}
+		}
+		b.err = ErrUnknownPlan.Gen("Invalid Join Equal Condition !!")
+	}
+	switch v.JoinType {
+	case plan.LeftOuterJoin:
+		e.outter = true
+		e.leftSmall = false
+		e.smallFilter = composeCondition(v.RightConditions)
+		e.bigFilter = composeCondition(v.LeftConditions)
+		e.smallHashKey = rightHashKey
+		e.bigHashKey = leftHashKey
+	case plan.RightOuterJoin:
+		e.outter = true
+		e.leftSmall = true
+		e.smallFilter = composeCondition(v.LeftConditions)
+		e.bigFilter = composeCondition(v.RightConditions)
+		e.smallHashKey = leftHashKey
+		e.bigHashKey = rightHashKey
+	case plan.InnerJoin:
+		//TODO: assume right table is the small one before cbo is realized.
+		e.outter = false
+		e.leftSmall = false
+		e.smallFilter = composeCondition(v.RightConditions)
+		e.bigFilter = composeCondition(v.LeftConditions)
+		e.smallHashKey = rightHashKey
+		e.bigHashKey = leftHashKey
+	default:
+		b.err = ErrUnknownPlan.Gen("Unknown Join Type !!")
+		return nil
+	}
+	if e.leftSmall {
+		e.smallExec = b.build(v.GetChildByIndex(0))
+		e.bigExec = b.build(v.GetChildByIndex(1))
+	} else {
+		e.smallExec = b.build(v.GetChildByIndex(1))
+		e.bigExec = b.build(v.GetChildByIndex(0))
+	}
+	return e
 }
 
 func (b *executorBuilder) buildFilter(src Executor, conditions []ast.ExprNode) Executor {
@@ -117,6 +191,11 @@ func (b *executorBuilder) buildFilter(src Executor, conditions []ast.ExprNode) E
 		Condition: b.joinConditions(conditions),
 		ctx:       b.ctx,
 	}
+}
+
+func (b *executorBuilder) buildTableDual(v *plan.TableDual) Executor {
+	e := &TableDualExec{fields: v.Fields()}
+	return b.buildFilter(e, v.FilterConditions)
 }
 
 func (b *executorBuilder) buildTableScan(v *plan.TableScan) Executor {
@@ -132,29 +211,44 @@ func (b *executorBuilder) buildTableScan(v *plan.TableScan) Executor {
 	case "information_schema", "performance_schema":
 		memDB = true
 	}
-	if !memDB && client.SupportRequestType(kv.ReqTypeSelect, 0) && txn.IsReadOnly() {
+	supportDesc := client.SupportRequestType(kv.ReqTypeSelect, kv.ReqSubTypeDesc)
+	if !memDB && client.SupportRequestType(kv.ReqTypeSelect, 0) {
 		log.Debug("xapi select table")
 		e := &XSelectTableExec{
-			table:     table,
-			ctx:       b.ctx,
-			tablePlan: v,
+			table:       table,
+			ctx:         b.ctx,
+			tablePlan:   v,
+			supportDesc: supportDesc,
 		}
-		where := conditionsToPBExpression(v.FilterConditions...)
-		if xapi.SupportExpression(client, where) {
+		where, remained := b.conditionsToPBExpr(client, v.FilterConditions, v.TableName)
+		if where != nil {
 			e.where = where
-			return e
 		}
-		return b.buildFilter(e, v.FilterConditions)
+		if len(remained) == 0 {
+			e.allFiltersPushed = true
+		}
+		var ex Executor
+		if txn.IsReadOnly() {
+			ex = e
+		} else {
+			ex = b.buildUnionScanExec(e)
+		}
+		return b.buildFilter(ex, remained)
 	}
 
 	e := &TableScanExec{
-		t:          table,
-		fields:     v.Fields(),
-		ctx:        b.ctx,
-		ranges:     v.Ranges,
-		seekHandle: math.MinInt64,
+		t:           table,
+		tableAsName: v.TableAsName,
+		fields:      v.Fields(),
+		ctx:         b.ctx,
+		ranges:      v.Ranges,
+		seekHandle:  math.MinInt64,
 	}
-	return b.buildFilter(e, v.FilterConditions)
+	x := b.buildFilter(e, v.FilterConditions)
+	if v.Desc {
+		x = &ReverseExec{Src: x}
+	}
+	return x
 }
 
 func (b *executorBuilder) buildShowDDL(v *plan.ShowDDL) Executor {
@@ -186,26 +280,34 @@ func (b *executorBuilder) buildIndexScan(v *plan.IndexScan) Executor {
 	}
 	tbl, _ := b.is.TableByID(v.Table.ID)
 	client := txn.GetClient()
+	supportDesc := client.SupportRequestType(kv.ReqTypeIndex, kv.ReqSubTypeDesc)
 	var memDB bool
 	switch v.Fields()[0].DBName.L {
 	case "information_schema", "performance_schema":
 		memDB = true
 	}
-	if !memDB && client.SupportRequestType(kv.ReqTypeIndex, 0) && txn.IsReadOnly() {
+	if !memDB && client.SupportRequestType(kv.ReqTypeIndex, 0) {
 		log.Debug("xapi select index")
 		e := &XSelectIndexExec{
-			table:     tbl,
-			ctx:       b.ctx,
-			indexPlan: v,
+			table:       tbl,
+			ctx:         b.ctx,
+			indexPlan:   v,
+			supportDesc: supportDesc,
 		}
-		where := conditionsToPBExpression(v.FilterConditions...)
-		if xapi.SupportExpression(client, where) {
+		where, remained := b.conditionsToPBExpr(client, v.FilterConditions, v.TableName)
+		if where != nil {
 			e.where = where
-			return e
 		}
-		return b.buildFilter(e, v.FilterConditions)
+		var ex Executor
+		if txn.IsReadOnly() {
+			ex = e
+		} else {
+			ex = b.buildUnionScanExec(e)
+		}
+		return b.buildFilter(ex, remained)
 	}
-	var idx *column.IndexedCol
+
+	var idx *table.IndexedColumn
 	for _, val := range tbl.Indices() {
 		if val.IndexInfo.Name.L == v.Index.Name.L {
 			idx = val
@@ -213,12 +315,13 @@ func (b *executorBuilder) buildIndexScan(v *plan.IndexScan) Executor {
 		}
 	}
 	e := &IndexScanExec{
-		tbl:        tbl,
-		idx:        idx,
-		fields:     v.Fields(),
-		ctx:        b.ctx,
-		Desc:       v.Desc,
-		valueTypes: make([]*types.FieldType, len(idx.Columns)),
+		tbl:         tbl,
+		tableAsName: v.TableAsName,
+		idx:         idx,
+		fields:      v.Fields(),
+		ctx:         b.ctx,
+		Desc:        v.Desc,
+		valueTypes:  make([]*types.FieldType, len(idx.Columns)),
 	}
 
 	for i, ic := range idx.Columns {
@@ -230,7 +333,11 @@ func (b *executorBuilder) buildIndexScan(v *plan.IndexScan) Executor {
 	for i, val := range v.Ranges {
 		e.Ranges[i] = b.buildIndexRange(e, val)
 	}
-	return b.buildFilter(e, v.FilterConditions)
+	x := b.buildFilter(e, v.FilterConditions)
+	if v.Desc {
+		x = &ReverseExec{Src: x}
+	}
+	return x
 }
 
 func (b *executorBuilder) buildIndexRange(scan *IndexScanExec, v *plan.IndexRange) *IndexRangeExec {
@@ -278,11 +385,12 @@ func (b *executorBuilder) joinConditions(conditions []ast.ExprNode) ast.ExprNode
 		L:  conditions[0],
 		R:  b.joinConditions(conditions[1:]),
 	}
+	ast.MergeChildrenFlags(condition, condition.L, condition.R)
 	return condition
 }
 
 func (b *executorBuilder) buildSelectLock(v *plan.SelectLock) Executor {
-	src := b.build(v.Src())
+	src := b.build(v.GetChildByIndex(0))
 	if autocommit.ShouldAutocommit(b.ctx) {
 		// Locking of rows for update using SELECT FOR UPDATE only applies when autocommit
 		// is disabled (either by beginning transaction with START TRANSACTION or by setting
@@ -299,7 +407,7 @@ func (b *executorBuilder) buildSelectLock(v *plan.SelectLock) Executor {
 }
 
 func (b *executorBuilder) buildSelectFields(v *plan.SelectFields) Executor {
-	src := b.build(v.Src())
+	src := b.build(v.GetChildByIndex(0))
 	e := &SelectFieldsExec{
 		Src:          src,
 		ResultFields: v.Fields(),
@@ -309,7 +417,7 @@ func (b *executorBuilder) buildSelectFields(v *plan.SelectFields) Executor {
 }
 
 func (b *executorBuilder) buildAggregate(v *plan.Aggregate) Executor {
-	src := b.build(v.Src())
+	src := b.build(v.GetChildByIndex(0))
 	e := &AggregateExec{
 		Src:          src,
 		ResultFields: v.Fields(),
@@ -321,22 +429,23 @@ func (b *executorBuilder) buildAggregate(v *plan.Aggregate) Executor {
 }
 
 func (b *executorBuilder) buildHaving(v *plan.Having) Executor {
-	src := b.build(v.Src())
+	src := b.build(v.GetChildByIndex(0))
 	return b.buildFilter(src, v.Conditions)
 }
 
 func (b *executorBuilder) buildSort(v *plan.Sort) Executor {
-	src := b.build(v.Src())
+	src := b.build(v.GetChildByIndex(0))
 	e := &SortExec{
 		Src:     src,
 		ByItems: v.ByItems,
 		ctx:     b.ctx,
+		Limit:   v.ExecLimit,
 	}
 	return e
 }
 
 func (b *executorBuilder) buildLimit(v *plan.Limit) Executor {
-	src := b.build(v.Src())
+	src := b.build(v.GetChildByIndex(0))
 	e := &LimitExec{
 		Src:    src,
 		Offset: v.Offset,
@@ -358,7 +467,7 @@ func (b *executorBuilder) buildUnion(v *plan.Union) Executor {
 }
 
 func (b *executorBuilder) buildDistinct(v *plan.Distinct) Executor {
-	return &DistinctExec{Src: b.build(v.Src())}
+	return &DistinctExec{Src: b.build(v.GetChildByIndex(0))}
 }
 
 func (b *executorBuilder) buildPrepare(v *plan.Prepare) Executor {
@@ -489,4 +598,28 @@ func (b *executorBuilder) buildExplain(v *plan.Explain) Executor {
 		StmtPlan: v.StmtPlan,
 		fields:   v.Fields(),
 	}
+}
+
+// buildUnionScanExec builds a union scan executor, the src Executor is either
+// *XSelectTableExec or *XSelectIndexExec.
+func (b *executorBuilder) buildUnionScanExec(src Executor) *UnionScanExec {
+	us := &UnionScanExec{ctx: b.ctx, Src: src}
+	switch x := src.(type) {
+	case *XSelectTableExec:
+		us.desc = x.tablePlan.Desc
+		us.dirty = getDirtyDB(b.ctx).getDirtyTable(x.table.Meta().ID)
+		us.condition = b.joinConditions(append(x.tablePlan.AccessConditions, x.tablePlan.FilterConditions...))
+		us.buildAndSortAddedRows(x.table, x.tablePlan.TableAsName)
+	case *XSelectIndexExec:
+		us.desc = x.indexPlan.Desc
+		for _, ic := range x.indexPlan.Index.Columns {
+			us.usedIndex = append(us.usedIndex, ic.Offset)
+		}
+		us.dirty = getDirtyDB(b.ctx).getDirtyTable(x.table.Meta().ID)
+		us.condition = b.joinConditions(append(x.indexPlan.AccessConditions, x.indexPlan.FilterConditions...))
+		us.buildAndSortAddedRows(x.table, x.indexPlan.TableAsName)
+	default:
+		b.err = ErrUnknownPlan
+	}
+	return us
 }

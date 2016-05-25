@@ -21,6 +21,7 @@ import (
 	"github.com/pingcap/tidb/kv"
 	"github.com/pingcap/tidb/store/localstore"
 	"github.com/pingcap/tidb/store/localstore/goleveldb"
+	"github.com/pingcap/tidb/util/testleak"
 )
 
 const (
@@ -109,22 +110,22 @@ func (c *MockContext) fillTxn() error {
 	return nil
 }
 
-func (c *MockContext) FinishTxn(rollback bool) error {
+func (c *MockContext) CommitTxn() error {
 	if c.txn == nil {
 		return nil
 	}
-
 	return c.txn.Commit()
 }
 
 func (s *testPrefixSuite) TestPrefix(c *C) {
+	defer testleak.AfterTest(c)()
 	ctx := &MockContext{10000000, make(map[fmt.Stringer]interface{}), s.s, nil}
 	ctx.fillTxn()
 	txn, err := ctx.GetTxn(false)
 	c.Assert(err, IsNil)
 	err = DelKeyWithPrefix(txn, encodeInt(ctx.prefix))
 	c.Assert(err, IsNil)
-	err = ctx.FinishTxn(false)
+	err = ctx.CommitTxn()
 	c.Assert(err, IsNil)
 
 	txn, err = s.s.Begin()
@@ -141,6 +142,7 @@ func (s *testPrefixSuite) TestPrefix(c *C) {
 }
 
 func (s *testPrefixSuite) TestPrefixFilter(c *C) {
+	defer testleak.AfterTest(c)()
 	rowKey := []byte("test@#$%l(le[0]..prefix) 2uio")
 	rowKey[8] = 0x00
 	rowKey[9] = 0x00

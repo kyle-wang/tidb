@@ -4,6 +4,7 @@ import (
 	"io"
 
 	"github.com/pingcap/tidb/kv"
+	"github.com/pingcap/tipb/go-tipb"
 )
 
 type dbClient struct {
@@ -37,11 +38,34 @@ func (c *dbClient) Send(req *kv.Request) kv.Response {
 func (c *dbClient) SupportRequestType(reqType, subType int64) bool {
 	switch reqType {
 	case kv.ReqTypeSelect:
-		return subType == kv.ReqSubTypeBasic
+		return supportExpr(tipb.ExprType(subType))
 	case kv.ReqTypeIndex:
-		return subType == kv.ReqSubTypeBasic
+		switch subType {
+		case kv.ReqSubTypeDesc, kv.ReqSubTypeBasic:
+			return true
+		}
 	}
 	return false
+}
+
+func supportExpr(exprType tipb.ExprType) bool {
+	switch exprType {
+	case tipb.ExprType_Null, tipb.ExprType_Int64, tipb.ExprType_Uint64, tipb.ExprType_Float32,
+		tipb.ExprType_Float64, tipb.ExprType_String, tipb.ExprType_Bytes,
+		tipb.ExprType_MysqlDuration, tipb.ExprType_MysqlDecimal,
+		tipb.ExprType_ColumnRef,
+		tipb.ExprType_And, tipb.ExprType_Or,
+		tipb.ExprType_LT, tipb.ExprType_LE, tipb.ExprType_EQ, tipb.ExprType_NE,
+		tipb.ExprType_GE, tipb.ExprType_GT, tipb.ExprType_NullEQ,
+		tipb.ExprType_In, tipb.ExprType_ValueList,
+		tipb.ExprType_Not,
+		tipb.ExprType_Like:
+		return true
+	case kv.ReqSubTypeDesc:
+		return true
+	default:
+		return false
+	}
 }
 
 func (c *dbClient) updateRegionInfo() {
@@ -152,6 +176,12 @@ func buildRegionTasks(client *dbClient, req *kv.Request) (tasks []*task) {
 			}
 			tasks = append(tasks, task)
 			infoCursor++
+		}
+	}
+	if req.Desc {
+		for i := 0; i < len(tasks)/2; i++ {
+			j := len(tasks) - i - 1
+			tasks[i], tasks[j] = tasks[j], tasks[i]
 		}
 	}
 	return

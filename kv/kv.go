@@ -38,6 +38,11 @@ type Retriever interface {
 	// If such entry is not found, it returns an invalid Iterator with no error.
 	// The Iterator must be Closed after use.
 	Seek(k Key) (Iterator, error)
+
+	// SeekReverse creates a reversed Iterator positioned on the first entry which key is less than k.
+	// The returned iterator will iterate from greater key to smaller key.
+	// If k is nil, the returned iterator will be positioned at the last key.
+	SeekReverse(k Key) (Iterator, error)
 }
 
 // Mutator is the interface wraps the basic Set and Delete methods.
@@ -84,7 +89,7 @@ type Transaction interface {
 	// GetClient gets a client instance.
 	GetClient() Client
 	// StartTS returns the transaction start timestamp.
-	StartTS() int64
+	StartTS() uint64
 }
 
 // Client is used to send request to KV layer.
@@ -102,6 +107,7 @@ const (
 	ReqTypeIndex  = 102
 
 	ReqSubTypeBasic = 0
+	ReqSubTypeDesc  = 10000
 )
 
 // KeyRange represents a range where StartKey <= key < EndKey.
@@ -122,6 +128,8 @@ type Request struct {
 	Data []byte
 	// Key Ranges
 	KeyRanges []KeyRange
+	// If KeepOrder is true, the response should be returned in order.
+	KeepOrder bool
 	// If desc is true, the request is sent in descending order.
 	Desc bool
 	// If concurrency is 1, it only sends the request to a single storage unit when

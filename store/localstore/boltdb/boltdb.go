@@ -51,34 +51,6 @@ func (d *db) Get(key []byte) ([]byte, error) {
 	return value, errors.Trace(err)
 }
 
-func (d *db) MultiSeek(keys [][]byte) []*engine.MSeekResult {
-	res := make([]*engine.MSeekResult, 0, len(keys))
-	d.DB.View(func(tx *bolt.Tx) error {
-		b := tx.Bucket(bucketName)
-		c := b.Cursor()
-		for _, key := range keys {
-			var k, v []byte
-			if key == nil {
-				k, v = c.First()
-			} else {
-				k, v = c.Seek(key)
-			}
-
-			r := &engine.MSeekResult{}
-			if k == nil {
-				r.Err = engine.ErrNotFound
-			} else {
-				r.Key, r.Value, r.Err = bytes.CloneBytes(k), bytes.CloneBytes(v), nil
-			}
-
-			res = append(res, r)
-		}
-		return nil
-	})
-
-	return res
-}
-
 func (d *db) Seek(startKey []byte) ([]byte, []byte, error) {
 	var key, value []byte
 	err := d.DB.View(func(tx *bolt.Tx) error {
@@ -89,6 +61,33 @@ func (d *db) Seek(startKey []byte) ([]byte, []byte, error) {
 			k, v = c.First()
 		} else {
 			k, v = c.Seek(startKey)
+		}
+		if k != nil {
+			key, value = bytes.CloneBytes(k), bytes.CloneBytes(v)
+		}
+		return nil
+	})
+
+	if err != nil {
+		return nil, nil, errors.Trace(err)
+	}
+	if key == nil {
+		return nil, nil, errors.Trace(engine.ErrNotFound)
+	}
+	return key, value, nil
+}
+
+func (d *db) SeekReverse(startKey []byte) ([]byte, []byte, error) {
+	var key, value []byte
+	err := d.DB.View(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucketName)
+		c := b.Cursor()
+		var k, v []byte
+		if startKey == nil {
+			k, v = c.Last()
+		} else {
+			c.Seek(startKey)
+			k, v = c.Prev()
 		}
 		if k != nil {
 			key, value = bytes.CloneBytes(k), bytes.CloneBytes(v)

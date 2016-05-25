@@ -23,7 +23,7 @@ import (
 	"github.com/pingcap/tidb/util/codec"
 	"github.com/pingcap/tidb/util/types"
 	"github.com/pingcap/tidb/xapi/tablecodec"
-	"github.com/pingcap/tidb/xapi/tipb"
+	"github.com/pingcap/tipb/go-tipb"
 )
 
 // SelectResult is used to get response rows from SelectRequest.
@@ -92,6 +92,12 @@ func (r *SubResult) Next() (handle int64, data []types.Datum, err error) {
 	if err != nil {
 		return 0, nil, errors.Trace(err)
 	}
+	if data == nil {
+		// When no column is referenced, the data may be nil, like 'select count(*) from t'.
+		// In this case, we need to create a zero length datum slice,
+		// as caller will check if data is nil to finish iteration.
+		data = make([]types.Datum, 0)
+	}
 	handleBytes := row.GetHandle()
 	datums, err := codec.Decode(handleBytes)
 	if err != nil {
@@ -132,6 +138,7 @@ func Select(client kv.Client, req *tipb.SelectRequest, concurrency int) (*Select
 func composeRequest(req *tipb.SelectRequest, concurrency int) (*kv.Request, error) {
 	kvReq := &kv.Request{
 		Concurrency: concurrency,
+		KeepOrder:   true,
 	}
 	if req.IndexInfo != nil {
 		kvReq.Tp = kv.ReqTypeIndex
@@ -142,6 +149,9 @@ func composeRequest(req *tipb.SelectRequest, concurrency int) (*kv.Request, erro
 		kvReq.Tp = kv.ReqTypeSelect
 		tid := req.GetTableInfo().GetTableId()
 		kvReq.KeyRanges = tablecodec.EncodeTableRanges(tid, req.Ranges)
+	}
+	if req.OrderBy != nil {
+		kvReq.Desc = *req.OrderBy[0].Desc
 	}
 	var err error
 	kvReq.Data, err = proto.Marshal(req)

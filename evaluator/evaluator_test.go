@@ -14,10 +14,10 @@
 package evaluator
 
 import (
-	"fmt"
 	"testing"
 	"time"
 
+	"fmt"
 	. "github.com/pingcap/check"
 	"github.com/pingcap/tidb/ast"
 	"github.com/pingcap/tidb/model"
@@ -27,6 +27,8 @@ import (
 	"github.com/pingcap/tidb/sessionctx/variable"
 	"github.com/pingcap/tidb/util/charset"
 	"github.com/pingcap/tidb/util/mock"
+	"github.com/pingcap/tidb/util/testleak"
+	"github.com/pingcap/tidb/util/testutil"
 	"github.com/pingcap/tidb/util/types"
 )
 
@@ -57,12 +59,13 @@ func (s *testEvaluatorSuite) runTests(c *C, cases []testCase) {
 		expr := parseExpr(c, ca.exprStr)
 		val, err := Eval(ctx, expr)
 		c.Assert(err, IsNil)
-		valStr := fmt.Sprintf("%v", val)
+		valStr := fmt.Sprintf("%v", val.GetValue())
 		c.Assert(valStr, Equals, ca.resultStr, Commentf("for %s", ca.exprStr))
 	}
 }
 
 func (s *testEvaluatorSuite) TestBetween(c *C) {
+	defer testleak.AfterTest(c)()
 	cases := []testCase{
 		{exprStr: "1 between 2 and 3", resultStr: "0"},
 		{exprStr: "1 not between 2 and 3", resultStr: "1"},
@@ -71,6 +74,7 @@ func (s *testEvaluatorSuite) TestBetween(c *C) {
 }
 
 func (s *testEvaluatorSuite) TestBinopComparison(c *C) {
+	defer testleak.AfterTest(c)()
 	ctx := mock.NewContext()
 	tbl := []struct {
 		lhs    interface{}
@@ -111,7 +115,7 @@ func (s *testEvaluatorSuite) TestBinopComparison(c *C) {
 		expr := &ast.BinaryOperationExpr{Op: t.op, L: ast.NewValueExpr(t.lhs), R: ast.NewValueExpr(t.rhs)}
 		v, err := Eval(ctx, expr)
 		c.Assert(err, IsNil)
-		val, err := types.ToBool(v)
+		val, err := v.ToBool()
 		c.Assert(err, IsNil)
 		c.Assert(val, Equals, t.result)
 	}
@@ -140,11 +144,12 @@ func (s *testEvaluatorSuite) TestBinopComparison(c *C) {
 		expr := &ast.BinaryOperationExpr{Op: t.op, L: ast.NewValueExpr(t.lhs), R: ast.NewValueExpr(t.rhs)}
 		v, err := Eval(ctx, expr)
 		c.Assert(err, IsNil)
-		c.Assert(v, IsNil)
+		c.Assert(v.Kind(), Equals, types.KindNull)
 	}
 }
 
 func (s *testEvaluatorSuite) TestBinopLogic(c *C) {
+	defer testleak.AfterTest(c)()
 	ctx := mock.NewContext()
 	tbl := []struct {
 		lhs interface{}
@@ -174,14 +179,15 @@ func (s *testEvaluatorSuite) TestBinopLogic(c *C) {
 		c.Assert(err, IsNil)
 		switch x := t.ret.(type) {
 		case nil:
-			c.Assert(v, IsNil)
+			c.Assert(v.Kind(), Equals, types.KindNull)
 		case int:
-			c.Assert(v, DeepEquals, int64(x))
+			c.Assert(v, testutil.DatumEquals, types.NewDatum(int64(x)))
 		}
 	}
 }
 
 func (s *testEvaluatorSuite) TestBinopBitop(c *C) {
+	defer testleak.AfterTest(c)()
 	ctx := mock.NewContext()
 	tbl := []struct {
 		lhs interface{}
@@ -209,14 +215,15 @@ func (s *testEvaluatorSuite) TestBinopBitop(c *C) {
 
 		switch x := t.ret.(type) {
 		case nil:
-			c.Assert(v, IsNil)
+			c.Assert(v.Kind(), Equals, types.KindNull)
 		case int:
-			c.Assert(v, DeepEquals, uint64(x))
+			c.Assert(v, testutil.DatumEquals, types.NewDatum(uint64(x)))
 		}
 	}
 }
 
 func (s *testEvaluatorSuite) TestBinopNumeric(c *C) {
+	defer testleak.AfterTest(c)()
 	ctx := mock.NewContext()
 	tbl := []struct {
 		lhs interface{}
@@ -299,12 +306,12 @@ func (s *testEvaluatorSuite) TestBinopNumeric(c *C) {
 		expr := &ast.BinaryOperationExpr{Op: t.op, L: ast.NewValueExpr(t.lhs), R: ast.NewValueExpr(t.rhs)}
 		v, err := Eval(ctx, expr)
 		c.Assert(err, IsNil)
-		switch v.(type) {
-		case nil:
+		switch v.Kind() {
+		case types.KindNull:
 			c.Assert(t.ret, IsNil)
 		default:
 			// we use float64 as the result type check for all.
-			f, err := types.ToFloat64(v)
+			f, err := v.ToFloat64()
 			c.Assert(err, IsNil)
 
 			r, err := types.ToFloat64(t.ret)
@@ -315,6 +322,7 @@ func (s *testEvaluatorSuite) TestBinopNumeric(c *C) {
 }
 
 func (s *testEvaluatorSuite) TestCaseWhen(c *C) {
+	defer testleak.AfterTest(c)()
 	cases := []testCase{
 		{
 			exprStr:   "case 1 when 1 then 'str1' when 2 then 'str2' end",
@@ -345,14 +353,16 @@ func (s *testEvaluatorSuite) TestCaseWhen(c *C) {
 	ctx := mock.NewContext()
 	v, err := Eval(ctx, caseExpr)
 	c.Assert(err, IsNil)
-	c.Assert(v, Equals, int64(1))
+	c.Assert(v, testutil.DatumEquals, types.NewDatum(int64(1)))
 	valExpr.SetValue(4)
+	ast.ResetEvaluatedFlag(caseExpr)
 	v, err = Eval(ctx, caseExpr)
 	c.Assert(err, IsNil)
-	c.Assert(v, IsNil)
+	c.Assert(v.Kind(), Equals, types.KindNull)
 }
 
 func (s *testEvaluatorSuite) TestCall(c *C) {
+	defer testleak.AfterTest(c)()
 	ctx := mock.NewContext()
 
 	// Test case for correct number of arguments
@@ -362,9 +372,8 @@ func (s *testEvaluatorSuite) TestCall(c *C) {
 	}
 	v, err := Eval(ctx, expr)
 	c.Assert(err, IsNil)
-	value, ok := v.(mysql.Time)
-	c.Assert(ok, IsTrue)
-	c.Assert(value.String(), Equals, "2015-12-21")
+	c.Assert(v.Kind(), Equals, types.KindMysqlTime)
+	c.Assert(v.GetMysqlTime().String(), Equals, "2015-12-21")
 
 	// Test case for unlimited upper bound
 	expr = &ast.FuncCallExpr{
@@ -374,7 +383,8 @@ func (s *testEvaluatorSuite) TestCall(c *C) {
 	}
 	v, err = Eval(ctx, expr)
 	c.Assert(err, IsNil)
-	c.Assert(v, Equals, "TiDB")
+	c.Assert(v.Kind(), Equals, types.KindString)
+	c.Assert(v.GetString(), Equals, "TiDB")
 
 	// Test case for unknown function
 	expr = &ast.FuncCallExpr{
@@ -403,41 +413,44 @@ func (s *testEvaluatorSuite) TestCall(c *C) {
 }
 
 func (s *testEvaluatorSuite) TestCast(c *C) {
+	defer testleak.AfterTest(c)()
 	f := types.NewFieldType(mysql.TypeLonglong)
 
 	expr := &ast.FuncCastExpr{
 		Expr: ast.NewValueExpr(1),
 		Tp:   f,
 	}
+	ast.SetFlag(expr)
 	ctx := mock.NewContext()
 	v, err := Eval(ctx, expr)
 	c.Assert(err, IsNil)
-	c.Assert(v, Equals, int64(1))
+	c.Assert(v, testutil.DatumEquals, types.NewDatum(int64(1)))
 
 	f.Flag |= mysql.UnsignedFlag
 	v, err = Eval(ctx, expr)
 	c.Assert(err, IsNil)
-	c.Assert(v, Equals, uint64(1))
+	c.Assert(v, testutil.DatumEquals, types.NewDatum(uint64(1)))
 
 	f.Tp = mysql.TypeString
 	f.Charset = charset.CharsetBin
 	v, err = Eval(ctx, expr)
 	c.Assert(err, IsNil)
-	c.Assert(v, DeepEquals, []byte("1"))
+	c.Assert(v, testutil.DatumEquals, types.NewDatum([]byte("1")))
 
 	f.Tp = mysql.TypeString
 	f.Charset = "utf8"
 	v, err = Eval(ctx, expr)
 	c.Assert(err, IsNil)
-	c.Assert(v, DeepEquals, "1")
+	c.Assert(v, testutil.DatumEquals, types.NewDatum("1"))
 
 	expr.Expr = ast.NewValueExpr(nil)
 	v, err = Eval(ctx, expr)
 	c.Assert(err, IsNil)
-	c.Assert(v, IsNil)
+	c.Assert(v.Kind(), Equals, types.KindNull)
 }
 
 func (s *testEvaluatorSuite) TestExtract(c *C) {
+	defer testleak.AfterTest(c)()
 	str := "2011-11-11 10:10:10.123456"
 	tbl := []struct {
 		Unit   string
@@ -472,7 +485,7 @@ func (s *testEvaluatorSuite) TestExtract(c *C) {
 		}
 		v, err := Eval(ctx, e)
 		c.Assert(err, IsNil)
-		c.Assert(v, Equals, t.Expect)
+		c.Assert(v, testutil.DatumEquals, types.NewDatum(t.Expect))
 	}
 
 	// Test nil
@@ -483,10 +496,11 @@ func (s *testEvaluatorSuite) TestExtract(c *C) {
 
 	v, err := Eval(ctx, e)
 	c.Assert(err, IsNil)
-	c.Assert(v, IsNil)
+	c.Assert(v.Kind(), Equals, types.KindNull)
 }
 
 func (s *testEvaluatorSuite) TestPatternIn(c *C) {
+	defer testleak.AfterTest(c)()
 	cases := []testCase{
 		{
 			exprStr:   "1 not in (1, 2, 3)",
@@ -533,6 +547,7 @@ func (s *testEvaluatorSuite) TestPatternIn(c *C) {
 }
 
 func (s *testEvaluatorSuite) TestIsNull(c *C) {
+	defer testleak.AfterTest(c)()
 	cases := []testCase{
 		{
 			exprStr:   "1 IS NULL",
@@ -555,6 +570,7 @@ func (s *testEvaluatorSuite) TestIsNull(c *C) {
 }
 
 func (s *testEvaluatorSuite) TestIsTruth(c *C) {
+	defer testleak.AfterTest(c)()
 	cases := []testCase{
 		{
 			exprStr:   "1 IS TRUE",
@@ -625,6 +641,7 @@ func (s *testEvaluatorSuite) TestIsTruth(c *C) {
 }
 
 func (s *testEvaluatorSuite) TestLike(c *C) {
+	defer testleak.AfterTest(c)()
 	tbl := []struct {
 		pattern string
 		input   string
@@ -695,6 +712,7 @@ func (s *testEvaluatorSuite) TestLike(c *C) {
 }
 
 func (s *testEvaluatorSuite) TestRegexp(c *C) {
+	defer testleak.AfterTest(c)()
 	tbl := []struct {
 		pattern string
 		input   string
@@ -718,11 +736,12 @@ func (s *testEvaluatorSuite) TestRegexp(c *C) {
 		}
 		match, err := Eval(ctx, pattern)
 		c.Assert(err, IsNil)
-		c.Assert(match, Equals, v.match, Commentf("%v", v))
+		c.Assert(match, testutil.DatumEquals, types.NewDatum(v.match), Commentf("%v", v))
 	}
 }
 
 func (s *testEvaluatorSuite) TestUnaryOp(c *C) {
+	defer testleak.AfterTest(c)()
 	tbl := []struct {
 		arg    interface{}
 		op     opcode.Op
@@ -772,13 +791,13 @@ func (s *testEvaluatorSuite) TestUnaryOp(c *C) {
 		{mysql.Set{Name: "a", Value: 1}, opcode.Minus, -1.0},
 	}
 	ctx := mock.NewContext()
-	expr := &ast.UnaryOperationExpr{}
 	for i, t := range tbl {
+		expr := &ast.UnaryOperationExpr{}
 		expr.Op = t.op
 		expr.V = ast.NewValueExpr(t.arg)
 		result, err := Eval(ctx, expr)
 		c.Assert(err, IsNil)
-		c.Assert(result, DeepEquals, t.result, Commentf("%d", i))
+		c.Assert(result, testutil.DatumEquals, types.NewDatum(t.result), Commentf("%d", i))
 	}
 
 	tbl = []struct {
@@ -802,39 +821,43 @@ func (s *testEvaluatorSuite) TestUnaryOp(c *C) {
 		result, err := Eval(ctx, expr)
 		c.Assert(err, IsNil)
 
-		ret, err := types.Compare(result, t.result)
+		ret, err := result.CompareDatum(types.NewDatum(t.result))
 		c.Assert(err, IsNil)
 		c.Assert(ret, Equals, 0)
 	}
 }
 
 func (s *testEvaluatorSuite) TestColumnNameExpr(c *C) {
+	defer testleak.AfterTest(c)()
 	ctx := mock.NewContext()
 	value1 := ast.NewValueExpr(1)
 	rf := &ast.ResultField{Expr: value1}
 	expr := &ast.ColumnNameExpr{Refer: rf}
 
+	ast.SetFlag(expr)
 	result, err := Eval(ctx, expr)
 	c.Assert(err, IsNil)
-	c.Assert(result, Equals, int64(1))
+	c.Assert(result, testutil.DatumEquals, types.NewDatum(int64(1)))
 
 	value2 := ast.NewValueExpr(2)
 	rf.Expr = value2
 	result, err = Eval(ctx, expr)
 	c.Assert(err, IsNil)
-	c.Assert(result, Equals, int64(2))
+	c.Assert(result, testutil.DatumEquals, types.NewDatum(int64(2)))
 }
 
 func (s *testEvaluatorSuite) TestAggFuncAvg(c *C) {
+	defer testleak.AfterTest(c)()
 	ctx := mock.NewContext()
 	avg := &ast.AggregateFuncExpr{
 		F: ast.AggFuncAvg,
 	}
 	avg.CurrentGroup = "emptyGroup"
+	ast.SetFlag(avg)
 	result, err := Eval(ctx, avg)
 	c.Assert(err, IsNil)
 	// Empty group should return nil.
-	c.Assert(result, IsNil)
+	c.Assert(result.Kind(), Equals, types.KindNull)
 
 	avg.Args = []ast.ExprNode{ast.NewValueExpr(2)}
 	avg.Update()
@@ -844,17 +867,17 @@ func (s *testEvaluatorSuite) TestAggFuncAvg(c *C) {
 	result, err = Eval(ctx, avg)
 	c.Assert(err, IsNil)
 	expect, _ := mysql.ConvertToDecimal(3)
-	v, ok := result.(mysql.Decimal)
-	c.Assert(ok, IsTrue)
-	c.Assert(v.Equals(expect), IsTrue)
+	c.Assert(result.Kind(), Equals, types.KindMysqlDecimal)
+	c.Assert(result.GetMysqlDecimal().Equals(expect), IsTrue)
 }
 
 func (s *testEvaluatorSuite) TestGetTimeValue(c *C) {
+	defer testleak.AfterTest(c)()
 	v, err := GetTimeValue(nil, "2012-12-12 00:00:00", mysql.TypeTimestamp, mysql.MinFsp)
 	c.Assert(err, IsNil)
 
-	timeValue, ok := v.(mysql.Time)
-	c.Assert(ok, IsTrue)
+	c.Assert(v.Kind(), Equals, types.KindMysqlTime)
+	timeValue := v.GetMysqlTime()
 	c.Assert(timeValue.String(), Equals, "2012-12-12 00:00:00")
 
 	ctx := mock.NewContext()
@@ -865,24 +888,24 @@ func (s *testEvaluatorSuite) TestGetTimeValue(c *C) {
 	v, err = GetTimeValue(ctx, "2012-12-12 00:00:00", mysql.TypeTimestamp, mysql.MinFsp)
 	c.Assert(err, IsNil)
 
-	timeValue, ok = v.(mysql.Time)
-	c.Assert(ok, IsTrue)
+	c.Assert(v.Kind(), Equals, types.KindMysqlTime)
+	timeValue = v.GetMysqlTime()
 	c.Assert(timeValue.String(), Equals, "2012-12-12 00:00:00")
 
 	sessionVars.Systems["timestamp"] = "0"
 	v, err = GetTimeValue(ctx, "2012-12-12 00:00:00", mysql.TypeTimestamp, mysql.MinFsp)
 	c.Assert(err, IsNil)
 
-	timeValue, ok = v.(mysql.Time)
-	c.Assert(ok, IsTrue)
+	c.Assert(v.Kind(), Equals, types.KindMysqlTime)
+	timeValue = v.GetMysqlTime()
 	c.Assert(timeValue.String(), Equals, "2012-12-12 00:00:00")
 
 	delete(sessionVars.Systems, "timestamp")
 	v, err = GetTimeValue(ctx, "2012-12-12 00:00:00", mysql.TypeTimestamp, mysql.MinFsp)
 	c.Assert(err, IsNil)
 
-	timeValue, ok = v.(mysql.Time)
-	c.Assert(ok, IsTrue)
+	c.Assert(v.Kind(), Equals, types.KindMysqlTime)
+	timeValue = v.GetMysqlTime()
 	c.Assert(timeValue.String(), Equals, "2012-12-12 00:00:00")
 
 	sessionVars.Systems["timestamp"] = "1234"
@@ -906,11 +929,11 @@ func (s *testEvaluatorSuite) TestGetTimeValue(c *C) {
 		v, err := GetTimeValue(ctx, t.Expr, mysql.TypeTimestamp, mysql.MinFsp)
 		c.Assert(err, IsNil)
 
-		switch x := v.(type) {
-		case mysql.Time:
-			c.Assert(x.String(), DeepEquals, t.Ret, comment)
+		switch v.Kind() {
+		case types.KindMysqlTime:
+			c.Assert(v.GetMysqlTime().String(), DeepEquals, t.Ret, comment)
 		default:
-			c.Assert(x, DeepEquals, t.Ret, comment)
+			c.Assert(v.GetValue(), DeepEquals, t.Ret, comment)
 		}
 	}
 
@@ -931,9 +954,65 @@ func (s *testEvaluatorSuite) TestGetTimeValue(c *C) {
 }
 
 func (s *testEvaluatorSuite) TestIsCurrentTimeExpr(c *C) {
+	defer testleak.AfterTest(c)()
 	v := IsCurrentTimeExpr(ast.NewValueExpr("abc"))
 	c.Assert(v, IsFalse)
 
 	v = IsCurrentTimeExpr(&ast.FuncCallExpr{FnName: model.NewCIStr("CURRENT_TIMESTAMP")})
 	c.Assert(v, IsTrue)
+}
+
+func (s *testEvaluatorSuite) TestEvaluatedFlag(c *C) {
+	l := ast.NewValueExpr(int64(1))
+	r := ast.NewValueExpr(int64(2))
+	b := &ast.BinaryOperationExpr{L: l, R: r, Op: opcode.Plus}
+	ast.SetFlag(b)
+	c.Assert(ast.IsPreEvaluable(b), Equals, true)
+	ctx := mock.NewContext()
+	d, err := Eval(ctx, b)
+	c.Assert(ast.IsEvaluated(b), Equals, true)
+	c.Assert(err, IsNil)
+	c.Assert(d, testutil.DatumEquals, types.NewIntDatum(3))
+
+	funcCall := &ast.FuncCallExpr{
+		FnName: model.NewCIStr("abs"),
+		Args:   []ast.ExprNode{ast.NewValueExpr(int(-1))},
+	}
+	b = &ast.BinaryOperationExpr{L: funcCall, R: r, Op: opcode.Plus}
+	ast.ResetEvaluatedFlag(b)
+	ast.SetFlag(b)
+	c.Assert(ast.IsPreEvaluable(b), Equals, true)
+	d, err = Eval(ctx, b)
+	c.Assert(ast.IsEvaluated(b), Equals, false)
+	c.Assert(err, IsNil)
+	c.Assert(d, testutil.DatumEquals, types.NewIntDatum(3))
+
+	rf := &ast.ResultField{Expr: ast.NewValueExpr(int64(1))}
+	colExpr := &ast.ColumnNameExpr{Refer: rf}
+	b = &ast.BinaryOperationExpr{L: colExpr, R: r, Op: opcode.Plus}
+	ast.ResetEvaluatedFlag(b)
+	ast.SetFlag(b)
+	c.Assert(ast.IsPreEvaluable(b), Equals, false)
+	d, err = Eval(ctx, b)
+	c.Assert(ast.IsEvaluated(b), Equals, false)
+	c.Assert(err, IsNil)
+	c.Assert(d, testutil.DatumEquals, types.NewIntDatum(3))
+}
+
+func (s *testEvaluatorSuite) TestMod(c *C) {
+	cases := []testCase{
+		{
+			exprStr:   "MOD(234, 10)",
+			resultStr: "4",
+		},
+		{
+			exprStr:   "MOD(29, 9)",
+			resultStr: "2",
+		},
+		{
+			exprStr:   "MOD(34.5, 3)",
+			resultStr: "1.5",
+		},
+	}
+	s.runTests(c, cases)
 }

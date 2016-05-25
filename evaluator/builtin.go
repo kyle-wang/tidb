@@ -18,14 +18,19 @@
 package evaluator
 
 import (
+	"strings"
+
 	"github.com/pingcap/tidb/context"
 	"github.com/pingcap/tidb/util/types"
 )
 
+// BuiltinFunc is the function signature for builtin functions
+type BuiltinFunc func([]types.Datum, context.Context) (types.Datum, error)
+
 // Func is for a builtin function.
 type Func struct {
 	// F is the specific calling function.
-	F func([]types.Datum, context.Context) (types.Datum, error)
+	F BuiltinFunc
 	// MinArgs is the minimal arguments needed,
 	MinArgs int
 	// MaxArgs is the maximal arguments needed, -1 for infinity.
@@ -36,12 +41,14 @@ type Func struct {
 var Funcs = map[string]Func{
 	// common functions
 	"coalesce": {builtinCoalesce, 1, -1},
+	"isnull":   {builtinIsNull, 1, 1},
 
 	// math functions
 	"abs":   {builtinAbs, 1, 1},
 	"pow":   {builtinPow, 2, 2},
 	"power": {builtinPow, 2, 2},
 	"rand":  {builtinRand, 0, 1},
+	"round": {builtinRound, 1, 2},
 
 	// time functions
 	"curdate":           {builtinCurrentDate, 0, 0},
@@ -62,6 +69,7 @@ var Funcs = map[string]Func{
 	"now":               {builtinNow, 0, 1},
 	"second":            {builtinSecond, 1, 1},
 	"sysdate":           {builtinSysDate, 0, 1},
+	"utc_date":          {builtinUTCDate, 0, 0},
 	"week":              {builtinWeek, 1, 2},
 	"weekday":           {builtinWeekDay, 1, 1},
 	"weekofyear":        {builtinWeekOfYear, 1, 1},
@@ -71,20 +79,26 @@ var Funcs = map[string]Func{
 	"date_arith":        {builtinDateArith, 3, 3},
 
 	// string functions
+	"ascii":           {builtinASCII, 1, 1},
 	"concat":          {builtinConcat, 1, -1},
 	"concat_ws":       {builtinConcatWS, 2, -1},
 	"left":            {builtinLeft, 2, 2},
 	"length":          {builtinLength, 1, 1},
 	"lower":           {builtinLower, 1, 1},
+	"lcase":           {builtinLower, 1, 1},
+	"ltrim":           {trimFn(strings.TrimLeft, spaceChars), 1, 1},
 	"repeat":          {builtinRepeat, 2, 2},
 	"upper":           {builtinUpper, 1, 1},
+	"ucase":           {builtinUpper, 1, 1},
 	"replace":         {builtinReplace, 3, 3},
+	"rtrim":           {trimFn(strings.TrimRight, spaceChars), 1, 1},
 	"strcmp":          {builtinStrcmp, 2, 2},
 	"convert":         {builtinConvert, 2, 2},
 	"substring":       {builtinSubstring, 2, 3},
 	"substring_index": {builtinSubstringIndex, 3, 3},
 	"locate":          {builtinLocate, 2, 3},
 	"trim":            {builtinTrim, 1, 3},
+	"reverse":         {builtinReverse, 1, 1},
 
 	// information functions
 	"current_user":  {builtinCurrentUser, 0, 0},
@@ -106,6 +120,16 @@ func builtinCoalesce(args []types.Datum, ctx context.Context) (d types.Datum, er
 		if d.Kind() != types.KindNull {
 			return d, nil
 		}
+	}
+	return d, nil
+}
+
+// See: https://dev.mysql.com/doc/refman/5.7/en/comparison-operators.html#function_isnull
+func builtinIsNull(args []types.Datum, _ context.Context) (d types.Datum, err error) {
+	if args[0].Kind() == types.KindNull {
+		d.SetInt64(1)
+	} else {
+		d.SetInt64(0)
 	}
 	return d, nil
 }

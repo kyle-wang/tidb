@@ -14,11 +14,13 @@
 package executor_test
 
 import (
+	"flag"
 	"fmt"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/ngaut/log"
 	. "github.com/pingcap/check"
 	"github.com/pingcap/tidb"
 	"github.com/pingcap/tidb/domain"
@@ -26,7 +28,10 @@ import (
 	"github.com/pingcap/tidb/inspectkv"
 	"github.com/pingcap/tidb/kv"
 	"github.com/pingcap/tidb/model"
+	"github.com/pingcap/tidb/optimizer/plan"
+	"github.com/pingcap/tidb/store/tikv"
 	"github.com/pingcap/tidb/util/testkit"
+	"github.com/pingcap/tidb/util/testleak"
 	"github.com/pingcap/tidb/util/types"
 )
 
@@ -40,17 +45,30 @@ type testSuite struct {
 	store kv.Storage
 }
 
+var mockTikv = flag.Bool("mockTikv", true, "use mock tikv store in executor test")
+
 func (s *testSuite) SetUpSuite(c *C) {
-	store, err := tidb.NewStore("memory://test/test")
-	c.Assert(err, IsNil)
-	s.store = store
+	flag.Lookup("mockTikv")
+	useMockTikv := *mockTikv
+	if useMockTikv {
+		s.store = tikv.NewMockTikvStore()
+		tidb.SetSchemaLease(0)
+	} else {
+		store, err := tidb.NewStore("memory://test/test")
+		c.Assert(err, IsNil)
+		s.store = store
+	}
+	log.SetLevelByString("warn")
+	executor.BaseLookupTableTaskSize = 2
 }
 
 func (s *testSuite) TearDownSuite(c *C) {
+	executor.BaseLookupTableTaskSize = 512
 	s.store.Close()
 }
 
 func (s *testSuite) TestAdmin(c *C) {
+	defer testleak.AfterTest(c)()
 	tk := testkit.NewTestKit(c, s.store)
 	tk.MustExec("use test")
 	tk.MustExec("drop table if exists admin_test")
@@ -107,6 +125,7 @@ func (s *testSuite) TestAdmin(c *C) {
 }
 
 func (s *testSuite) TestPrepared(c *C) {
+	defer testleak.AfterTest(c)()
 	tk := testkit.NewTestKit(c, s.store)
 	tk.MustExec("use test")
 	tk.MustExec("drop table if exists prepare_test")
@@ -175,6 +194,7 @@ func (s *testSuite) fillData(tk *testkit.TestKit, table string) {
 }
 
 func (s *testSuite) TestDelete(c *C) {
+	defer testleak.AfterTest(c)()
 	tk := testkit.NewTestKit(c, s.store)
 	s.fillData(tk, "delete_test")
 
@@ -221,6 +241,7 @@ func (s *testSuite) fillDataMultiTable(tk *testkit.TestKit) {
 }
 
 func (s *testSuite) TestMultiTableDelete(c *C) {
+	defer testleak.AfterTest(c)()
 	tk := testkit.NewTestKit(c, s.store)
 	s.fillDataMultiTable(tk)
 
@@ -233,6 +254,7 @@ func (s *testSuite) TestMultiTableDelete(c *C) {
 }
 
 func (s *testSuite) TestQualifedDelete(c *C) {
+	defer testleak.AfterTest(c)()
 	tk := testkit.NewTestKit(c, s.store)
 	tk.MustExec("use test")
 	tk.MustExec("drop table if exists t1")
@@ -271,6 +293,7 @@ func (s *testSuite) TestQualifedDelete(c *C) {
 }
 
 func (s *testSuite) TestInsert(c *C) {
+	defer testleak.AfterTest(c)()
 	tk := testkit.NewTestKit(c, s.store)
 	tk.MustExec("use test")
 	testSQL := `drop table if exists insert_test;create table insert_test (id int PRIMARY KEY AUTO_INCREMENT, c1 int, c2 int, c3 int default 1);`
@@ -344,6 +367,7 @@ func (s *testSuite) TestInsert(c *C) {
 }
 
 func (s *testSuite) TestInsertAutoInc(c *C) {
+	defer testleak.AfterTest(c)()
 	tk := testkit.NewTestKit(c, s.store)
 	tk.MustExec("use test")
 	createSQL := `drop table if exists insert_autoinc_test; create table insert_autoinc_test (id int primary key auto_increment, c1 int);`
@@ -427,6 +451,7 @@ func (s *testSuite) TestInsertAutoInc(c *C) {
 }
 
 func (s *testSuite) TestReplace(c *C) {
+	defer testleak.AfterTest(c)()
 	tk := testkit.NewTestKit(c, s.store)
 	tk.MustExec("use test")
 	testSQL := `drop table if exists replace_test;
@@ -548,6 +573,7 @@ func (s *testSuite) TestReplace(c *C) {
 }
 
 func (s *testSuite) TestSelectWithoutFrom(c *C) {
+	defer testleak.AfterTest(c)()
 	tk := testkit.NewTestKit(c, s.store)
 	tk.MustExec("use test")
 
@@ -562,7 +588,49 @@ func (s *testSuite) TestSelectWithoutFrom(c *C) {
 	tk.MustExec("commit")
 }
 
+func (s *testSuite) TestSelectLimit(c *C) {
+	defer testleak.AfterTest(c)()
+	tk := testkit.NewTestKit(c, s.store)
+	tk.MustExec("use test")
+	s.fillData(tk, "select_limit")
+
+	tk.MustExec("insert INTO select_limit VALUES (3, \"hello\");")
+	tk.CheckExecResult(1, 0)
+	tk.MustExec("insert INTO select_limit VALUES (4, \"hello\");")
+	tk.CheckExecResult(1, 0)
+
+	tk.MustExec("begin")
+	r := tk.MustQuery("select * from select_limit limit 1;")
+	rowStr1 := fmt.Sprintf("%v %v", 1, []byte("hello"))
+	r.Check(testkit.Rows(rowStr1))
+	tk.MustExec("commit")
+
+	tk.MustExec("begin")
+	r = tk.MustQuery("select * from select_limit limit 18446744073709551615 offset 0;")
+	rowStr2 := fmt.Sprintf("%v %v", 2, []byte("hello"))
+	rowStr3 := fmt.Sprintf("%v %v", 3, []byte("hello"))
+	rowStr4 := fmt.Sprintf("%v %v", 4, []byte("hello"))
+	r.Check(testkit.Rows(rowStr1, rowStr2, rowStr3, rowStr4))
+	tk.MustExec("commit")
+
+	tk.MustExec("begin")
+	r = tk.MustQuery("select * from select_limit limit 18446744073709551615 offset 1;")
+	r.Check(testkit.Rows(rowStr2, rowStr3, rowStr4))
+	tk.MustExec("commit")
+
+	tk.MustExec("begin")
+	r = tk.MustQuery("select * from select_limit limit 18446744073709551615 offset 3;")
+	r.Check(testkit.Rows(rowStr4))
+	tk.MustExec("commit")
+
+	tk.MustExec("begin")
+	_, err := tk.Exec("select * from select_limit limit 18446744073709551616 offset 3;")
+	c.Assert(err, NotNil)
+	tk.MustExec("rollback")
+}
+
 func (s *testSuite) TestSelectOrderBy(c *C) {
+	defer testleak.AfterTest(c)()
 	tk := testkit.NewTestKit(c, s.store)
 	tk.MustExec("use test")
 	s.fillData(tk, "select_order_test")
@@ -575,16 +643,57 @@ func (s *testSuite) TestSelectOrderBy(c *C) {
 	tk.MustExec("commit")
 
 	tk.MustExec("begin")
+	// Test limit
+	r = tk.MustQuery("select * from select_order_test order by name, id limit 1 offset 0;")
+	rowStr = fmt.Sprintf("%v %v", 1, []byte("hello"))
+	r.Check(testkit.Rows(rowStr))
+	tk.MustExec("commit")
+
+	tk.MustExec("begin")
+	// Test limit overflow
+	r = tk.MustQuery("select * from select_order_test order by name, id limit 100 offset 0;")
+	rowStr1 := fmt.Sprintf("%v %v", 1, []byte("hello"))
+	rowStr2 := fmt.Sprintf("%v %v", 2, []byte("hello"))
+	r.Check(testkit.Rows(rowStr1, rowStr2))
+	tk.MustExec("commit")
+
+	tk.MustExec("begin")
+	// Test offset overflow
+	r = tk.MustQuery("select * from select_order_test order by name, id limit 1 offset 100;")
+	r.Check(testkit.Rows())
+	tk.MustExec("commit")
+
+	tk.MustExec("begin")
 	// Test multiple field
 	r = tk.MustQuery("select id, name from select_order_test where id = 1 group by id, name limit 1 offset 0;")
 	rowStr = fmt.Sprintf("%v %v", 1, []byte("hello"))
 	r.Check(testkit.Rows(rowStr))
 	tk.MustExec("commit")
 
+	// Test limit + order by
+	tk.MustExec("begin")
+	executor.SortBufferSize = 10
+	for i := 3; i <= 10; i += 1 {
+		tk.MustExec(fmt.Sprintf("insert INTO select_order_test VALUES (%d, \"zz\");", i))
+	}
+	tk.MustExec("insert INTO select_order_test VALUES (10086, \"hi\");")
+	for i := 11; i <= 20; i += 1 {
+		tk.MustExec(fmt.Sprintf("insert INTO select_order_test VALUES (%d, \"hh\");", i))
+	}
+	for i := 21; i <= 30; i += 1 {
+		tk.MustExec(fmt.Sprintf("insert INTO select_order_test VALUES (%d, \"zz\");", i))
+	}
+	tk.MustExec("insert INTO select_order_test VALUES (1501, \"aa\");")
+	r = tk.MustQuery("select * from select_order_test order by name, id limit 1 offset 3;")
+	rowStr = fmt.Sprintf("%v %v", 11, []byte("hh"))
+	r.Check(testkit.Rows(rowStr))
+	tk.MustExec("commit")
+	executor.SortBufferSize = 500
 	tk.MustExec("drop table select_order_test")
 }
 
 func (s *testSuite) TestSelectDistinct(c *C) {
+	defer testleak.AfterTest(c)()
 	tk := testkit.NewTestKit(c, s.store)
 	tk.MustExec("use test")
 	s.fillData(tk, "select_distinct_test")
@@ -599,6 +708,7 @@ func (s *testSuite) TestSelectDistinct(c *C) {
 }
 
 func (s *testSuite) TestSelectHaving(c *C) {
+	defer testleak.AfterTest(c)()
 	tk := testkit.NewTestKit(c, s.store)
 	tk.MustExec("use test")
 	s.fillData(tk, "select_having_test")
@@ -609,10 +719,13 @@ func (s *testSuite) TestSelectHaving(c *C) {
 	r.Check(testkit.Rows(rowStr))
 	tk.MustExec("commit")
 
+	r = tk.MustQuery("select * from select_having_test group by id having null is not null;")
+
 	tk.MustExec("drop table select_having_test")
 }
 
 func (s *testSuite) TestSelectErrorRow(c *C) {
+	defer testleak.AfterTest(c)()
 	tk := testkit.NewTestKit(c, s.store)
 	tk.MustExec("use test")
 
@@ -645,6 +758,7 @@ func (s *testSuite) TestSelectErrorRow(c *C) {
 }
 
 func (s *testSuite) TestUpdate(c *C) {
+	defer testleak.AfterTest(c)()
 	tk := testkit.NewTestKit(c, s.store)
 	tk.MustExec("use test")
 	s.fillData(tk, "update_test")
@@ -706,6 +820,7 @@ func (s *testSuite) fillMultiTableForUpdate(tk *testkit.TestKit) {
 }
 
 func (s *testSuite) TestMultipleTableUpdate(c *C) {
+	defer testleak.AfterTest(c)()
 	tk := testkit.NewTestKit(c, s.store)
 	tk.MustExec("use test")
 	s.fillMultiTableForUpdate(tk)
@@ -742,6 +857,7 @@ func (s *testSuite) TestMultipleTableUpdate(c *C) {
 
 // For https://github.com/pingcap/tidb/issues/345
 func (s *testSuite) TestIssue345(c *C) {
+	defer testleak.AfterTest(c)()
 	tk := testkit.NewTestKit(c, s.store)
 	tk.MustExec("use test")
 	tk.MustExec(`drop table if exists t1, t2`)
@@ -782,6 +898,7 @@ func (s *testSuite) TestIssue345(c *C) {
 }
 
 func (s *testSuite) TestMultiUpdate(c *C) {
+	defer testleak.AfterTest(c)()
 	tk := testkit.NewTestKit(c, s.store)
 	tk.MustExec("use test")
 	// fix https://github.com/pingcap/tidb/issues/369
@@ -808,9 +925,9 @@ func (s *testSuite) TestMultiUpdate(c *C) {
 }
 
 func (s *testSuite) TestUnion(c *C) {
+	defer testleak.AfterTest(c)()
 	tk := testkit.NewTestKit(c, s.store)
 	tk.MustExec("use test")
-
 	testSQL := `select 1 union select 0;`
 	tk.MustExec(testSQL)
 
@@ -827,6 +944,11 @@ func (s *testSuite) TestUnion(c *C) {
 	testSQL = `select id from union_test union select id from union_test;`
 	tk.MustExec("begin")
 	r := tk.MustQuery(testSQL)
+	r.Check(testkit.Rows("1", "2"))
+
+	testSQL = `select * from (select id from union_test union select id from union_test) t;`
+	tk.MustExec("begin")
+	r = tk.MustQuery(testSQL)
 	r.Check(testkit.Rows("1", "2"))
 
 	r = tk.MustQuery("select 1 union all select 1")
@@ -858,6 +980,7 @@ func (s *testSuite) TestUnion(c *C) {
 }
 
 func (s *testSuite) TestTablePKisHandleScan(c *C) {
+	defer testleak.AfterTest(c)()
 	tk := testkit.NewTestKit(c, s.store)
 	tk.MustExec("use test")
 	tk.MustExec("drop table if exists t")
@@ -920,6 +1043,7 @@ func (s *testSuite) TestTablePKisHandleScan(c *C) {
 }
 
 func (s *testSuite) TestJoin(c *C) {
+	defer testleak.AfterTest(c)()
 	tk := testkit.NewTestKit(c, s.store)
 	tk.MustExec("use test")
 	tk.MustExec("drop table if exists t")
@@ -942,4 +1066,287 @@ func (s *testSuite) TestJoin(c *C) {
 		result := tk.MustQuery(ca.sql)
 		result.Check(ca.result)
 	}
+
+	tk.MustExec("drop table if exists t")
+	tk.MustExec("drop table if exists t1")
+	tk.MustExec("create table t(c1 int, c2 int)")
+	tk.MustExec("create table t1(c1 int, c2 int)")
+	tk.MustExec("insert into t values(1,1),(2,2)")
+	tk.MustExec("insert into t1 values(2,3),(4,4)")
+	result := tk.MustQuery("select * from t left outer join t1 on t.c1 = t1.c1 where t.c1 = 1 or t1.c2 > 20")
+	result.Check(testkit.Rows("1 1 <nil> <nil>"))
+	result = tk.MustQuery("select * from t1 right outer join t on t.c1 = t1.c1 where t.c1 = 1 or t1.c2 > 20")
+	result.Check(testkit.Rows("<nil> <nil> 1 1"))
+	result = tk.MustQuery("select * from t right outer join t1 on t.c1 = t1.c1 where t.c1 = 1 or t1.c2 > 20")
+	result.Check(testkit.Rows())
+	result = tk.MustQuery("select * from t left outer join t1 on t.c1 = t1.c1 where t1.c1 = 3 or false")
+	result.Check(testkit.Rows())
+	result = tk.MustQuery("select * from t left outer join t1 on t.c1 = t1.c1 and t.c1 != 1")
+	result.Check(testkit.Rows("1 1 <nil> <nil>", "2 2 2 3"))
+
+	tk.MustExec("drop table if exists t1")
+	tk.MustExec("drop table if exists t2")
+	tk.MustExec("drop table if exists t3")
+
+	tk.MustExec("create table t1 (c1 int, c2 int)")
+	tk.MustExec("create table t2 (c1 int, c2 int)")
+	tk.MustExec("create table t3 (c1 int, c2 int)")
+
+	tk.MustExec("insert into t1 values (1,1), (2,2), (3,3)")
+	tk.MustExec("insert into t2 values (1,1), (3,3), (5,5)")
+	tk.MustExec("insert into t3 values (1,1), (5,5), (9,9)")
+
+	result = tk.MustQuery("select * from t1 left join t2 on t1.c1 = t2.c1 right join t3 on t2.c1 = t3.c1 order by t1.c1, t1.c2, t2.c1, t2.c2, t3.c1, t3.c2;")
+	result.Check(testkit.Rows("<nil> <nil> <nil> <nil> 5 5", "<nil> <nil> <nil> <nil> 9 9", "1 1 1 1 1 1"))
+}
+
+func (s *testSuite) TestNewJoin(c *C) {
+	plan.UseNewPlanner = true
+	defer testleak.AfterTest(c)()
+	tk := testkit.NewTestKit(c, s.store)
+	tk.MustExec("use test")
+	tk.MustExec("drop table if exists t")
+	tk.MustExec("create table t (c int)")
+	tk.MustExec("insert t values (1)")
+	cases := []struct {
+		sql    string
+		result [][]interface{}
+	}{
+		{
+			"select 1 from t as a left join t as b on 0",
+			testkit.Rows("1"),
+		},
+		{
+			"select 1 from t as a join t as b on 1",
+			testkit.Rows("1"),
+		},
+	}
+	for _, ca := range cases {
+		result := tk.MustQuery(ca.sql)
+		result.Check(ca.result)
+	}
+
+	tk.MustExec("drop table if exists t")
+	tk.MustExec("drop table if exists t1")
+	tk.MustExec("create table t(c1 int, c2 int)")
+	tk.MustExec("create table t1(c1 int, c2 int)")
+	tk.MustExec("insert into t values(1,1),(2,2)")
+	tk.MustExec("insert into t1 values(2,3),(4,4)")
+	result := tk.MustQuery("select * from t left outer join t1 on t.c1 = t1.c1 where t.c1 = 1 or t1.c2 > 20")
+	result.Check(testkit.Rows("1 1 <nil> <nil>"))
+	result = tk.MustQuery("select * from t1 right outer join t on t.c1 = t1.c1 where t.c1 = 1 or t1.c2 > 20")
+	result.Check(testkit.Rows("<nil> <nil> 1 1"))
+	result = tk.MustQuery("select * from t right outer join t1 on t.c1 = t1.c1 where t.c1 = 1 or t1.c2 > 20")
+	result.Check(testkit.Rows())
+	result = tk.MustQuery("select * from t left outer join t1 on t.c1 = t1.c1 where t1.c1 = 3 or false")
+	result.Check(testkit.Rows())
+	result = tk.MustQuery("select * from t left outer join t1 on t.c1 = t1.c1 and t.c1 != 1")
+	result.Check(testkit.Rows("1 1 <nil> <nil>", "2 2 2 3"))
+
+	tk.MustExec("drop table if exists t1")
+	tk.MustExec("drop table if exists t2")
+	tk.MustExec("drop table if exists t3")
+
+	tk.MustExec("create table t1 (c1 int, c2 int)")
+	tk.MustExec("create table t2 (c1 int, c2 int)")
+	tk.MustExec("create table t3 (c1 int, c2 int)")
+
+	tk.MustExec("insert into t1 values (1,1), (2,2), (3,3)")
+	tk.MustExec("insert into t2 values (1,1), (3,3), (5,5)")
+	tk.MustExec("insert into t3 values (1,1), (5,5), (9,9)")
+
+	result = tk.MustQuery("select * from t1 left join t2 on t1.c1 = t2.c1 right join t3 on t2.c1 = t3.c1 order by t1.c1, t1.c2, t2.c1, t2.c2, t3.c1, t3.c2;")
+	result.Check(testkit.Rows("<nil> <nil> <nil> <nil> 5 5", "<nil> <nil> <nil> <nil> 9 9", "1 1 1 1 1 1"))
+
+	tk.MustExec("drop table if exists t1")
+	tk.MustExec("create table t1 (c1 int)")
+	tk.MustExec("insert into t1 values (1), (1), (1)")
+	result = tk.MustQuery("select * from t1 a join t1 b on a.c1 = b.c1;")
+	result.Check(testkit.Rows("1 1", "1 1", "1 1", "1 1", "1 1", "1 1", "1 1", "1 1", "1 1"))
+
+	plan.UseNewPlanner = false
+}
+
+func (s *testSuite) TestIndexScan(c *C) {
+	defer testleak.AfterTest(c)()
+	tk := testkit.NewTestKit(c, s.store)
+	tk.MustExec("use test")
+	tk.MustExec("drop table if exists t")
+	tk.MustExec("create table t (a int unique)")
+	tk.MustExec("insert t values (-1), (2), (3), (5), (6), (7), (8), (9)")
+	result := tk.MustQuery("select a from t where a < 0 or (a >= 2.1 and a < 5.1) or ( a > 5.9 and a <= 7.9) or a > '8.1'")
+	result.Check(testkit.Rows("-1", "3", "5", "6", "7", "9"))
+}
+
+func (s *testSuite) TestSubquerySameTable(c *C) {
+	defer testleak.AfterTest(c)()
+	tk := testkit.NewTestKit(c, s.store)
+	tk.MustExec("use test")
+	tk.MustExec("drop table if exists t")
+	tk.MustExec("create table t (a int)")
+	tk.MustExec("insert t values (1), (2)")
+	result := tk.MustQuery("select a from t where exists(select 1 from t as x where x.a < t.a)")
+	result.Check(testkit.Rows("2"))
+}
+
+func (s *testSuite) TestIndexReverseOrder(c *C) {
+	defer testleak.AfterTest(c)()
+	tk := testkit.NewTestKit(c, s.store)
+	tk.MustExec("use test")
+	tk.MustExec("drop table if exists t")
+	tk.MustExec("create table t (a int primary key auto_increment, b int, index idx (b))")
+	tk.MustExec("insert t (b) values (0), (1), (2), (3), (4), (5), (6), (7), (8), (9)")
+	result := tk.MustQuery("select b from t order by b desc")
+	result.Check(testkit.Rows("9", "8", "7", "6", "5", "4", "3", "2", "1", "0"))
+	result = tk.MustQuery("select b from t where b <3 or (b >=6 and b < 8) order by b desc")
+	result.Check(testkit.Rows("7", "6", "2", "1", "0"))
+
+	tk.MustExec("drop table if exists t")
+	tk.MustExec("create table t (a int, b int, index idx (b, a))")
+	tk.MustExec("insert t values (0, 2), (1, 2), (2, 2), (0, 1), (1, 1), (2, 1), (0, 0), (1, 0), (2, 0)")
+	result = tk.MustQuery("select b, a from t order by b, a desc")
+	result.Check(testkit.Rows("0 2", "0 1", "0 0", "1 2", "1 1", "1 0", "2 2", "2 1", "2 0"))
+}
+
+func (s *testSuite) TestTableReverseOrder(c *C) {
+	defer testleak.AfterTest(c)()
+	tk := testkit.NewTestKit(c, s.store)
+	tk.MustExec("use test")
+	tk.MustExec("drop table if exists t")
+	tk.MustExec("create table t (a int primary key auto_increment, b int)")
+	tk.MustExec("insert t (b) values (1), (2), (3), (4), (5), (6), (7), (8), (9)")
+	result := tk.MustQuery("select b from t order by a desc")
+	result.Check(testkit.Rows("9", "8", "7", "6", "5", "4", "3", "2", "1"))
+	result = tk.MustQuery("select a from t where a <3 or (a >=6 and a < 8) order by a desc")
+	result.Check(testkit.Rows("7", "6", "2", "1"))
+}
+
+func (s *testSuite) TestInSubquery(c *C) {
+	defer testleak.AfterTest(c)()
+	tk := testkit.NewTestKit(c, s.store)
+	tk.MustExec("use test")
+	tk.MustExec("drop table if exists t")
+	tk.MustExec("create table t (a int, b int)")
+	tk.MustExec("insert t values (1, 1), (2, 1)")
+	result := tk.MustQuery("select m1.a from t as m1 where m1.a in (select m2.b from t as m2)")
+	result.Check(testkit.Rows("1"))
+	result = tk.MustQuery("select m1.a from t as m1 where m1.a in (select m2.b+? from t as m2)", 1)
+	result.Check(testkit.Rows("2"))
+	tk.MustExec(`prepare stmt1 from 'select m1.a from t as m1 where m1.a in (select m2.b+? from t as m2)'`)
+	tk.MustExec("set @a = 1")
+	result = tk.MustQuery(`execute stmt1 using @a;`)
+	result.Check(testkit.Rows("2"))
+	tk.MustExec("set @a = 0")
+	result = tk.MustQuery(`execute stmt1 using @a;`)
+	result.Check(testkit.Rows("1"))
+
+	result = tk.MustQuery("select m1.a from t as m1 where m1.a in (1, 3, 5)")
+	result.Check(testkit.Rows("1"))
+
+	tk.MustExec("drop table if exists t1")
+	tk.MustExec("create table t1 (a float)")
+	tk.MustExec("insert t1 values (281.37)")
+	tk.MustQuery("select a from t1 where (a in (select a from t1))").Check(testkit.Rows("281.37"))
+}
+
+func (s *testSuite) TestDefaultNull(c *C) {
+	defer testleak.AfterTest(c)()
+	tk := testkit.NewTestKit(c, s.store)
+	tk.MustExec("use test")
+	tk.MustExec("drop table if exists t")
+	tk.MustExec("create table t (a int primary key auto_increment, b int default 1, c int)")
+	tk.MustExec("insert t values ()")
+	tk.MustQuery("select * from t").Check(testkit.Rows("1 1 <nil>"))
+	tk.MustExec("update t set b = NULL where a = 1")
+	tk.MustQuery("select * from t").Check(testkit.Rows("1 <nil> <nil>"))
+	tk.MustExec("update t set c = 1")
+	tk.MustQuery("select * from t ").Check(testkit.Rows("1 <nil> 1"))
+	tk.MustExec("delete from t where a = 1")
+	tk.MustExec("insert t (a) values (1)")
+	tk.MustQuery("select * from t").Check(testkit.Rows("1 1 <nil>"))
+}
+
+func (s *testSuite) TestUsignedPKColumn(c *C) {
+	defer testleak.AfterTest(c)()
+	tk := testkit.NewTestKit(c, s.store)
+	tk.MustExec("use test")
+	tk.MustExec("drop table if exists t")
+	tk.MustExec("create table t (a int unsigned primary key, b int, c int, key idx_ba (b, c, a));")
+	tk.MustExec("insert t values (1, 1, 1)")
+	result := tk.MustQuery("select * from t;")
+	result.Check(testkit.Rows("1 1 1"))
+	tk.MustExec("update t set c=2 where a=1;")
+	result = tk.MustQuery("select * from t where b=1;")
+	result.Check(testkit.Rows("1 1 2"))
+}
+
+func (s *testSuite) TestDirtyTransaction(c *C) {
+	defer testleak.AfterTest(c)
+	tk := testkit.NewTestKit(c, s.store)
+	tk.MustExec("use test")
+	tk.MustExec("drop table if exists t")
+	tk.MustExec("create table t (a int primary key, b int, index idx_b (b));")
+	tk.MustExec("insert t value (2, 3), (4, 8), (6, 8)")
+	tk.MustExec("begin")
+	tk.MustQuery("select * from t").Check(testkit.Rows("2 3", "4 8", "6 8"))
+	tk.MustExec("insert t values (1, 5), (3, 4), (7, 6)")
+	tk.MustQuery("select * from t").Check(testkit.Rows("1 5", "2 3", "3 4", "4 8", "6 8", "7 6"))
+	tk.MustQuery("select * from t order by a desc").Check(testkit.Rows("7 6", "6 8", "4 8", "3 4", "2 3", "1 5"))
+	tk.MustQuery("select * from t order by b").Check(testkit.Rows("2 3", "3 4", "1 5", "7 6", "4 8", "6 8"))
+	tk.MustQuery("select * from t order by b desc").Check(testkit.Rows("6 8", "4 8", "7 6", "1 5", "3 4", "2 3"))
+	// Delete a snapshot row and a dirty row.
+	tk.MustExec("delete from t where a = 2 or a = 3")
+	tk.MustQuery("select * from t").Check(testkit.Rows("1 5", "4 8", "6 8", "7 6"))
+	tk.MustQuery("select * from t order by a desc").Check(testkit.Rows("7 6", "6 8", "4 8", "1 5"))
+	tk.MustQuery("select * from t order by b").Check(testkit.Rows("1 5", "7 6", "4 8", "6 8"))
+	tk.MustQuery("select * from t order by b desc").Check(testkit.Rows("6 8", "4 8", "7 6", "1 5"))
+	// Add deleted row back.
+	tk.MustExec("insert t values (2, 3), (3, 4)")
+	tk.MustQuery("select * from t").Check(testkit.Rows("1 5", "2 3", "3 4", "4 8", "6 8", "7 6"))
+	tk.MustQuery("select * from t order by a desc").Check(testkit.Rows("7 6", "6 8", "4 8", "3 4", "2 3", "1 5"))
+	tk.MustQuery("select * from t order by b").Check(testkit.Rows("2 3", "3 4", "1 5", "7 6", "4 8", "6 8"))
+	tk.MustQuery("select * from t order by b desc").Check(testkit.Rows("6 8", "4 8", "7 6", "1 5", "3 4", "2 3"))
+	// Truncate Table
+	tk.MustExec("truncate table t")
+	tk.MustQuery("select * from t").Check(testkit.Rows())
+	tk.MustExec("insert t values (1, 2)")
+	tk.MustQuery("select * from t").Check(testkit.Rows("1 2"))
+	tk.MustExec("truncate table t")
+	tk.MustExec("insert t values (3, 4)")
+	tk.MustQuery("select * from t").Check(testkit.Rows("3 4"))
+	tk.Exec("abort")
+}
+
+func (s *testSuite) TestDatumXAPI(c *C) {
+	defer testleak.AfterTest(c)()
+	tk := testkit.NewTestKit(c, s.store)
+	tk.MustExec("use test")
+	tk.MustExec("drop table if exists t")
+	tk.MustExec("create table t (a decimal(10,6), b decimal, index idx_b (b))")
+	tk.MustExec("insert t values (1.1, 1.1)")
+	tk.MustExec("insert t values (2.2, 2.2)")
+	tk.MustExec("insert t values (3.3, 3.3)")
+	result := tk.MustQuery("select * from t where a > 1.5")
+	result.Check(testkit.Rows("2.200000 2.2", "3.300000 3.3"))
+	result = tk.MustQuery("select * from t where b > 1.5")
+	result.Check(testkit.Rows("2.200000 2.2", "3.300000 3.3"))
+
+	tk.MustExec("drop table if exists t")
+	tk.MustExec("create table t (a time(3), b time, index idx_a (a))")
+	tk.MustExec("insert t values ('11:11:11', '11:11:11')")
+	tk.MustExec("insert t values ('11:11:12', '11:11:12')")
+	tk.MustExec("insert t values ('11:11:13', '11:11:13')")
+	result = tk.MustQuery("select * from t where a > '11:11:11.5'")
+	result.Check(testkit.Rows("11:11:12 11:11:12", "11:11:13 11:11:13"))
+	result = tk.MustQuery("select * from t where b > '11:11:11.5'")
+	result.Check(testkit.Rows("11:11:12 11:11:12", "11:11:13 11:11:13"))
+}
+
+func (s *testSuite) TestJoinPanic(c *C) {
+	defer testleak.AfterTest(c)()
+	tk := testkit.NewTestKit(c, s.store)
+	tk.MustExec("use test")
+	tk.MustExec("drop table if exists events")
+	tk.MustExec("create table events (clock int, source int)")
+	tk.MustQuery("SELECT * FROM events e JOIN (SELECT MAX(clock) AS clock FROM events e2 GROUP BY e2.source) e3 ON e3.clock=e.clock")
 }

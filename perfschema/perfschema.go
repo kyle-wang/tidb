@@ -14,9 +14,18 @@
 package perfschema
 
 import (
+	"reflect"
+
+	"github.com/juju/errors"
 	"github.com/pingcap/tidb/kv"
 	"github.com/pingcap/tidb/model"
 	"github.com/pingcap/tidb/table"
+	"github.com/pingcap/tidb/terror"
+)
+
+var (
+	errInvalidPerfSchemaTable = terror.ClassPerfSchema.New(codeInvalidPerfSchemaTable, "invalid perfschema table")
+	errInvalidTimerFlag       = terror.ClassPerfSchema.New(codeInvalidTimerFlag, "invalid timer flag")
 )
 
 // StatementInstrument defines the methods for statement instrumentation points
@@ -41,34 +50,29 @@ type PerfSchema interface {
 }
 
 type perfSchema struct {
-	store   kv.Storage
-	dbInfo  *model.DBInfo
-	tables  map[string]*model.TableInfo
-	mTables map[string]table.Table // MemoryTables for perfSchema
-
-	// Used for TableStmtsHistory
-	historyHandles []int64
-	historyCursor  int
+	store       kv.Storage
+	dbInfo      *model.DBInfo
+	tables      map[string]*model.TableInfo
+	mTables     map[string]table.Table // Memory tables for perfSchema
+	stmtHandles []int64
+	stmtInfos   map[reflect.Type]*statementInfo
 }
 
 var _ PerfSchema = (*perfSchema)(nil)
 
-// PerfHandle is the only access point for the in-memory performance schema information
-var (
-	PerfHandle PerfSchema
-)
-
 // NewPerfHandle creates a new perfSchema on store.
-func NewPerfHandle(store kv.Storage) PerfSchema {
-	schema := PerfHandle.(*perfSchema)
-	schema.store = store
-	schema.historyHandles = make([]int64, 0, stmtsHistoryElemMax)
-	_ = schema.initialize()
-	registerStatements()
-	return PerfHandle
+func NewPerfHandle() (PerfSchema, error) {
+	schema := &perfSchema{}
+	err := schema.initialize()
+	if err != nil {
+		return nil, errors.Trace(err)
+	}
+	schema.registerStatements()
+	return schema, nil
 }
 
-func init() {
-	schema := &perfSchema{}
-	PerfHandle = schema
-}
+// perfschema error codes.
+const (
+	codeInvalidPerfSchemaTable terror.ErrCode = 1
+	codeInvalidTimerFlag                      = 2
+)

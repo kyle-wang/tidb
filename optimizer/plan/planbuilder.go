@@ -14,6 +14,9 @@
 package plan
 
 import (
+	"math"
+
+	"github.com/golang/protobuf/proto"
 	"github.com/juju/errors"
 	"github.com/ngaut/log"
 	"github.com/pingcap/tidb/ast"
@@ -28,12 +31,14 @@ import (
 
 // Error instances.
 var (
-	ErrUnsupportedType = terror.ClassOptimizerPlan.New(CodeUnsupportedType, "Unsupported type")
+	ErrUnsupportedType      = terror.ClassOptimizerPlan.New(CodeUnsupportedType, "Unsupported type")
+	SystemInternalErrorType = terror.ClassOptimizerPlan.New(SystemInternalError, "System internal error")
 )
 
 // Error codes.
 const (
 	CodeUnsupportedType terror.ErrCode = 1
+	SystemInternalError terror.ErrCode = 2
 )
 
 // BuildPlan builds a plan from a node.
@@ -84,6 +89,9 @@ func (b *planBuilder) build(node ast.Node) Plan {
 	case *ast.PrepareStmt:
 		return b.buildPrepare(x)
 	case *ast.SelectStmt:
+		if UseNewPlanner {
+			return b.buildNewSelect(x)
+		}
 		return b.buildSelect(x)
 	case *ast.UnionStmt:
 		return b.buildUnion(x)
@@ -205,6 +213,7 @@ func (b *planBuilder) buildSubquery(n ast.Node) {
 func (b *planBuilder) buildSelect(sel *ast.SelectStmt) Plan {
 	var aggFuncs []*ast.AggregateFuncExpr
 	hasAgg := b.detectSelectAgg(sel)
+	canPushLimit := !hasAgg
 	if hasAgg {
 		aggFuncs = b.extractSelectAgg(sel)
 	}
@@ -231,6 +240,10 @@ func (b *planBuilder) buildSelect(sel *ast.SelectStmt) Plan {
 			return nil
 		}
 	} else {
+		canPushLimit = false
+		if sel.Where != nil {
+			p = b.buildTableDual(sel)
+		}
 		if hasAgg {
 			p = b.buildAggregate(p, aggFuncs, nil)
 		}
@@ -246,18 +259,23 @@ func (b *planBuilder) buildSelect(sel *ast.SelectStmt) Plan {
 		}
 	}
 	if sel.Distinct {
+		canPushLimit = false
 		p = b.buildDistinct(p)
 		if b.err != nil {
 			return nil
 		}
 	}
-	if sel.OrderBy != nil && !matchOrder(p, sel.OrderBy.Items) {
+	if sel.OrderBy != nil && !pushOrder(p, sel.OrderBy.Items) {
+		canPushLimit = false
 		p = b.buildSort(p, sel.OrderBy.Items)
 		if b.err != nil {
 			return nil
 		}
 	}
 	if sel.Limit != nil {
+		if canPushLimit {
+			pushLimit(p, sel.Limit)
+		}
 		p = b.buildLimit(p, sel.Limit)
 		if b.err != nil {
 			return nil
@@ -269,12 +287,12 @@ func (b *planBuilder) buildSelect(sel *ast.SelectStmt) Plan {
 func (b *planBuilder) buildFrom(sel *ast.SelectStmt) Plan {
 	from := sel.From.TableRefs
 	if from.Right == nil {
-		return b.buildSingleTable(sel)
+		return b.buildTableSource(sel)
 	}
 	return b.buildJoin(sel)
 }
 
-func (b *planBuilder) buildSingleTable(sel *ast.SelectStmt) Plan {
+func (b *planBuilder) buildTableSource(sel *ast.SelectStmt) Plan {
 	from := sel.From.TableRefs
 	ts, ok := from.Left.(*ast.TableSource)
 	if !ok {
@@ -286,6 +304,8 @@ func (b *planBuilder) buildSingleTable(sel *ast.SelectStmt) Plan {
 	case *ast.TableName:
 	case *ast.SelectStmt:
 		bestPlan = b.buildSelect(v)
+	case *ast.UnionStmt:
+		bestPlan = b.buildUnion(v)
 	}
 	if bestPlan != nil {
 		return bestPlan
@@ -305,7 +325,7 @@ func (b *planBuilder) buildSingleTable(sel *ast.SelectStmt) Plan {
 			bestPlan = v
 			lowestCost = cost
 		}
-		if cost < lowestCost {
+		if cost <= lowestCost {
 			bestPlan = v
 			lowestCost = cost
 		}
@@ -314,24 +334,119 @@ func (b *planBuilder) buildSingleTable(sel *ast.SelectStmt) Plan {
 }
 
 func (b *planBuilder) buildAllAccessMethodsPlan(path *joinPath) []Plan {
+	indices, includeTableScan := b.availableIndices(path.table)
 	var candidates []Plan
-	p := b.buildTableScanPlan(path)
-	candidates = append(candidates, p)
-	for _, index := range path.table.TableInfo.Indices {
+	if includeTableScan {
+		p := b.buildTableScanPlan(path)
+		candidates = append(candidates, p)
+	}
+	for _, index := range indices {
 		ip := b.buildIndexScanPlan(index, path)
 		candidates = append(candidates, ip)
 	}
 	return candidates
 }
 
+func (b *planBuilder) availableIndices(table *ast.TableName) (indices []*model.IndexInfo, includeTableScan bool) {
+	var usableHints []*ast.IndexHint
+	for _, hint := range table.IndexHints {
+		if hint.HintScope == ast.HintForScan {
+			usableHints = append(usableHints, hint)
+		}
+	}
+	if len(usableHints) == 0 {
+		return table.TableInfo.Indices, true
+	}
+	var hasUse bool
+	var ignores []*model.IndexInfo
+	for _, hint := range usableHints {
+		switch hint.HintType {
+		case ast.HintUse, ast.HintForce:
+			// Currently we don't distinguish between Force and Use because our cost estimation is not reliable.
+			hasUse = true
+			for _, idxName := range hint.IndexNames {
+				idx := findIndexByName(table.TableInfo.Indices, idxName)
+				if idx != nil {
+					indices = append(indices, idx)
+				}
+			}
+		case ast.HintIgnore:
+			// Collect all the ignore index hints.
+			for _, idxName := range hint.IndexNames {
+				idx := findIndexByName(table.TableInfo.Indices, idxName)
+				if idx != nil {
+					ignores = append(ignores, idx)
+				}
+			}
+		}
+	}
+	indices = removeIgnores(indices, ignores)
+	// If we have got FORCE or USE index hint, table scan is excluded.
+	if len(indices) != 0 {
+		return indices, false
+	}
+	if hasUse {
+		// Empty use hint means don't use any index.
+		return nil, true
+	}
+	if len(ignores) == 0 {
+		return table.TableInfo.Indices, true
+	}
+	for _, idx := range table.TableInfo.Indices {
+		// Exclude ignored index.
+		if findIndexByName(ignores, idx.Name) == nil {
+			indices = append(indices, idx)
+		}
+	}
+	return indices, true
+}
+
+func removeIgnores(indices, ignores []*model.IndexInfo) []*model.IndexInfo {
+	if len(ignores) == 0 {
+		return indices
+	}
+	var remainedIndices []*model.IndexInfo
+	for _, index := range indices {
+		if findIndexByName(ignores, index.Name) == nil {
+			remainedIndices = append(remainedIndices, index)
+		}
+	}
+	return remainedIndices
+}
+
+func findIndexByName(indices []*model.IndexInfo, name model.CIStr) *model.IndexInfo {
+	for _, idx := range indices {
+		if idx.Name.L == name.L {
+			return idx
+		}
+	}
+	return nil
+}
+
+func (b *planBuilder) buildTableDual(sel *ast.SelectStmt) Plan {
+	dual := &TableDual{FilterConditions: splitWhere(sel.Where)}
+	ret := ast.ResultField{}
+	dual.SetFields([]*ast.ResultField{&ret})
+	return dual
+}
+
+func getTableAsName(fields []*ast.ResultField) *model.CIStr {
+	if len(fields) > 0 {
+		return &fields[0].TableAsName
+	}
+	return nil
+}
+
 func (b *planBuilder) buildTableScanPlan(path *joinPath) Plan {
 	tn := path.table
 	p := &TableScan{
-		Table: tn.TableInfo,
+		Table:     tn.TableInfo,
+		TableName: tn,
 	}
 	// Equal condition contains a column from previous joined table.
 	p.RefAccess = len(path.eqConds) > 0
 	p.SetFields(tn.GetResultFields())
+	p.TableAsName = getTableAsName(p.Fields())
 	var pkName model.CIStr
 	if p.Table.PKIsHandle {
 		for _, colInfo := range p.Table.Columns {
@@ -357,9 +472,10 @@ func (b *planBuilder) buildTableScanPlan(path *joinPath) Plan {
 
 func (b *planBuilder) buildIndexScanPlan(index *model.IndexInfo, path *joinPath) Plan {
 	tn := path.table
-	ip := &IndexScan{Table: tn.TableInfo, Index: index}
+	ip := &IndexScan{Table: tn.TableInfo, Index: index, TableName: tn}
 	ip.RefAccess = len(path.eqConds) > 0
 	ip.SetFields(tn.GetResultFields())
+	ip.TableAsName = getTableAsName(ip.Fields())
 
 	condMap := map[ast.ExprNode]bool{}
 	for _, con := range path.conditions {
@@ -410,6 +526,7 @@ out:
 }
 
 // buildPseudoSelectPlan pre-builds more complete plans that may affect total cost.
+// Also set OutOfOrder and NoLimit property.
 func (b *planBuilder) buildPseudoSelectPlan(p Plan, sel *ast.SelectStmt) Plan {
 	if sel.OrderBy == nil {
 		return p
@@ -417,16 +534,26 @@ func (b *planBuilder) buildPseudoSelectPlan(p Plan, sel *ast.SelectStmt) Plan {
 	if sel.GroupBy != nil {
 		return p
 	}
-	if !matchOrder(p, sel.OrderBy.Items) {
+	if !pushOrder(p, sel.OrderBy.Items) {
+		switch x := p.(type) {
+		case *IndexScan:
+			x.OutOfOrder = true
+			x.NoLimit = true
+		}
 		np := &Sort{ByItems: sel.OrderBy.Items}
-		np.SetSrc(p)
+		addChild(np, p)
 		p = np
 	}
 	if sel.Limit != nil {
 		np := &Limit{Offset: sel.Limit.Offset, Count: sel.Limit.Count}
-		np.SetSrc(p)
+		addChild(np, p)
 		np.SetLimit(0)
 		p = np
+	} else {
+		switch x := p.(type) {
+		case *IndexScan:
+			x.NoLimit = true
+		}
 	}
 	return p
 }
@@ -435,14 +562,14 @@ func (b *planBuilder) buildSelectLock(src Plan, lock ast.SelectLockType) *Select
 	selectLock := &SelectLock{
 		Lock: lock,
 	}
-	selectLock.SetSrc(src)
+	addChild(selectLock, src)
 	selectLock.SetFields(src.Fields())
 	return selectLock
 }
 
 func (b *planBuilder) buildSelectFields(src Plan, fields []*ast.ResultField) Plan {
 	selectFields := &SelectFields{}
-	selectFields.SetSrc(src)
+	addChild(selectFields, src)
 	selectFields.SetFields(fields)
 	return selectFields
 }
@@ -452,7 +579,7 @@ func (b *planBuilder) buildAggregate(src Plan, aggFuncs []*ast.AggregateFuncExpr
 	aggPlan := &Aggregate{
 		AggFuncs: aggFuncs,
 	}
-	aggPlan.SetSrc(src)
+	addChild(aggPlan, src)
 	if src != nil {
 		aggPlan.SetFields(src.Fields())
 	}
@@ -466,7 +593,7 @@ func (b *planBuilder) buildHaving(src Plan, having *ast.HavingClause) Plan {
 	p := &Having{
 		Conditions: splitWhere(having.Expr),
 	}
-	p.SetSrc(src)
+	addChild(p, src)
 	p.SetFields(src.Fields())
 	return p
 }
@@ -475,7 +602,7 @@ func (b *planBuilder) buildSort(src Plan, byItems []*ast.ByItem) Plan {
 	sort := &Sort{
 		ByItems: byItems,
 	}
-	sort.SetSrc(src)
+	addChild(sort, src)
 	sort.SetFields(src.Fields())
 	return sort
 }
@@ -485,7 +612,11 @@ func (b *planBuilder) buildLimit(src Plan, limit *ast.Limit) Plan {
 		Offset: limit.Offset,
 		Count:  limit.Count,
 	}
-	li.SetSrc(src)
+	if s, ok := src.(*Sort); ok {
+		s.ExecLimit = li
+		return s
+	}
+	addChild(li, src)
 	li.SetFields(src.Fields())
 	return li
 }
@@ -563,8 +694,29 @@ func buildResultField(tableName, name string, tp byte, size int) *ast.ResultFiel
 	}
 }
 
-// matchOrder checks if the plan has the same ordering as items.
-func matchOrder(p Plan, items []*ast.ByItem) bool {
+func pushLimit(p Plan, limit *ast.Limit) {
+	switch x := p.(type) {
+	case *IndexScan:
+		limitCount := limit.Offset + limit.Count
+		if limitCount < math.MaxInt64 {
+			x.LimitCount = proto.Int64(int64(limitCount))
+		}
+	case *TableScan:
+		limitCount := limit.Offset + limit.Count
+		if limitCount < math.MaxInt64 {
+			x.LimitCount = proto.Int64(int64(limitCount))
+		}
+	default:
+		child := x.GetChildByIndex(0)
+		if child != nil {
+			pushLimit(child, limit)
+		}
+	}
+}
+
+// pushOrder tries to push order by items to the plan, returns true if
+// order is pushed.
+func pushOrder(p Plan, items []*ast.ByItem) bool {
 	switch x := p.(type) {
 	case *Aggregate:
 		return false
@@ -572,10 +724,9 @@ func matchOrder(p Plan, items []*ast.ByItem) bool {
 		if len(items) > len(x.Index.Columns) {
 			return false
 		}
+		var hasDesc bool
+		var hasAsc bool
 		for i, item := range items {
-			if item.Desc {
-				return false
-			}
 			var rf *ast.ResultField
 			switch y := item.Expr.(type) {
 			case *ast.ColumnNameExpr:
@@ -588,13 +739,22 @@ func matchOrder(p Plan, items []*ast.ByItem) bool {
 			if rf.Table.Name.L != x.Table.Name.L || rf.Column.Name.L != x.Index.Columns[i].Name.L {
 				return false
 			}
+			if item.Desc {
+				if hasAsc {
+					return false
+				}
+				hasDesc = true
+			} else {
+				if hasDesc {
+					return false
+				}
+				hasAsc = true
+			}
 		}
+		x.Desc = hasDesc
 		return true
 	case *TableScan:
 		if len(items) != 1 || !x.Table.PKIsHandle {
-			return false
-		}
-		if items[0].Desc {
 			return false
 		}
 		var refer *ast.ResultField
@@ -607,6 +767,7 @@ func matchOrder(p Plan, items []*ast.ByItem) bool {
 			return false
 		}
 		if mysql.HasPriKeyFlag(refer.Column.Flag) {
+			x.Desc = items[0].Desc
 			return true
 		}
 		return false
@@ -617,10 +778,13 @@ func matchOrder(p Plan, items []*ast.ByItem) bool {
 	case *Sort:
 		// Sort plan should not be checked here as there should only be one sort plan in a plan tree.
 		return false
-	case WithSrcPlan:
-		return matchOrder(x.Src(), items)
+	default:
+		child := x.GetChildByIndex(0)
+		if child != nil {
+			return pushOrder(child, items)
+		}
 	}
-	return true
+	return false
 }
 
 // splitWhere split a where expression to a list of AND conditions.
@@ -676,11 +840,18 @@ func (se *subqueryVisitor) Leave(in ast.Node) (out ast.Node, ok bool) {
 func (b *planBuilder) buildUnion(union *ast.UnionStmt) Plan {
 	sels := make([]Plan, len(union.SelectList.Selects))
 	for i, sel := range union.SelectList.Selects {
-		sels[i] = b.buildSelect(sel)
+		if UseNewPlanner {
+			sels[i] = b.buildNewSelect(sel)
+		} else {
+			sels[i] = b.buildSelect(sel)
+		}
 	}
 	var p Plan
 	p = &Union{
 		Selects: sels,
+		basePlan: basePlan{
+			children: sels,
+		},
 	}
 	unionFields := union.GetResultFields()
 	for _, sel := range sels {
@@ -709,6 +880,7 @@ func (b *planBuilder) buildUnion(union *ast.UnionStmt) Plan {
 				uField.Column.Tp = f.Column.Tp
 			}
 		}
+		addChild(p, sel)
 	}
 	for _, v := range unionFields {
 		v.Expr.SetType(&v.Column.FieldType)
@@ -729,7 +901,7 @@ func (b *planBuilder) buildUnion(union *ast.UnionStmt) Plan {
 
 func (b *planBuilder) buildDistinct(src Plan) Plan {
 	d := &Distinct{}
-	d.src = src
+	addChild(d, src)
 	d.SetFields(src.Fields())
 	return d
 }
@@ -737,13 +909,17 @@ func (b *planBuilder) buildDistinct(src Plan) Plan {
 func (b *planBuilder) buildUpdate(update *ast.UpdateStmt) Plan {
 	sel := &ast.SelectStmt{From: update.TableRefs, Where: update.Where, OrderBy: update.Order, Limit: update.Limit}
 	p := b.buildFrom(sel)
-	if sel.OrderBy != nil && !matchOrder(p, sel.OrderBy.Items) {
+	for _, v := range p.Fields() {
+		v.Referenced = true
+	}
+	if sel.OrderBy != nil && !pushOrder(p, sel.OrderBy.Items) {
 		p = b.buildSort(p, sel.OrderBy.Items)
 		if b.err != nil {
 			return nil
 		}
 	}
 	if sel.Limit != nil {
+		pushLimit(p, sel.Limit)
 		p = b.buildLimit(p, sel.Limit)
 		if b.err != nil {
 			return nil
@@ -753,7 +929,7 @@ func (b *planBuilder) buildUpdate(update *ast.UpdateStmt) Plan {
 	if b.err != nil {
 		return nil
 	}
-	return &Update{OrderedList: orderedList, SelectPlan: p}
+	return &Update{OrderedList: orderedList, SelectPlan: p, basePlan: basePlan{children: []Plan{p}}}
 }
 
 func (b *planBuilder) buildUpdateLists(list []*ast.Assignment, fields []*ast.ResultField) []*ast.Assignment {
@@ -772,13 +948,17 @@ func (b *planBuilder) buildUpdateLists(list []*ast.Assignment, fields []*ast.Res
 func (b *planBuilder) buildDelete(del *ast.DeleteStmt) Plan {
 	sel := &ast.SelectStmt{From: del.TableRefs, Where: del.Where, OrderBy: del.Order, Limit: del.Limit}
 	p := b.buildFrom(sel)
-	if sel.OrderBy != nil && !matchOrder(p, sel.OrderBy.Items) {
+	for _, v := range p.Fields() {
+		v.Referenced = true
+	}
+	if sel.OrderBy != nil && !pushOrder(p, sel.OrderBy.Items) {
 		p = b.buildSort(p, sel.OrderBy.Items)
 		if b.err != nil {
 			return nil
 		}
 	}
 	if sel.Limit != nil {
+		pushLimit(p, sel.Limit)
 		p = b.buildLimit(p, sel.Limit)
 		if b.err != nil {
 			return nil
@@ -792,6 +972,7 @@ func (b *planBuilder) buildDelete(del *ast.DeleteStmt) Plan {
 		Tables:       tables,
 		IsMultiTable: del.IsMultiTable,
 		SelectPlan:   p,
+		basePlan:     basePlan{children: []Plan{p}},
 	}
 }
 
@@ -863,7 +1044,7 @@ func (b *planBuilder) buildShow(show *ast.ShowStmt) Plan {
 	}
 	if len(conditions) != 0 {
 		filter := &Filter{Conditions: conditions}
-		filter.SetSrc(p)
+		addChild(filter, p)
 		p = filter
 	}
 	return p
@@ -885,6 +1066,7 @@ func (b *planBuilder) buildInsert(insert *ast.InsertStmt) Plan {
 	}
 	if insert.Select != nil {
 		insertPlan.SelectPlan = b.build(insert.Select)
+		addChild(insertPlan, insertPlan.SelectPlan)
 		if b.err != nil {
 			return nil
 		}
@@ -905,6 +1087,7 @@ func (b *planBuilder) buildExplain(explain *ast.ExplainStmt) Plan {
 		return nil
 	}
 	p := &Explain{StmtPlan: targetPlan}
+	addChild(p, targetPlan)
 	p.SetFields(buildExplainFields())
 	return p
 }

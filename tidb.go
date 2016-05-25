@@ -34,12 +34,11 @@ import (
 	"github.com/pingcap/tidb/domain"
 	"github.com/pingcap/tidb/executor"
 	"github.com/pingcap/tidb/kv"
+	"github.com/pingcap/tidb/metric"
 	"github.com/pingcap/tidb/parser"
 	"github.com/pingcap/tidb/sessionctx/autocommit"
 	"github.com/pingcap/tidb/sessionctx/variable"
-	"github.com/pingcap/tidb/store/hbase"
 	"github.com/pingcap/tidb/store/localstore"
-	"github.com/pingcap/tidb/store/localstore/boltdb"
 	"github.com/pingcap/tidb/store/localstore/engine"
 	"github.com/pingcap/tidb/store/localstore/goleveldb"
 	"github.com/pingcap/tidb/util/types"
@@ -47,12 +46,9 @@ import (
 
 // Engine prefix name
 const (
-	EngineGoLevelDBMemory     = "memory://"
-	EngineGoLevelDBPersistent = "goleveldb://"
-	EngineBoltDB              = "boltdb://"
-	EngineHBase               = "hbase://"
-	defaultMaxRetries         = 30
-	retrySleepInterval        = 500 * time.Millisecond
+	EngineGoLevelDBMemory = "memory://"
+	defaultMaxRetries     = 30
+	retrySleepInterval    = 500 * time.Millisecond
 )
 
 type domainMap struct {
@@ -89,7 +85,7 @@ var (
 	// EnablePprof indicates whether to enable HTTP Pprof or not.
 	EnablePprof = os.Getenv("TIDB_PPROF") != "0"
 	// PprofAddr is the pprof url.
-	PprofAddr = "localhost:8888"
+	PprofAddr = ":8888"
 	// store.UUID()-> IfBootstrapped
 	storeBootstrapped = make(map[string]bool)
 
@@ -152,7 +148,7 @@ func runStmt(ctx context.Context, s ast.Statement, args ...interface{}) (ast.Rec
 	// before every execution, we must clear affectedrows.
 	variable.GetSessionVars(ctx).SetAffectedRows(0)
 	if s.IsDDL() {
-		err = ctx.FinishTxn(false)
+		err = ctx.CommitTxn()
 		if err != nil {
 			return nil, errors.Trace(err)
 		}
@@ -164,9 +160,9 @@ func runStmt(ctx context.Context, s ast.Statement, args ...interface{}) (ast.Rec
 	// MySQL DDL should be auto-commit
 	if s.IsDDL() || autocommit.ShouldAutocommit(ctx) {
 		if err != nil {
-			ctx.FinishTxn(true)
+			ctx.RollbackTxn()
 		} else {
-			err = ctx.FinishTxn(false)
+			err = ctx.CommitTxn()
 		}
 	}
 	return rs, errors.Trace(err)
@@ -218,7 +214,6 @@ func RegisterLocalStore(name string, driver engine.Driver) error {
 // Examples:
 //    goleveldb://relative/path
 //    boltdb:///absolute/path
-//    hbase://zk1,zk2,zk3/hbasetbl?tso=127.0.0.1:1234
 //
 // The engine should be registered before creating storage.
 func NewStore(path string) (kv.Storage, error) {
@@ -282,15 +277,22 @@ func IsQuery(sql string) bool {
 	return false
 }
 
+var tpsMetrics metric.TPSMetrics
+
+// GetTPS gets tidb tps.
+func GetTPS() int64 {
+	return tpsMetrics.Get()
+}
+
 func init() {
 	// Register default memory and goleveldb storage
 	RegisterLocalStore("memory", goleveldb.MemoryDriver{})
 	RegisterLocalStore("goleveldb", goleveldb.Driver{})
-	RegisterLocalStore("boltdb", boltdb.Driver{})
-	RegisterStore("hbase", hbasekv.Driver{})
-
 	// start pprof handlers
 	if EnablePprof {
 		go http.ListenAndServe(PprofAddr, nil)
 	}
+
+	// Init metrics
+	tpsMetrics = metric.NewTPSMetrics()
 }

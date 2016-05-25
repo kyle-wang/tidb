@@ -64,6 +64,7 @@ type ColumnInfo struct {
 	DefaultValue    interface{} `json:"default"`
 	types.FieldType `json:"type"`
 	State           SchemaState `json:"state"`
+	Comment         string      `json:"comment"`
 }
 
 // Clone clones ColumnInfo.
@@ -79,11 +80,13 @@ type TableInfo struct {
 	Charset string `json:"charset"`
 	Collate string `json:"collate"`
 	// Columns are listed in the order in which they appear in the schema.
-	Columns    []*ColumnInfo `json:"cols"`
-	Indices    []*IndexInfo  `json:"index_info"`
-	State      SchemaState   `json:"state"`
-	PKIsHandle bool          `json:"pk_is_handle"`
-	Comment    string        `json:"comment"`
+	Columns     []*ColumnInfo `json:"cols"`
+	Indices     []*IndexInfo  `json:"index_info"`
+	ForeignKeys []*FKInfo     `json:"fk_info"`
+	State       SchemaState   `json:"state"`
+	PKIsHandle  bool          `json:"pk_is_handle"`
+	Comment     string        `json:"comment"`
+	AutoIncID   int64         `json:"auto_inc_id"`
 }
 
 // Clone clones TableInfo.
@@ -91,6 +94,7 @@ func (t *TableInfo) Clone() *TableInfo {
 	nt := *t
 	nt.Columns = make([]*ColumnInfo, len(t.Columns))
 	nt.Indices = make([]*IndexInfo, len(t.Indices))
+	nt.ForeignKeys = make([]*FKInfo, len(t.ForeignKeys))
 
 	for i := range t.Columns {
 		nt.Columns[i] = t.Columns[i].Clone()
@@ -99,6 +103,11 @@ func (t *TableInfo) Clone() *TableInfo {
 	for i := range t.Indices {
 		nt.Indices[i] = t.Indices[i].Clone()
 	}
+
+	for i := range t.ForeignKeys {
+		nt.ForeignKeys[i] = t.ForeignKeys[i].Clone()
+	}
+
 	return &nt
 }
 
@@ -160,6 +169,30 @@ func (index *IndexInfo) Clone() *IndexInfo {
 	return &ni
 }
 
+// FKInfo provides meta data describing a foreign key constraint.
+type FKInfo struct {
+	ID       int64       `json:"id"`
+	Name     CIStr       `json:"fk_name"`
+	RefTable CIStr       `json:"ref_table"`
+	RefCols  []CIStr     `json:"ref_cols"`
+	Cols     []CIStr     `json:"cols"`
+	OnDelete int         `json:"on_delete"`
+	OnUpdate int         `json:"on_update"`
+	State    SchemaState `json:"state"`
+}
+
+// Clone clones FKInfo.
+func (fk *FKInfo) Clone() *FKInfo {
+	nfk := *fk
+
+	nfk.RefCols = make([]CIStr, len(fk.RefCols))
+	nfk.Cols = make([]CIStr, len(fk.Cols))
+	copy(nfk.RefCols, fk.RefCols)
+	copy(nfk.Cols, fk.Cols)
+
+	return &nfk
+}
+
 // DBInfo provides meta data describing a DB.
 type DBInfo struct {
 	ID      int64        `json:"id"`      // Database ID
@@ -180,7 +213,7 @@ func (db *DBInfo) Clone() *DBInfo {
 	return &newInfo
 }
 
-// CIStr is case insensitve string.
+// CIStr is case insensitive string.
 type CIStr struct {
 	O string `json:"O"` // Original string.
 	L string `json:"L"` // Lower case string.

@@ -18,7 +18,6 @@ import (
 
 	"github.com/juju/errors"
 	"github.com/pingcap/tidb/ast"
-	"github.com/pingcap/tidb/column"
 	"github.com/pingcap/tidb/context"
 	"github.com/pingcap/tidb/evaluator"
 	"github.com/pingcap/tidb/inspectkv"
@@ -46,6 +45,7 @@ var (
 	_ Executor = &SelectLockExec{}
 	_ Executor = &ShowDDLExec{}
 	_ Executor = &SortExec{}
+	_ Executor = &TableDualExec{}
 	_ Executor = &TableScanExec{}
 )
 
@@ -56,6 +56,7 @@ var (
 	ErrStmtNotFound    = terror.ClassExecutor.New(CodeStmtNotFound, "Prepared statement not found")
 	ErrSchemaChanged   = terror.ClassExecutor.New(CodeSchemaChanged, "Schema has changed")
 	ErrWrongParamCount = terror.ClassExecutor.New(CodeWrongParamCount, "Wrong parameter count")
+	ErrRowKeyCount     = terror.ClassExecutor.New(CodeRowKeyCount, "Wrong row key entry count")
 )
 
 // Error codes.
@@ -65,6 +66,7 @@ const (
 	CodeStmtNotFound    terror.ErrCode = 3
 	CodeSchemaChanged   terror.ErrCode = 4
 	CodeWrongParamCount terror.ErrCode = 5
+	CodeRowKeyCount     terror.ErrCode = 6
 )
 
 // Row represents a record row.
@@ -82,6 +84,8 @@ type RowKeyEntry struct {
 	Tbl table.Table
 	// Row key.
 	Handle int64
+	// Table alias name.
+	TableAsName *model.CIStr
 }
 
 // Executor executes a query.
@@ -103,7 +107,7 @@ func (e *ShowDDLExec) Fields() []*ast.ResultField {
 	return e.fields
 }
 
-// Next implements Execution Next interface.
+// Next implements Executor Next interface.
 func (e *ShowDDLExec) Next() (*Row, error) {
 	if e.done {
 		return nil, nil
@@ -173,7 +177,7 @@ func (e *CheckTableExec) Fields() []*ast.ResultField {
 	return nil
 }
 
-// Next implements Execution Next interface.
+// Next implements Executor Next interface.
 func (e *CheckTableExec) Next() (*Row, error) {
 	if e.done {
 		return nil, nil
@@ -208,15 +212,41 @@ func (e *CheckTableExec) Close() error {
 	return nil
 }
 
+// TableDualExec represents a dual table executor.
+type TableDualExec struct {
+	fields   []*ast.ResultField
+	executed bool
+}
+
+// Fields implements Executor Fields interface.
+func (e *TableDualExec) Fields() []*ast.ResultField {
+	return e.fields
+}
+
+// Next implements Executor Next interface.
+func (e *TableDualExec) Next() (*Row, error) {
+	if e.executed {
+		return nil, nil
+	}
+	e.executed = true
+	return &Row{}, nil
+}
+
+// Close implements plan.Plan Close interface.
+func (e *TableDualExec) Close() error {
+	return nil
+}
+
 // TableScanExec represents a table scan executor.
 type TableScanExec struct {
-	t          table.Table
-	fields     []*ast.ResultField
-	iter       kv.Iterator
-	ctx        context.Context
-	ranges     []plan.TableRange // Disjoint close handle ranges.
-	seekHandle int64             // The handle to seek, should be initialized to math.MinInt64.
-	cursor     int               // The range cursor, used to locate to current range.
+	t           table.Table
+	tableAsName *model.CIStr
+	fields      []*ast.ResultField
+	iter        kv.Iterator
+	ctx         context.Context
+	ranges      []plan.TableRange // Disjoint close handle ranges.
+	seekHandle  int64             // The handle to seek, should be initialized to math.MinInt64.
+	cursor      int               // The range cursor, used to locate to current range.
 }
 
 // Fields implements Executor Fields interface.
@@ -224,7 +254,7 @@ func (e *TableScanExec) Fields() []*ast.ResultField {
 	return e.fields
 }
 
-// Next implements Execution Next interface.
+// Next implements Executor Next interface.
 func (e *TableScanExec) Next() (*Row, error) {
 	for {
 		if e.cursor >= len(e.ranges) {
@@ -287,19 +317,29 @@ func (e *TableScanExec) seekRange(handle int64) (inRange bool) {
 func (e *TableScanExec) getRow(handle int64) (*Row, error) {
 	row := &Row{}
 	var err error
-	row.Data, err = e.t.Row(e.ctx, handle)
+
+	columns := make([]*table.Column, len(e.fields))
+	for i, v := range e.fields {
+		if v.Referenced {
+			columns[i] = e.t.Cols()[i]
+		}
+	}
+	row.Data, err = e.t.RowWithCols(e.ctx, handle, columns)
 	if err != nil {
 		return nil, errors.Trace(err)
 	}
 	// Set result fields value.
 	for i, v := range e.fields {
-		v.Expr.SetValue(row.Data[i].GetValue())
+		if v.Referenced {
+			v.Expr.SetValue(row.Data[i].GetValue())
+		}
 	}
 
 	// Put rowKey to the tail of record row
 	rke := &RowKeyEntry{
-		Tbl:    e.t,
-		Handle: handle,
+		Tbl:         e.t,
+		Handle:      handle,
+		TableAsName: e.tableAsName,
 	}
 	row.RowKeys = append(row.RowKeys, rke)
 	return row, nil
@@ -325,7 +365,7 @@ type IndexRangeExec struct {
 	highVals    []types.Datum
 	highExclude bool
 
-	iter       kv.IndexIterator
+	iter       table.IndexIterator
 	skipLowCmp bool
 	finished   bool
 }
@@ -415,7 +455,13 @@ func indexCompare(idxKey []types.Datum, boundVals []types.Datum) (int, error) {
 func (e *IndexRangeExec) lookupRow(h int64) (*Row, error) {
 	row := &Row{}
 	var err error
-	row.Data, err = e.scan.tbl.Row(e.scan.ctx, h)
+	columns := make([]*table.Column, len(e.scan.fields))
+	for i, v := range e.scan.fields {
+		if v.Referenced {
+			columns[i] = e.scan.tbl.Cols()[i]
+		}
+	}
+	row.Data, err = e.scan.tbl.RowWithCols(e.scan.ctx, h, columns)
 	if err != nil {
 		return nil, errors.Trace(err)
 	}
@@ -440,14 +486,15 @@ func (e *IndexRangeExec) Close() error {
 
 // IndexScanExec represents an index scan executor.
 type IndexScanExec struct {
-	tbl        table.Table
-	idx        *column.IndexedCol
-	fields     []*ast.ResultField
-	Ranges     []*IndexRangeExec
-	Desc       bool
-	rangeIdx   int
-	ctx        context.Context
-	valueTypes []*types.FieldType
+	tbl         table.Table
+	tableAsName *model.CIStr
+	idx         *table.IndexedColumn
+	fields      []*ast.ResultField
+	Ranges      []*IndexRangeExec
+	Desc        bool
+	rangeIdx    int
+	ctx         context.Context
+	valueTypes  []*types.FieldType
 }
 
 // Fields implements Executor Fields interface.
@@ -466,6 +513,9 @@ func (e *IndexScanExec) Next() (*Row, error) {
 		if row != nil {
 			for i, val := range row.Data {
 				e.fields[i].Expr.SetValue(val.GetValue())
+			}
+			for _, entry := range row.RowKeys {
+				entry.TableAsName = e.tableAsName
 			}
 			return row, nil
 		}
@@ -613,6 +663,7 @@ func (e *JoinInnerExec) Next() (*Row, error) {
 			e.cursor++
 			continue
 		}
+
 		var match = true
 		if e.Condition != nil {
 			match, err = evaluator.EvalBool(e.ctx, e.Condition)
@@ -696,7 +747,7 @@ func (e *SelectFieldsExec) Next() (*Row, error) {
 		if err != nil {
 			return nil, errors.Trace(err)
 		}
-		row.Data[i] = types.NewDatum(val)
+		row.Data[i] = val
 	}
 	return row, nil
 }
@@ -809,8 +860,7 @@ func (e *LimitExec) Next() (*Row, error) {
 		}
 		e.Idx++
 	}
-	// Negative Limit means no limit.
-	if e.Count >= 0 && e.Idx >= e.Offset+e.Count {
+	if e.Idx >= e.Count+e.Offset {
 		return nil, nil
 	}
 	srcRow, err := e.Src.Next()
@@ -831,7 +881,7 @@ func (e *LimitExec) Close() error {
 
 // orderByRow binds a row to its order values, so it can be sorted.
 type orderByRow struct {
-	key []interface{}
+	key []types.Datum
 	row *Row
 }
 
@@ -841,6 +891,7 @@ type SortExec struct {
 	ByItems []*ast.ByItem
 	Rows    []*orderByRow
 	ctx     context.Context
+	Limit   *plan.Limit
 	Idx     int
 	fetched bool
 	err     error
@@ -867,7 +918,7 @@ func (e *SortExec) Less(i, j int) bool {
 		v1 := e.Rows[i].key[index]
 		v2 := e.Rows[j].key[index]
 
-		ret, err := types.Compare(v1, v2)
+		ret, err := v1.CompareDatum(v2)
 		if err != nil {
 			e.err = err
 			return true
@@ -887,9 +938,18 @@ func (e *SortExec) Less(i, j int) bool {
 	return false
 }
 
+// SortBufferSize represents the total extra row count that sort can use.
+var SortBufferSize = 500
+
 // Next implements Executor Next interface.
 func (e *SortExec) Next() (*Row, error) {
 	if !e.fetched {
+		offset := -1
+		totalCount := -1
+		if e.Limit != nil {
+			offset = int(e.Limit.Offset)
+			totalCount = offset + int(e.Limit.Count)
+		}
 		for {
 			srcRow, err := e.Src.Next()
 			if err != nil {
@@ -900,7 +960,7 @@ func (e *SortExec) Next() (*Row, error) {
 			}
 			orderRow := &orderByRow{
 				row: srcRow,
-				key: make([]interface{}, len(e.ByItems)),
+				key: make([]types.Datum, len(e.ByItems)),
 			}
 			for i, byItem := range e.ByItems {
 				orderRow.key[i], err = evaluator.Eval(e.ctx, byItem.Expr)
@@ -909,8 +969,21 @@ func (e *SortExec) Next() (*Row, error) {
 				}
 			}
 			e.Rows = append(e.Rows, orderRow)
+			if totalCount != -1 && e.Len() >= totalCount+SortBufferSize {
+				sort.Sort(e)
+				e.Rows = e.Rows[:totalCount]
+			}
 		}
 		sort.Sort(e)
+		if offset >= 0 && offset < e.Len() {
+			if totalCount > e.Len() {
+				e.Rows = e.Rows[offset:]
+			} else {
+				e.Rows = e.Rows[offset:totalCount]
+			}
+		} else if offset != -1 {
+			e.Rows = e.Rows[:0]
+		}
 		e.fetched = true
 	}
 	if e.err != nil {
@@ -999,7 +1072,7 @@ func (e *AggregateExec) getGroupKey() (string, error) {
 		if err != nil {
 			return "", errors.Trace(err)
 		}
-		vals = append(vals, types.NewDatum(v))
+		vals = append(vals, v)
 	}
 	bs, err := codec.EncodeValue([]byte{}, vals...)
 	if err != nil {
@@ -1153,5 +1226,50 @@ func (e *DistinctExec) Next() (*Row, error) {
 
 // Close implements Executor Close interface.
 func (e *DistinctExec) Close() error {
+	return e.Src.Close()
+}
+
+// ReverseExec produces reverse ordered result, it is used to wrap executors that do not support reverse scan.
+type ReverseExec struct {
+	Src    Executor
+	rows   []*Row
+	cursor int
+	done   bool
+}
+
+// Fields implements Executor Fields interface.
+func (e *ReverseExec) Fields() []*ast.ResultField {
+	return e.Src.Fields()
+}
+
+// Next implements Executor Next interface.
+func (e *ReverseExec) Next() (*Row, error) {
+	if !e.done {
+		for {
+			row, err := e.Src.Next()
+			if err != nil {
+				return nil, errors.Trace(err)
+			}
+			if row == nil {
+				break
+			}
+			e.rows = append(e.rows, row)
+		}
+		e.cursor = len(e.rows) - 1
+		e.done = true
+	}
+	if e.cursor < 0 {
+		return nil, nil
+	}
+	row := e.rows[e.cursor]
+	e.cursor--
+	for i, field := range e.Src.Fields() {
+		field.Expr.SetDatum(row.Data[i])
+	}
+	return row, nil
+}
+
+// Close implements Executor Close interface.
+func (e *ReverseExec) Close() error {
 	return e.Src.Close()
 }

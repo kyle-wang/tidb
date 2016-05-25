@@ -30,7 +30,8 @@ type memDbBuffer struct {
 }
 
 type memDbIter struct {
-	iter iterator.Iterator
+	iter    iterator.Iterator
+	reverse bool
 }
 
 // NewMemDbBuffer creates a new memDbBuffer.
@@ -42,11 +43,22 @@ func NewMemDbBuffer() MemBuffer {
 func (m *memDbBuffer) Seek(k Key) (Iterator, error) {
 	var i Iterator
 	if k == nil {
-		i = &memDbIter{iter: m.db.NewIterator(&util.Range{})}
+		i = &memDbIter{iter: m.db.NewIterator(&util.Range{}), reverse: false}
 	} else {
-		i = &memDbIter{iter: m.db.NewIterator(&util.Range{Start: []byte(k)})}
+		i = &memDbIter{iter: m.db.NewIterator(&util.Range{Start: []byte(k)}), reverse: false}
 	}
 	i.Next()
+	return i, nil
+}
+
+func (m *memDbBuffer) SeekReverse(k Key) (Iterator, error) {
+	var i *memDbIter
+	if k == nil {
+		i = &memDbIter{iter: m.db.NewIterator(&util.Range{}), reverse: true}
+	} else {
+		i = &memDbIter{iter: m.db.NewIterator(&util.Range{Limit: []byte(k)}), reverse: true}
+	}
+	i.iter.Last()
 	return i, nil
 }
 
@@ -81,7 +93,11 @@ func (m *memDbBuffer) Release() {
 
 // Next implements the Iterator Next.
 func (i *memDbIter) Next() error {
-	i.iter.Next()
+	if i.reverse {
+		i.iter.Prev()
+	} else {
+		i.iter.Next()
+	}
 	return nil
 }
 

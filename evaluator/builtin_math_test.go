@@ -15,10 +15,13 @@ package evaluator
 
 import (
 	. "github.com/pingcap/check"
+	"github.com/pingcap/tidb/util/testleak"
+	"github.com/pingcap/tidb/util/testutil"
 	"github.com/pingcap/tidb/util/types"
 )
 
 func (s *testEvaluatorSuite) TestAbs(c *C) {
+	defer testleak.AfterTest(c)()
 	tbl := []struct {
 		Arg interface{}
 		Ret interface{}
@@ -36,11 +39,12 @@ func (s *testEvaluatorSuite) TestAbs(c *C) {
 	for _, t := range Dtbl {
 		v, err := builtinAbs(t["Arg"], nil)
 		c.Assert(err, IsNil)
-		c.Assert(v, DatumEquals, t["Ret"][0])
+		c.Assert(v, testutil.DatumEquals, t["Ret"][0])
 	}
 }
 
 func (s *testEvaluatorSuite) TestRand(c *C) {
+	defer testleak.AfterTest(c)()
 	v, err := builtinRand(make([]types.Datum, 0), nil)
 	c.Assert(err, IsNil)
 	c.Assert(v.GetFloat64(), Less, float64(1))
@@ -48,6 +52,7 @@ func (s *testEvaluatorSuite) TestRand(c *C) {
 }
 
 func (s *testEvaluatorSuite) TestPow(c *C) {
+	defer testleak.AfterTest(c)()
 	tbl := []struct {
 		Arg []interface{}
 		Ret float64
@@ -63,7 +68,7 @@ func (s *testEvaluatorSuite) TestPow(c *C) {
 	for _, t := range Dtbl {
 		v, err := builtinPow(t["Arg"], nil)
 		c.Assert(err, IsNil)
-		c.Assert(v, DatumEquals, t["Ret"][0])
+		c.Assert(v, testutil.DatumEquals, t["Ret"][0])
 	}
 
 	errTbl := []struct {
@@ -79,5 +84,30 @@ func (s *testEvaluatorSuite) TestPow(c *C) {
 	for _, t := range errDtbl {
 		_, err := builtinPow(t["Arg"], nil)
 		c.Assert(err, NotNil)
+	}
+}
+
+func (s *testEvaluatorSuite) TestRound(c *C) {
+	defer testleak.AfterTest(c)()
+	tbl := []struct {
+		Arg []interface{}
+		Ret float64
+	}{
+		{[]interface{}{-1.23}, -1},
+		{[]interface{}{-1.23, 0}, -1},
+		{[]interface{}{-1.58}, -2},
+		{[]interface{}{1.58}, 2},
+		{[]interface{}{1.298, 1}, 1.3},
+		{[]interface{}{1.298}, 1},
+		{[]interface{}{1.298, 0}, 1},
+		{[]interface{}{23.298, -1}, 20},
+	}
+
+	Dtbl := tblToDtbl(tbl)
+
+	for _, t := range Dtbl {
+		v, err := builtinRound(t["Arg"], nil)
+		c.Assert(err, IsNil)
+		c.Assert(v, testutil.DatumEquals, t["Ret"][0])
 	}
 }

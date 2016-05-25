@@ -18,7 +18,6 @@ import (
 	"testing"
 
 	. "github.com/pingcap/check"
-	"github.com/pingcap/tidb/column"
 	"github.com/pingcap/tidb/kv"
 	"github.com/pingcap/tidb/meta"
 	"github.com/pingcap/tidb/meta/autoid"
@@ -30,6 +29,7 @@ import (
 	"github.com/pingcap/tidb/table"
 	"github.com/pingcap/tidb/table/tables"
 	"github.com/pingcap/tidb/util/mock"
+	"github.com/pingcap/tidb/util/testleak"
 	"github.com/pingcap/tidb/util/types"
 )
 
@@ -125,6 +125,7 @@ func (s *testSuite) TearDownSuite(c *C) {
 }
 
 func (s *testSuite) TestGetDDLInfo(c *C) {
+	defer testleak.AfterTest(c)()
 	txn, err := s.store.Begin()
 	c.Assert(err, IsNil)
 	t := meta.NewMeta(txn)
@@ -153,6 +154,7 @@ func (s *testSuite) TestGetDDLInfo(c *C) {
 }
 
 func (s *testSuite) TestGetBgDDLInfo(c *C) {
+	defer testleak.AfterTest(c)()
 	txn, err := s.store.Begin()
 	c.Assert(err, IsNil)
 	t := meta.NewMeta(txn)
@@ -176,13 +178,14 @@ func (s *testSuite) TestGetBgDDLInfo(c *C) {
 }
 
 func (s *testSuite) TestScan(c *C) {
+	defer testleak.AfterTest(c)()
 	alloc := autoid.NewAllocator(s.store, s.dbInfo.ID)
 	tb, err := tables.TableFromMeta(alloc, s.tbInfo)
 	c.Assert(err, IsNil)
 	indices := tb.Indices()
 	_, err = tb.AddRecord(s.ctx, types.MakeDatums(10, 11))
 	c.Assert(err, IsNil)
-	s.ctx.FinishTxn(false)
+	s.ctx.CommitTxn()
 
 	record1 := &RecordData{Handle: int64(1), Values: types.MakeDatums(int64(10), int64(11))}
 	record2 := &RecordData{Handle: int64(2), Values: types.MakeDatums(int64(20), int64(21))}
@@ -194,7 +197,7 @@ func (s *testSuite) TestScan(c *C) {
 
 	_, err = tb.AddRecord(s.ctx, record2.Values)
 	c.Assert(err, IsNil)
-	s.ctx.FinishTxn(false)
+	s.ctx.CommitTxn()
 	txn, err := s.store.Begin()
 	c.Assert(err, IsNil)
 
@@ -212,7 +215,7 @@ func (s *testSuite) TestScan(c *C) {
 
 	idxRow1 := &RecordData{Handle: int64(1), Values: types.MakeDatums(int64(10))}
 	idxRow2 := &RecordData{Handle: int64(2), Values: types.MakeDatums(int64(20))}
-	kvIndex := kv.NewKVIndex(tb.IndexPrefix(), indices[0].Name.L, indices[0].ID, indices[0].Unique)
+	kvIndex := tables.NewIndex(tb.IndexPrefix(), indices[0].Name.L, indices[0].ID, indices[0].Unique)
 	idxRows, nextVals, err := ScanIndexData(txn, kvIndex, idxRow1.Values, 2)
 	c.Assert(err, IsNil)
 	c.Assert(idxRows, DeepEquals, []*RecordData{idxRow1, idxRow2})
@@ -238,7 +241,7 @@ func (s *testSuite) TestScan(c *C) {
 }
 
 func newDiffRetError(prefix string, ra, rb *RecordData) string {
-	return fmt.Sprintf("%s:%v != record:%v", prefix, ra, rb)
+	return fmt.Sprintf("[inspectkv:1]%s:%v != record:%v", prefix, ra, rb)
 }
 
 func (s *testSuite) testTableData(c *C, tb table.Table, rs []*RecordData) {
@@ -288,10 +291,10 @@ func (s *testSuite) testTableData(c *C, tb table.Table, rs []*RecordData) {
 
 	errRs := append(rs, &RecordData{Handle: int64(1), Values: types.MakeDatums(int64(3))})
 	err = CompareTableRecord(txn, tb, errRs, false)
-	c.Assert(err.Error(), DeepEquals, "handle:1 is repeated in data")
+	c.Assert(err.Error(), DeepEquals, "[inspectkv:2]handle:1 is repeated in data")
 }
 
-func (s *testSuite) testIndex(c *C, tb table.Table, idx *column.IndexedCol) {
+func (s *testSuite) testIndex(c *C, tb table.Table, idx *table.IndexedColumn) {
 	txn, err := s.store.Begin()
 	c.Assert(err, IsNil)
 
@@ -319,7 +322,7 @@ func (s *testSuite) testIndex(c *C, tb table.Table, idx *column.IndexedCol) {
 	err = CompareIndexData(txn, tb, idx)
 	c.Assert(err, NotNil)
 	record1 := &RecordData{Handle: int64(3), Values: types.MakeDatums(int64(30))}
-	diffMsg := newDiffRetError("index", record1, nil)
+	diffMsg := newDiffRetError("index", record1, &RecordData{Handle: int64(3), Values: types.MakeDatums(nil)})
 	c.Assert(err.Error(), DeepEquals, diffMsg)
 
 	// current index data:
@@ -376,7 +379,7 @@ func (s *testSuite) testIndex(c *C, tb table.Table, idx *column.IndexedCol) {
 	err = CompareIndexData(txn, tb, idx)
 	c.Assert(err, NotNil)
 	record1 = &RecordData{Handle: int64(4), Values: types.MakeDatums(int64(40))}
-	diffMsg = newDiffRetError("index", record1, nil)
+	diffMsg = newDiffRetError("index", record1, &RecordData{Handle: int64(4), Values: types.MakeDatums(nil)})
 	c.Assert(err.Error(), DeepEquals, diffMsg)
 
 	// current index data:

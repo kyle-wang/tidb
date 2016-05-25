@@ -21,6 +21,7 @@ import (
 	"testing"
 
 	. "github.com/pingcap/check"
+	"github.com/pingcap/tidb/util/testleak"
 )
 
 const (
@@ -41,7 +42,7 @@ type testKVSuite struct {
 
 func (s *testKVSuite) SetUpSuite(c *C) {
 	s.bs = make([]MemBuffer, 2)
-	s.bs[0] = NewBTreeBuffer()
+	s.bs[0] = NewRBTreeBuffer()
 	s.bs[1] = NewMemDbBuffer()
 }
 
@@ -137,6 +138,7 @@ func mustGet(c *C, buffer MemBuffer) {
 }
 
 func (s *testKVSuite) TestGetSet(c *C) {
+	defer testleak.AfterTest(c)()
 	for _, buffer := range s.bs {
 		insertData(c, buffer)
 		mustGet(c, buffer)
@@ -145,6 +147,7 @@ func (s *testKVSuite) TestGetSet(c *C) {
 }
 
 func (s *testKVSuite) TestNewIterator(c *C) {
+	defer testleak.AfterTest(c)()
 	for _, buffer := range s.bs {
 		// should be invalid
 		iter, err := buffer.Seek(nil)
@@ -158,6 +161,7 @@ func (s *testKVSuite) TestNewIterator(c *C) {
 }
 
 func (s *testKVSuite) TestBasicNewIterator(c *C) {
+	defer testleak.AfterTest(c)()
 	for _, buffer := range s.bs {
 		it, err := buffer.Seek([]byte("2"))
 		c.Assert(err, IsNil)
@@ -167,6 +171,7 @@ func (s *testKVSuite) TestBasicNewIterator(c *C) {
 }
 
 func (s *testKVSuite) TestNewIteratorMin(c *C) {
+	defer testleak.AfterTest(c)()
 	kvs := []struct {
 		key   string
 		value string
@@ -202,24 +207,24 @@ func (s *testKVSuite) TestNewIteratorMin(c *C) {
 
 var opCnt = 100000
 
-func BenchmarkBTreeBufferSequential(b *testing.B) {
+func BenchmarkRBTreeBufferSequential(b *testing.B) {
 	data := make([][]byte, opCnt)
 	for i := 0; i < opCnt; i++ {
 		data[i] = encodeInt(i)
 	}
-	buffer := NewBTreeBuffer()
+	buffer := NewRBTreeBuffer()
 	benchmarkSetGet(b, buffer, data)
 	buffer.Release()
 	b.ReportAllocs()
 }
 
-func BenchmarkBTreeBufferRandom(b *testing.B) {
+func BenchmarkRBTreeBufferRandom(b *testing.B) {
 	data := make([][]byte, opCnt)
 	for i := 0; i < opCnt; i++ {
 		data[i] = encodeInt(i)
 	}
 	shuffle(data)
-	buffer := NewBTreeBuffer()
+	buffer := NewRBTreeBuffer()
 	benchmarkSetGet(b, buffer, data)
 	buffer.Release()
 	b.ReportAllocs()
@@ -248,8 +253,8 @@ func BenchmarkMemDbBufferRandom(b *testing.B) {
 	b.ReportAllocs()
 }
 
-func BenchmarkBTreeIter(b *testing.B) {
-	buffer := NewBTreeBuffer()
+func BenchmarkRBTreeIter(b *testing.B) {
+	buffer := NewRBTreeBuffer()
 	benchIterator(b, buffer)
 	buffer.Release()
 	b.ReportAllocs()
@@ -262,9 +267,9 @@ func BenchmarkMemDbIter(b *testing.B) {
 	b.ReportAllocs()
 }
 
-func BenchmarkBTreeCreation(b *testing.B) {
+func BenchmarkRBTreeCreation(b *testing.B) {
 	for i := 0; i < b.N; i++ {
-		buffer := NewBTreeBuffer()
+		buffer := NewRBTreeBuffer()
 		buffer.Release()
 	}
 	b.ReportAllocs()

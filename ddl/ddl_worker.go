@@ -25,9 +25,9 @@ import (
 	"github.com/pingcap/tidb/terror"
 )
 
-func (d *ddl) startDDLJob(ctx context.Context, job *model.Job) error {
+func (d *ddl) doDDLJob(ctx context.Context, job *model.Job) error {
 	// for every DDL, we must commit current transaction.
-	if err := ctx.FinishTxn(false); err != nil {
+	if err := ctx.CommitTxn(); err != nil {
 		return errors.Trace(err)
 	}
 
@@ -352,6 +352,10 @@ func (d *ddl) runDDLJob(t *meta.Meta, job *model.Job) {
 		err = d.onCreateIndex(t, job)
 	case model.ActionDropIndex:
 		err = d.onDropIndex(t, job)
+	case model.ActionAddForeignKey:
+		err = d.onCreateForeignKey(t, job)
+	case model.ActionDropForeignKey:
+		err = d.onDropForeignKey(t, job)
 	default:
 		// invalid job, cancel it.
 		job.State = model.JobCancelled

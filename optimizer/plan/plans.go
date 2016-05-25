@@ -26,6 +26,15 @@ type TableRange struct {
 	HighVal int64
 }
 
+// TableDual represents a dual table plan.
+type TableDual struct {
+	basePlan
+
+	HasAgg bool
+	// FilterConditions can be used to filter result.
+	FilterConditions []ast.ExprNode
+}
+
 // TableScan represents a table scan plan.
 type TableScan struct {
 	basePlan
@@ -42,12 +51,14 @@ type TableScan struct {
 
 	// FilterConditions can be used to filter result.
 	FilterConditions []ast.ExprNode
-}
 
-// Accept implements Plan Accept interface.
-func (p *TableScan) Accept(v Visitor) (Plan, bool) {
-	np, _ := v.Enter(p)
-	return v.Leave(np)
+	// TableName is used to distinguish the same table selected multiple times in different place,
+	// like 'select * from t where exists(select 1 from t as x where t.c < x.c)'
+	TableName *ast.TableName
+
+	TableAsName *model.CIStr
+
+	LimitCount *int64
 }
 
 // ShowDDL is for showing DDL information.
@@ -55,24 +66,11 @@ type ShowDDL struct {
 	basePlan
 }
 
-// Accept implements Plan Accept interface.
-func (p *ShowDDL) Accept(v Visitor) (Plan, bool) {
-	np, _ := v.Enter(p)
-	return v.Leave(np)
-}
-
 // CheckTable is for checking table data.
 type CheckTable struct {
 	basePlan
 
 	Tables []*ast.TableName
-}
-
-// Accept implements Plan Accept interface.
-func (p *CheckTable) Accept(v Visitor) (Plan, bool) {
-	np, _ := v.Enter(p)
-	return v.Leave(np)
-
 }
 
 // IndexRange represents an index range to be scanned.
@@ -138,12 +136,17 @@ type IndexScan struct {
 
 	// OutOfOrder indicates if the index scan can return out of order.
 	OutOfOrder bool
-}
 
-// Accept implements Plan Accept interface.
-func (p *IndexScan) Accept(v Visitor) (Plan, bool) {
-	np, _ := v.Enter(p)
-	return v.Leave(np)
+	// NoLimit indicates that this plan need fetch all the rows.
+	NoLimit bool
+
+	// TableName is used to distinguish the same table selected multiple times in different place,
+	// like 'select * from t where exists(select 1 from t as x where t.c < x.c)'
+	TableName *ast.TableName
+
+	TableAsName *model.CIStr
+
+	LimitCount *int64
 }
 
 // JoinOuter represents outer join plan.
@@ -152,25 +155,6 @@ type JoinOuter struct {
 
 	Outer Plan
 	Inner Plan
-}
-
-// Accept implements Plan interface.
-func (p *JoinOuter) Accept(v Visitor) (Plan, bool) {
-	np, skip := v.Enter(p)
-	if skip {
-		return v.Leave(np)
-	}
-	p = np.(*JoinOuter)
-	var ok bool
-	p.Outer, ok = p.Outer.Accept(v)
-	if !ok {
-		return p, false
-	}
-	p.Inner, ok = p.Inner.Accept(v)
-	if !ok {
-		return p, false
-	}
-	return v.Leave(p)
 }
 
 // JoinInner represents inner join plan.
@@ -185,101 +169,39 @@ func (p *JoinInner) String() string {
 	return fmt.Sprintf("JoinInner()")
 }
 
-// Accept implements Plan interface.
-func (p *JoinInner) Accept(v Visitor) (Plan, bool) {
-	np, skip := v.Enter(p)
-	if skip {
-		return v.Leave(np)
-	}
-	p = np.(*JoinInner)
-	for i, in := range p.Inners {
-		x, ok := in.Accept(v)
-		if !ok {
-			return p, false
-		}
-		p.Inners[i] = x
-	}
-	return v.Leave(p)
-}
-
 // SelectLock represents a select lock plan.
 type SelectLock struct {
-	planWithSrc
+	basePlan
 
 	Lock ast.SelectLockType
-}
-
-// Accept implements Plan Accept interface.
-func (p *SelectLock) Accept(v Visitor) (Plan, bool) {
-	np, skip := v.Enter(p)
-	if skip {
-		return v.Leave(np)
-	}
-	p = np.(*SelectLock)
-	var ok bool
-	p.src, ok = p.src.Accept(v)
-	if !ok {
-		return p, false
-	}
-	return v.Leave(p)
 }
 
 // SetLimit implements Plan SetLimit interface.
 func (p *SelectLock) SetLimit(limit float64) {
 	p.limit = limit
-	p.src.SetLimit(p.limit)
+	p.GetChildByIndex(0).SetLimit(p.limit)
 }
 
 // SelectFields represents a select fields plan.
 type SelectFields struct {
-	planWithSrc
-}
-
-// Accept implements Plan Accept interface.
-func (p *SelectFields) Accept(v Visitor) (Plan, bool) {
-	np, skip := v.Enter(p)
-	if skip {
-		return v.Leave(np)
-	}
-	p = np.(*SelectFields)
-	if p.src != nil {
-		var ok bool
-		p.src, ok = p.src.Accept(v)
-		if !ok {
-			return p, false
-		}
-	}
-	return v.Leave(p)
+	basePlan
 }
 
 // SetLimit implements Plan SetLimit interface.
 func (p *SelectFields) SetLimit(limit float64) {
 	p.limit = limit
-	if p.src != nil {
-		p.src.SetLimit(limit)
+	if p.GetChildByIndex(0) != nil {
+		p.GetChildByIndex(0).SetLimit(limit)
 	}
 }
 
 // Sort represents a sorting plan.
 type Sort struct {
-	planWithSrc
+	basePlan
 
 	ByItems []*ast.ByItem
-}
 
-// Accept implements Plan Accept interface.
-func (p *Sort) Accept(v Visitor) (Plan, bool) {
-	np, skip := v.Enter(p)
-	if skip {
-		return v.Leave(np)
-	}
-	p = np.(*Sort)
-	var ok bool
-	p.src, ok = p.src.Accept(v)
-	if !ok {
-		return p, false
-	}
-	return v.Leave(p)
+	ExecLimit *Limit
 }
 
 // SetLimit implements Plan SetLimit interface.
@@ -291,25 +213,10 @@ func (p *Sort) SetLimit(limit float64) {
 
 // Limit represents offset and limit plan.
 type Limit struct {
-	planWithSrc
+	basePlan
 
 	Offset uint64
 	Count  uint64
-}
-
-// Accept implements Plan Accept interface.
-func (p *Limit) Accept(v Visitor) (Plan, bool) {
-	np, skip := v.Enter(p)
-	if skip {
-		return v.Leave(np)
-	}
-	p = np.(*Limit)
-	var ok bool
-	p.src, ok = p.src.Accept(v)
-	if !ok {
-		return p, false
-	}
-	return v.Leave(p)
 }
 
 // SetLimit implements Plan SetLimit interface.
@@ -317,7 +224,7 @@ func (p *Limit) Accept(v Visitor) (Plan, bool) {
 // We just ignore the input, and set the real limit.
 func (p *Limit) SetLimit(limit float64) {
 	p.limit = float64(p.Offset + p.Count)
-	p.src.SetLimit(p.limit)
+	p.GetChildByIndex(0).SetLimit(p.limit)
 }
 
 // Union represents Union plan.
@@ -327,48 +234,16 @@ type Union struct {
 	Selects []Plan
 }
 
-// Accept implements Plan Accept interface.
-func (p *Union) Accept(v Visitor) (Plan, bool) {
-	np, skip := v.Enter(p)
-	if skip {
-		return v.Leave(p)
-	}
-	p = np.(*Union)
-	for i, sel := range p.Selects {
-		var ok bool
-		p.Selects[i], ok = sel.Accept(v)
-		if !ok {
-			return p, false
-		}
-	}
-	return v.Leave(p)
-}
-
 // Distinct represents Distinct plan.
 type Distinct struct {
-	planWithSrc
-}
-
-// Accept implements Plan Accept interface.
-func (p *Distinct) Accept(v Visitor) (Plan, bool) {
-	np, skip := v.Enter(p)
-	if skip {
-		return v.Leave(p)
-	}
-	p = np.(*Distinct)
-	var ok bool
-	p.src, ok = p.src.Accept(v)
-	if !ok {
-		return p, false
-	}
-	return v.Leave(p)
+	basePlan
 }
 
 // SetLimit implements Plan SetLimit interface.
 func (p *Distinct) SetLimit(limit float64) {
 	p.limit = limit
-	if p.src != nil {
-		p.src.SetLimit(limit)
+	if p.GetChildByIndex(0) != nil {
+		p.GetChildByIndex(0).SetLimit(limit)
 	}
 }
 
@@ -380,16 +255,6 @@ type Prepare struct {
 	SQLText string
 }
 
-// Accept implements Plan Accept interface.
-func (p *Prepare) Accept(v Visitor) (Plan, bool) {
-	np, skip := v.Enter(p)
-	if skip {
-		return v.Leave(np)
-	}
-	p = np.(*Prepare)
-	return v.Leave(p)
-}
-
 // Execute represents prepare plan.
 type Execute struct {
 	basePlan
@@ -399,16 +264,6 @@ type Execute struct {
 	ID        uint32
 }
 
-// Accept implements Plan Accept interface.
-func (p *Execute) Accept(v Visitor) (Plan, bool) {
-	np, skip := v.Enter(p)
-	if skip {
-		return v.Leave(np)
-	}
-	p = np.(*Execute)
-	return v.Leave(p)
-}
-
 // Deallocate represents deallocate plan.
 type Deallocate struct {
 	basePlan
@@ -416,52 +271,25 @@ type Deallocate struct {
 	Name string
 }
 
-// Accept implements Plan Accept interface.
-func (p *Deallocate) Accept(v Visitor) (Plan, bool) {
-	np, skip := v.Enter(p)
-	if skip {
-		return v.Leave(np)
-	}
-	p = np.(*Deallocate)
-	return v.Leave(p)
-}
-
 // Aggregate represents a select fields plan.
 type Aggregate struct {
-	planWithSrc
+	basePlan
 	AggFuncs     []*ast.AggregateFuncExpr
 	GroupByItems []*ast.ByItem
-}
-
-// Accept implements Plan Accept interface.
-func (p *Aggregate) Accept(v Visitor) (Plan, bool) {
-	np, skip := v.Enter(p)
-	if skip {
-		return v.Leave(np)
-	}
-	p = np.(*Aggregate)
-	if p.src != nil {
-		var ok bool
-		p.src, ok = p.src.Accept(v)
-		if !ok {
-			return p, false
-		}
-	}
-	return v.Leave(p)
 }
 
 // SetLimit implements Plan SetLimit interface.
 func (p *Aggregate) SetLimit(limit float64) {
 	p.limit = limit
-	if p.src != nil {
-		p.src.SetLimit(limit)
+	if p.GetChildByIndex(0) != nil {
+		p.GetChildByIndex(0).SetLimit(limit)
 	}
 }
 
 // Having represents a having plan.
 // The having plan should after aggregate plan.
 type Having struct {
-	planWithSrc
+	basePlan
 
 	// Originally the WHERE or ON condition is parsed into a single expression,
 	// but after we converted to CNF(Conjunctive normal form), it can be
@@ -469,26 +297,11 @@ type Having struct {
 	Conditions []ast.ExprNode
 }
 
-// Accept implements Plan Accept interface.
-func (p *Having) Accept(v Visitor) (Plan, bool) {
-	np, skip := v.Enter(p)
-	if skip {
-		return v.Leave(np)
-	}
-	p = np.(*Having)
-	var ok bool
-	p.src, ok = p.src.Accept(v)
-	if !ok {
-		return p, false
-	}
-	return v.Leave(p)
-}
-
 // SetLimit implements Plan SetLimit interface.
 func (p *Having) SetLimit(limit float64) {
 	p.limit = limit
-	// We assume 50% of the src row is filtered out.
-	p.src.SetLimit(limit * 2)
+	// We assume 50% of the GetChildByIndex(0) row is filtered out.
+	p.GetChildByIndex(0).SetLimit(limit * 2)
 }
 
 // Update represents an update plan.
@@ -497,21 +310,6 @@ type Update struct {
 
 	OrderedList []*ast.Assignment // OrderedList has the same offset as TablePlan's result fields.
 	SelectPlan  Plan
-}
-
-// Accept implements Plan Accept interface.
-func (p *Update) Accept(v Visitor) (Plan, bool) {
-	np, skip := v.Enter(p)
-	if skip {
-		return v.Leave(np)
-	}
-	p = np.(*Update)
-	var ok bool
-	p.SelectPlan, ok = p.SelectPlan.Accept(v)
-	if !ok {
-		return p, false
-	}
-	return v.Leave(p)
 }
 
 // Delete represents a delete plan.
@@ -523,24 +321,9 @@ type Delete struct {
 	IsMultiTable bool
 }
 
-// Accept implements Plan Accept interface.
-func (p *Delete) Accept(v Visitor) (Plan, bool) {
-	np, skip := v.Enter(p)
-	if skip {
-		return v.Leave(np)
-	}
-	p = np.(*Delete)
-	var ok bool
-	p.SelectPlan, ok = p.SelectPlan.Accept(v)
-	if !ok {
-		return p, false
-	}
-	return v.Leave(p)
-}
-
-// Filter represents a plan that filter srcplan result.
+// Filter represents a plan that filter GetChildByIndex(0)plan result.
 type Filter struct {
-	planWithSrc
+	basePlan
 
 	// Originally the WHERE or ON condition is parsed into a single expression,
 	// but after we converted to CNF(Conjunctive normal form), it can be
@@ -548,26 +331,11 @@ type Filter struct {
 	Conditions []ast.ExprNode
 }
 
-// Accept implements Plan Accept interface.
-func (p *Filter) Accept(v Visitor) (Plan, bool) {
-	np, skip := v.Enter(p)
-	if skip {
-		return v.Leave(np)
-	}
-	p = np.(*Filter)
-	var ok bool
-	p.src, ok = p.src.Accept(v)
-	if !ok {
-		return p, false
-	}
-	return v.Leave(p)
-}
-
 // SetLimit implements Plan SetLimit interface.
 func (p *Filter) SetLimit(limit float64) {
 	p.limit = limit
-	// We assume 50% of the src row is filtered out.
-	p.src.SetLimit(limit * 2)
+	// We assume 50% of the GetChildByIndex(0) row is filtered out.
+	p.GetChildByIndex(0).SetLimit(limit * 2)
 }
 
 // Show represents a show plan.
@@ -586,31 +354,11 @@ type Show struct {
 	GlobalScope bool
 }
 
-// Accept implements Plan Accept interface.
-func (p *Show) Accept(v Visitor) (Plan, bool) {
-	np, skip := v.Enter(p)
-	if skip {
-		return v.Leave(np)
-	}
-	p = np.(*Show)
-	return v.Leave(p)
-}
-
 // Simple represents a simple statement plan which doesn't need any optimization.
 type Simple struct {
 	basePlan
 
 	Statement ast.StmtNode
-}
-
-// Accept implements Plan Accept interface.
-func (p *Simple) Accept(v Visitor) (Plan, bool) {
-	np, skip := v.Enter(p)
-	if skip {
-		return v.Leave(np)
-	}
-	p = np.(*Simple)
-	return v.Leave(p)
 }
 
 // Insert represents an insert plan.
@@ -628,23 +376,6 @@ type Insert struct {
 	Priority  int
 }
 
-// Accept implements Plan Accept interface.
-func (p *Insert) Accept(v Visitor) (Plan, bool) {
-	np, skip := v.Enter(p)
-	if skip {
-		return v.Leave(np)
-	}
-	p = np.(*Insert)
-	if p.SelectPlan != nil {
-		var ok bool
-		p.SelectPlan, ok = p.SelectPlan.Accept(v)
-		if !ok {
-			return p, false
-		}
-	}
-	return v.Leave(p)
-}
-
 // DDL represents a DDL statement plan.
 type DDL struct {
 	basePlan
@@ -652,29 +383,9 @@ type DDL struct {
 	Statement ast.DDLNode
 }
 
-// Accept implements Plan Accept interface.
-func (p *DDL) Accept(v Visitor) (Plan, bool) {
-	np, skip := v.Enter(p)
-	if skip {
-		return v.Leave(np)
-	}
-	p = np.(*DDL)
-	return v.Leave(p)
-}
-
 // Explain represents a explain plan.
 type Explain struct {
 	basePlan
 
 	StmtPlan Plan
-}
-
-// Accept implements Plan Accept interface.
-func (p *Explain) Accept(v Visitor) (Plan, bool) {
-	np, skip := v.Enter(p)
-	if skip {
-		v.Leave(np)
-	}
-	p = np.(*Explain)
-	return v.Leave(p)
 }

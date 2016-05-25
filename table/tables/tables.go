@@ -23,7 +23,6 @@ import (
 
 	"github.com/juju/errors"
 	"github.com/ngaut/log"
-	"github.com/pingcap/tidb/column"
 	"github.com/pingcap/tidb/context"
 	"github.com/pingcap/tidb/evaluator"
 	"github.com/pingcap/tidb/kv"
@@ -45,15 +44,20 @@ var TablePrefix = []byte{'t'}
 type Table struct {
 	ID      int64
 	Name    model.CIStr
-	Columns []*column.Col
+	Columns []*table.Column
 
-	publicColumns   []*column.Col
-	writableColumns []*column.Col
-	indices         []*column.IndexedCol
+	publicColumns   []*table.Column
+	writableColumns []*table.Column
+	indices         []*table.IndexedColumn
 	recordPrefix    kv.Key
 	indexPrefix     kv.Key
 	alloc           autoid.Allocator
 	meta            *model.TableInfo
+}
+
+// MockTableFromMeta only serves for test.
+func MockTableFromMeta(tableInfo *model.TableInfo) table.Table {
+	return &Table{ID: 0, meta: tableInfo}
 }
 
 // TableFromMeta creates a Table instance from model.TableInfo.
@@ -62,13 +66,13 @@ func TableFromMeta(alloc autoid.Allocator, tblInfo *model.TableInfo) (table.Tabl
 		return nil, errors.Errorf("table %s can't be in none state", tblInfo.Name)
 	}
 
-	columns := make([]*column.Col, 0, len(tblInfo.Columns))
+	columns := make([]*table.Column, 0, len(tblInfo.Columns))
 	for _, colInfo := range tblInfo.Columns {
 		if colInfo.State == model.StateNone {
 			return nil, errors.Errorf("column %s can't be in none state", colInfo.Name)
 		}
 
-		col := &column.Col{ColumnInfo: *colInfo}
+		col := &table.Column{ColumnInfo: *colInfo}
 		columns = append(columns, col)
 	}
 
@@ -79,20 +83,21 @@ func TableFromMeta(alloc autoid.Allocator, tblInfo *model.TableInfo) (table.Tabl
 			return nil, errors.Errorf("index %s can't be in none state", idxInfo.Name)
 		}
 
-		idx := &column.IndexedCol{
+		idx := &table.IndexedColumn{
 			IndexInfo: *idxInfo,
 		}
 
-		idx.X = kv.NewKVIndex(t.IndexPrefix(), idxInfo.Name.L, idxInfo.ID, idxInfo.Unique)
+		idx.X = NewIndex(t.IndexPrefix(), idxInfo.Name.L, idxInfo.ID, idxInfo.Unique)
 
 		t.indices = append(t.indices, idx)
 	}
+
 	t.meta = tblInfo
 	return t, nil
 }
 
 // newTable constructs a Table instance.
-func newTable(tableID int64, cols []*column.Col, alloc autoid.Allocator) *Table {
+func newTable(tableID int64, cols []*table.Column, alloc autoid.Allocator) *Table {
 	t := &Table{
 		ID:           tableID,
 		recordPrefix: genTableRecordPrefix(tableID),
@@ -107,7 +112,7 @@ func newTable(tableID int64, cols []*column.Col, alloc autoid.Allocator) *Table 
 }
 
 // Indices implements table.Table Indices interface.
-func (t *Table) Indices() []*column.IndexedCol {
+func (t *Table) Indices() []*table.IndexedColumn {
 	return t.indices
 }
 
@@ -117,12 +122,12 @@ func (t *Table) Meta() *model.TableInfo {
 }
 
 // Cols implements table.Table Cols interface.
-func (t *Table) Cols() []*column.Col {
+func (t *Table) Cols() []*table.Column {
 	if len(t.publicColumns) > 0 {
 		return t.publicColumns
 	}
 
-	t.publicColumns = make([]*column.Col, 0, len(t.Columns))
+	t.publicColumns = make([]*table.Column, 0, len(t.Columns))
 	for _, col := range t.Columns {
 		if col.State == model.StatePublic {
 			t.publicColumns = append(t.publicColumns, col)
@@ -132,12 +137,12 @@ func (t *Table) Cols() []*column.Col {
 	return t.publicColumns
 }
 
-func (t *Table) writableCols() []*column.Col {
+func (t *Table) writableCols() []*table.Column {
 	if len(t.writableColumns) > 0 {
 		return t.writableColumns
 	}
 
-	t.writableColumns = make([]*column.Col, 0, len(t.Columns))
+	t.writableColumns = make([]*table.Column, 0, len(t.Columns))
 	for _, col := range t.Columns {
 		if col.State == model.StateDeleteOnly || col.State == model.StateDeleteReorganization {
 			continue
@@ -160,7 +165,7 @@ func (t *Table) IndexPrefix() kv.Key {
 }
 
 // RecordKey implements table.Table RecordKey interface.
-func (t *Table) RecordKey(h int64, col *column.Col) kv.Key {
+func (t *Table) RecordKey(h int64, col *table.Column) kv.Key {
 	colID := int64(0)
 	if col != nil {
 		colID = col.ID
@@ -225,7 +230,7 @@ func (t *Table) UpdateRecord(ctx context.Context, h int64, oldData []types.Datum
 }
 
 func (t *Table) setOnUpdateData(ctx context.Context, touched map[int]bool, data []types.Datum) error {
-	ucols := column.FindOnUpdateCols(t.writableCols())
+	ucols := table.FindOnUpdateCols(t.writableCols())
 	for _, col := range ucols {
 		if !touched[col.Offset] {
 			value, err := evaluator.GetTimeValue(ctx, evaluator.CurrentTimestamp, col.Tp, col.Decimal)
@@ -233,7 +238,7 @@ func (t *Table) setOnUpdateData(ctx context.Context, touched map[int]bool, data 
 				return errors.Trace(err)
 			}
 
-			data[col.Offset] = types.NewDatum(value)
+			data[col.Offset] = value
 			touched[col.Offset] = true
 		}
 	}
@@ -322,6 +327,10 @@ func (t *Table) AddRecord(ctx context.Context, r []types.Datum) (recordID int64,
 	// Set public and write only column value.
 	for _, col := range t.writableCols() {
 		if col.IsPKHandleColumn(t.meta) {
+			continue
+		}
+		if col.DefaultValue == nil && r[col.Offset].Kind() == types.KindNull {
+			// Save storage space by not storing null value.
 			continue
 		}
 		var value types.Datum
@@ -430,24 +439,33 @@ func (t *Table) addIndices(ctx context.Context, recordID int64, r []types.Datum,
 }
 
 // RowWithCols implements table.Table RowWithCols interface.
-func (t *Table) RowWithCols(ctx context.Context, h int64, cols []*column.Col) ([]types.Datum, error) {
+func (t *Table) RowWithCols(ctx context.Context, h int64, cols []*table.Column) ([]types.Datum, error) {
 	txn, err := ctx.GetTxn(false)
 	if err != nil {
 		return nil, errors.Trace(err)
 	}
 	v := make([]types.Datum, len(cols))
 	for i, col := range cols {
+		if col == nil {
+			continue
+		}
 		if col.State != model.StatePublic {
 			return nil, errors.Errorf("Cannot use none public column - %v", cols)
 		}
 		if col.IsPKHandleColumn(t.meta) {
-			v[i].SetInt64(h)
+			if mysql.HasUnsignedFlag(col.Flag) {
+				v[i].SetUint64(uint64(h))
+			} else {
+				v[i].SetInt64(h)
+			}
 			continue
 		}
 
 		k := t.RecordKey(h, col)
 		data, err := txn.Get(k)
-		if err != nil {
+		if terror.ErrorEqual(err, kv.ErrNotExist) && !mysql.HasNotNullFlag(col.Flag) {
+			continue
+		} else if err != nil {
 			return nil, errors.Trace(err)
 		}
 
@@ -557,7 +575,7 @@ func (t *Table) removeRowIndices(ctx context.Context, h int64, rec []types.Datum
 }
 
 // RemoveRowIndex implements table.Table RemoveRowIndex interface.
-func (t *Table) removeRowIndex(rm kv.RetrieverMutator, h int64, vals []types.Datum, idx *column.IndexedCol) error {
+func (t *Table) removeRowIndex(rm kv.RetrieverMutator, h int64, vals []types.Datum, idx *table.IndexedColumn) error {
 	if err := idx.X.Delete(rm, vals, h); err != nil {
 		return errors.Trace(err)
 	}
@@ -565,7 +583,7 @@ func (t *Table) removeRowIndex(rm kv.RetrieverMutator, h int64, vals []types.Dat
 }
 
 // BuildIndexForRow implements table.Table BuildIndexForRow interface.
-func (t *Table) buildIndexForRow(rm kv.RetrieverMutator, h int64, vals []types.Datum, idx *column.IndexedCol) error {
+func (t *Table) buildIndexForRow(rm kv.RetrieverMutator, h int64, vals []types.Datum, idx *table.IndexedColumn) error {
 	if idx.State == model.StateDeleteOnly || idx.State == model.StateDeleteReorganization {
 		// If the index is in delete only or write reorganization state, we can not add index.
 		return nil
@@ -578,7 +596,7 @@ func (t *Table) buildIndexForRow(rm kv.RetrieverMutator, h int64, vals []types.D
 }
 
 // IterRecords implements table.Table IterRecords interface.
-func (t *Table) IterRecords(ctx context.Context, startKey kv.Key, cols []*column.Col,
+func (t *Table) IterRecords(ctx context.Context, startKey kv.Key, cols []*table.Column,
 	fn table.RecordIterFunc) error {
 	txn, err := ctx.GetTxn(false)
 	if err != nil {
@@ -856,7 +874,7 @@ func DecodeRecordKeyHandle(key kv.Key) (int64, error) {
 }
 
 // FindIndexByColName implements table.Table FindIndexByColName interface.
-func FindIndexByColName(t table.Table, name string) *column.IndexedCol {
+func FindIndexByColName(t table.Table, name string) *table.IndexedColumn {
 	for _, idx := range t.Indices() {
 		// only public index can be read.
 		if idx.State != model.StatePublic {
@@ -872,4 +890,5 @@ func FindIndexByColName(t table.Table, name string) *column.IndexedCol {
 
 func init() {
 	table.TableFromMeta = TableFromMeta
+	table.MockTableFromMeta = MockTableFromMeta
 }

@@ -50,7 +50,6 @@ func newTxn(s *dbStore, ver kv.Version) *dbTxn {
 }
 
 // Implement transaction interface
-
 func (txn *dbTxn) Get(k kv.Key) ([]byte, error) {
 	log.Debugf("[kv] get key:% x, txn:%d", k, txn.tid)
 	return txn.us.Get(k)
@@ -69,6 +68,11 @@ func (txn *dbTxn) String() string {
 func (txn *dbTxn) Seek(k kv.Key) (kv.Iterator, error) {
 	log.Debugf("[kv] seek key:% x, txn:%d", k, txn.tid)
 	return txn.us.Seek(k)
+}
+
+func (txn *dbTxn) SeekReverse(k kv.Key) (kv.Iterator, error) {
+	log.Debugf("[kv] seek reverse key:% x, txn:%d", k, txn.tid)
+	return txn.us.SeekReverse(k)
 }
 
 func (txn *dbTxn) Delete(k kv.Key) error {
@@ -140,8 +144,8 @@ func (txn *dbTxn) IsReadOnly() bool {
 	return !txn.dirty
 }
 
-func (txn *dbTxn) StartTS() int64 {
-	return int64(txn.tid)
+func (txn *dbTxn) StartTS() uint64 {
+	return txn.tid
 }
 
 func (txn *dbTxn) GetClient() kv.Client {

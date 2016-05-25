@@ -22,6 +22,7 @@ import (
 	"github.com/pingcap/tidb/model"
 	"github.com/pingcap/tidb/mysql"
 	"github.com/pingcap/tidb/parser"
+	"github.com/pingcap/tidb/util/testleak"
 )
 
 var _ = Suite(&testPlanSuite{})
@@ -33,6 +34,7 @@ func TestT(t *testing.T) {
 type testPlanSuite struct{}
 
 func (s *testPlanSuite) TestRangeBuilder(c *C) {
+	defer testleak.AfterTest(c)()
 	rb := &rangeBuilder{}
 
 	cases := []struct {
@@ -206,6 +208,7 @@ func (s *testPlanSuite) TestRangeBuilder(c *C) {
 }
 
 func (s *testPlanSuite) TestFilterRate(c *C) {
+	defer testleak.AfterTest(c)()
 	cases := []struct {
 		expr string
 		rate float64
@@ -238,6 +241,7 @@ func (s *testPlanSuite) TestFilterRate(c *C) {
 }
 
 func (s *testPlanSuite) TestBestPlan(c *C) {
+	defer testleak.AfterTest(c)()
 	cases := []struct {
 		sql  string
 		best string
@@ -260,7 +264,31 @@ func (s *testPlanSuite) TestBestPlan(c *C) {
 		},
 		{
 			sql:  "select * from t where a > 0 order by b limit 100",
-			best: "Index(t.b)->Fields->Limit",
+			best: "Index(t.b) + Limit(100)->Fields->Limit",
+		},
+		{
+			sql:  "select * from t where a > 0 order by b DESC limit 100",
+			best: "Index(t.b) + Limit(100)->Fields->Limit",
+		},
+		{
+			sql:  "select * from t where a > 0 order by b + a limit 100",
+			best: "Range(t)->Fields->Sort + Limit(100) + Offset(0)",
+		},
+		{
+			sql:  "select count(*) from t where a > 0 order by b limit 100",
+			best: "Range(t)->Aggregate->Fields->Sort + Limit(100) + Offset(0)",
+		},
+		{
+			sql:  "select count(*) from t where a > 0 limit 100",
+			best: "Range(t)->Aggregate->Fields->Limit",
+		},
+		{
+			sql:  "select distinct a from t where a > 0 limit 100",
+			best: "Range(t)->Fields->Distinct->Limit",
+		},
+		{
+			sql:  "select * from t where a > 0 order by a limit 100",
+			best: "Range(t) + Limit(100)->Fields->Limit",
 		},
 		{
 			sql:  "select * from t where d = 0",
@@ -296,7 +324,7 @@ func (s *testPlanSuite) TestBestPlan(c *C) {
 		},
 		{
 			sql:  "select a from t where a = 1 limit 1 for update",
-			best: "Range(t)->Lock->Fields->Limit",
+			best: "Range(t) + Limit(1)->Lock->Fields->Limit",
 		},
 		{
 			sql:  "admin show ddl",
@@ -318,11 +346,13 @@ func (s *testPlanSuite) TestBestPlan(c *C) {
 		c.Assert(err, IsNil)
 
 		err = Refine(p)
+		c.Assert(err, IsNil)
 		c.Assert(ToString(p), Equals, ca.best, Commentf("for %s cost %v", ca.sql, EstimateCost(p)))
 	}
 }
 
 func (s *testPlanSuite) TestSplitWhere(c *C) {
+	defer testleak.AfterTest(c)()
 	cases := []struct {
 		expr  string
 		count int
@@ -345,6 +375,7 @@ func (s *testPlanSuite) TestSplitWhere(c *C) {
 }
 
 func (s *testPlanSuite) TestNullRejectFinder(c *C) {
+	defer testleak.AfterTest(c)()
 	cases := []struct {
 		expr    string
 		notNull bool
@@ -420,9 +451,15 @@ func mockResolve(node ast.Node) {
 type mockResolver struct {
 	table     *model.TableInfo
 	tableName *ast.TableName
+
+	contextStack [][]*ast.ResultField
 }
 
 func (b *mockResolver) Enter(in ast.Node) (ast.Node, bool) {
+	switch in.(type) {
+	case *ast.SelectStmt:
+		b.contextStack = append(b.contextStack, make([]*ast.ResultField, 0))
+	}
 	return in, false
 }
 
@@ -441,6 +478,30 @@ func (b *mockResolver) Leave(in ast.Node) (ast.Node, bool) {
 		}
 	case *ast.TableName:
 		x.TableInfo = b.table
+	case *ast.FieldList:
+		for _, v := range x.Fields {
+			if v.WildCard == nil {
+				rf := &ast.ResultField{ColumnAsName: v.AsName}
+				switch k := v.Expr.(type) {
+				case *ast.ColumnNameExpr:
+					rf = &ast.ResultField{
+						Column: &model.ColumnInfo{
+							Name: k.Name.Name,
+						},
+						Table:     b.table,
+						TableName: b.tableName,
+					}
+				case *ast.AggregateFuncExpr:
+					rf.Column = &model.ColumnInfo{} // Empty column info.
+					rf.Table = &model.TableInfo{}   // Empty table info.
+					rf.Expr = k
+					b.contextStack[len(b.contextStack)-1] = append(b.contextStack[len(b.contextStack)-1], rf)
+				}
+			}
+		}
+	case *ast.SelectStmt:
+		x.SetResultFields(b.contextStack[len(b.contextStack)-1])
+		b.contextStack = b.contextStack[:len(b.contextStack)-1]
 	}
 	return in, true
 }
@@ -512,6 +573,7 @@ func (b *mockJoinResolver) Leave(in ast.Node) (ast.Node, bool) {
 }
 
 func (s *testPlanSuite) TestJoinPath(c *C) {
+	defer testleak.AfterTest(c)()
 	cases := []struct {
 		sql     string
 		explain string
@@ -526,7 +588,7 @@ func (s *testPlanSuite) TestJoinPath(c *C) {
 		},
 		{
 			"select * from t1 left join t2 on 1 where t2.c1 != 0 or t1.c1 != 0",
-			"OuterJoin{Table(t1)->Table(t2)}->Fields",
+			"OuterJoin{Table(t1)->Table(t2)}->Filter->Fields",
 		},
 		{
 			"select * from t1 left join t2 on t1.i1 = t2.i1 where t1.i1 = 1",
@@ -605,6 +667,7 @@ func (s *testPlanSuite) TestJoinPath(c *C) {
 }
 
 func (s *testPlanSuite) TestMultiColumnIndex(c *C) {
+	defer testleak.AfterTest(c)()
 	cases := []struct {
 		sql              string
 		accessEqualCount int
@@ -632,50 +695,50 @@ func (s *testPlanSuite) TestMultiColumnIndex(c *C) {
 	}
 }
 
-func (s *testPlanSuite) TestVisitCount(c *C) {
-	sqls := []string{
-		"select t1.c1, t2.c2 from t1, t2",
-		"select * from t1 left join t2 on t1.c1 = t2.c1",
-		"select * from t1 group by t1.c1 having sum(t1.c2) = 1",
-		"select * from t1 where t1.c1 > 2 order by t1.c2 limit 100",
-		"insert t1 values (1), (2)",
-		"delete from t1 where false",
-		"truncate table t1",
-		"do 1",
-		"show databases",
+func (s *testPlanSuite) TestIndexHint(c *C) {
+	defer testleak.AfterTest(c)()
+	cases := []struct {
+		sql     string
+		explain string
+	}{
+		{
+			"select * from t1 force index (i1) where t1.i1 > 0 and t1.i2 = 0",
+			"Index(t1.i1)->Fields",
+		},
+		{
+			"select * from t1 use index (i1) where t1.i1 > 0 and t1.i2 = 0",
+			"Index(t1.i1)->Fields",
+		},
+		{
+			"select * from t1 ignore index (i2) where t1.i1 > 0 and t1.i2 = 0",
+			"Index(t1.i1)->Fields",
+		},
+		{
+			"select * from t1 use index (i1, i2) where t1.i1 > 0 and t1.i2 between 0 and 2 and t1.i3 = 0",
+			"Index(t1.i2)->Fields",
+		},
+		{
+			"select * from t1 ignore index (i1, i2, i3) where t1.i1 = 0 and t1.i2 = 0 and t1.i3 = 0",
+			"Table(t1)->Fields",
+		},
+		{
+			"select * from t1 use index () where t1.i1 = 0 and t1.i2 = 0 and t1.i3 = 0",
+			"Table(t1)->Fields",
+		},
+		{
+			"select * from t1 use index (i1) ignore index (i1) where t1.i1 = 0",
+			"Table(t1)->Fields",
+		},
 	}
-	for _, sql := range sqls {
-		stmt, err := parser.ParseOneStmt(sql, "", "")
-		c.Assert(err, IsNil, Commentf(sql))
-		ast.SetFlag(stmt)
+	for _, ca := range cases {
+		comment := Commentf("for %s", ca.sql)
+		s, err := parser.ParseOneStmt(ca.sql, "", "")
+		c.Assert(err, IsNil, comment)
+		stmt := s.(*ast.SelectStmt)
 		mockJoinResolve(c, stmt)
-		b := &planBuilder{}
-		p := b.build(stmt)
-		c.Assert(b.err, IsNil)
-		visitor := &countVisitor{}
-		for i := 0; i < 5; i++ {
-			visitor.skipAt = i
-			visitor.enterCount = 0
-			visitor.leaveCount = 0
-			p.Accept(visitor)
-			c.Assert(visitor.enterCount, Equals, visitor.leaveCount, Commentf(sql))
-		}
+		ast.SetFlag(stmt)
+		p, err := BuildPlan(stmt, nil)
+		c.Assert(err, IsNil)
+		c.Assert(ToString(p), Equals, ca.explain, comment)
 	}
-}
-
-type countVisitor struct {
-	skipAt     int
-	enterCount int
-	leaveCount int
-}
-
-func (s *countVisitor) Enter(in Plan) (Plan, bool) {
-	skip := s.skipAt == s.enterCount
-	s.enterCount++
-	return in, skip
-}
-
-func (s *countVisitor) Leave(in Plan) (Plan, bool) {
-	s.leaveCount++
-	return in, true
 }

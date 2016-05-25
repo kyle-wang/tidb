@@ -15,49 +15,41 @@ old_versions := 0 1 2 3
 ifeq "$(major_version)" "$(filter $(major_version),$(old_versions))"
   # Old version of `make` installed. It fails to search golex/goyacc
   # by using the modified `PATH`, so we specify these commands with full path.
-  GODEP   = $$(which godep)
   GOLEX   = $$(which golex)
   GOYACC  = $$(which goyacc)
   GOLINT  = $$(which golint)
 else
   # After version 4, `make` could follow modified `PATH` to find
   # golex/goyacc correctly.
-  GODEP   := godep
   GOLEX   := golex
   GOYACC  := goyacc
   GOLINT  := golint
 endif
 
-GO        := $(GODEP) go
+GO        := GO15VENDOREXPERIMENT="1" go
 ARCH      := "`uname -s`"
 LINUX     := "Linux"
 MAC       := "Darwin"
+PACKAGES  := $$(go list ./...| grep -vE 'vendor')
 
 LDFLAGS += -X "github.com/pingcap/tidb/util/printer.TiDBBuildTS=$(shell date -u '+%Y-%m-%d %I:%M:%S')"
 LDFLAGS += -X "github.com/pingcap/tidb/util/printer.TiDBGitHash=$(shell git rev-parse HEAD)"
 
 TARGET = ""
 
-.PHONY: godep deps all build install update parser clean todo test gotest interpreter server
+.PHONY: all build install update parser clean todo test gotest interpreter server
 
-all: godep build test check
-
-godep:
-	go get github.com/tools/godep
-	go get github.com/pingcap/go-hbase
-	go get github.com/pingcap/go-themis
-	go get github.com/pingcap/tso/client
+all: parser build test check
 
 build:
+	rm -rf vendor && ln -s _vendor/vendor vendor
 	$(GO) build
+	rm -rf vendor
 
 install:
+	rm -rf vendor && ln -s _vendor/vendor vendor
 	$(GO) install ./...
-
-update:
-	go get -u github.com/pingcap/go-hbase
-	go get -u github.com/pingcap/go-themis
-	go get -u github.com/pingcap/tso/client
+	rm -rf vendor
 
 TEMP_FILE = temp_parser_file
 
@@ -87,25 +79,21 @@ check:
 	go get github.com/golang/lint/golint
 
 	@echo "vet"
-	@ go tool vet . 2>&1 | grep -vE 'Godeps|parser/scanner.*unreachable code' | awk '{print} END{if(NR>0) {exit 1}}'
+	@ go tool vet . 2>&1 | grep -vE 'vendor|parser/scanner.*unreachable code' | awk '{print} END{if(NR>0) {exit 1}}'
 	@echo "vet --shadow"
-	@ go tool vet --shadow . 2>&1 | grep -vE 'Godeps' | awk '{print} END{if(NR>0) {exit 1}}'
+	@ go tool vet --shadow . 2>&1 | grep -vE 'vendor|parser/parser.go|parser/scanner.go' | awk '{print} END{if(NR>0) {exit 1}}'
 	@echo "golint"
-	@ $(GOLINT) ./... 2>&1 | grep -vE 'LastInsertId|NewLexer|\.pb\.go' | awk '{print} END{if(NR>0) {exit 1}}'
+	@ $(GOLINT) ./... 2>&1 | grep -vE 'vendor|LastInsertId|NewLexer|\.pb\.go' | awk '{print} END{if(NR>0) {exit 1}}'
 	@echo "gofmt (simplify)"
-	@ gofmt -s -l . 2>&1 | grep -vE 'Godeps|parser/parser.go|parser/scanner.go' | awk '{print} END{if(NR>0) {exit 1}}'
+	@ gofmt -s -l . 2>&1 | grep -vE 'vendor|parser/parser.go|parser/scanner.go' | awk '{print} END{if(NR>0) {exit 1}}'
 
-deps:
-	go list -f '{{range .Deps}}{{printf "%s\n" .}}{{end}}{{range .TestImports}}{{printf "%s\n" .}}{{end}}' ./... | \
-		sort | uniq | grep -E '[^/]+\.[^/]+/' |grep -v "pingcap/tidb" | \
-		awk 'BEGIN{ print "#!/bin/bash" }{ printf("go get -u %s\n", $$1) }' > deps.sh
-	chmod +x deps.sh
-	bash deps.sh
+errcheck:
+	go get github.com/kisielk/errcheck
+	errcheck -blank $(PACKAGES)
 
 clean:
 	$(GO) clean -i ./...
 	rm -rf *.out
-	rm -f deps.sh
 
 todo:
 	@grep -n ^[[:space:]]*_[[:space:]]*=[[:space:]][[:alpha:]][[:alnum:]]* */*.go parser/scanner.l parser/parser.y || true
@@ -116,23 +104,42 @@ todo:
 test: gotest
 
 gotest:
-	$(GO) test -cover ./...
+	rm -rf vendor && ln -s _vendor/vendor vendor
+	$(GO) test -cover $(PACKAGES)
+	rm -rf vendor
 
 race:
-	$(GO) test --race -cover ./...
+	rm -rf vendor && ln -s _vendor/vendor vendor
+	$(GO) test --race -cover $(PACKAGES)
+	rm -rf vendor
 
 ddl_test:
+	rm -rf vendor && ln -s _vendor/vendor vendor
 	$(GO) test ./ddl/... -skip_ddl=false
+	rm -rf vendor
 
 ddl_race_test:
+	rm -rf vendor && ln -s _vendor/vendor vendor
 	$(GO) test --race ./ddl/... -skip_ddl=false
+	rm -rf vendor
+
+tikv_integration_test:
+	rm -rf vendor && ln -s _vendor/vendor vendor
+	$(GO) test ./store/tikv/. -with-tikv=true
+	rm -rf vendor
 
 interpreter:
+	rm -rf vendor && ln -s _vendor/vendor vendor
 	@cd interpreter && $(GO) build -ldflags '$(LDFLAGS)'
+	rm -rf vendor
 
 server:
 ifeq ($(TARGET), "")
+	rm -rf vendor && ln -s _vendor/vendor vendor
 	@cd tidb-server && $(GO) build -ldflags '$(LDFLAGS)'
+	rm -rf vendor
 else
+	rm -rf vendor && ln -s _vendor/vendor vendor
 	@cd tidb-server && $(GO) build -ldflags '$(LDFLAGS)' -o '$(TARGET)'
+	rm -rf vendor
 endif

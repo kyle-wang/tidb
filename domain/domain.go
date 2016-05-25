@@ -25,6 +25,7 @@ import (
 	"github.com/pingcap/tidb/kv"
 	"github.com/pingcap/tidb/meta"
 	"github.com/pingcap/tidb/model"
+	"github.com/pingcap/tidb/perfschema"
 	"github.com/pingcap/tidb/sessionctx/variable"
 	"github.com/pingcap/tidb/store/localstore"
 	"github.com/pingcap/tidb/terror"
@@ -35,12 +36,11 @@ var ddlLastReloadSchemaTS = "ddl_last_reload_schema_ts"
 // Domain represents a storage space. Different domains can use the same database name.
 // Multiple domains can be used in parallel without synchronization.
 type Domain struct {
-	store      kv.Storage
-	infoHandle *infoschema.Handle
-	ddl        ddl.DDL
-	leaseCh    chan time.Duration
-	// nano seconds
-	lastLeaseTS int64
+	store       kv.Storage
+	infoHandle  *infoschema.Handle
+	ddl         ddl.DDL
+	leaseCh     chan time.Duration
+	lastLeaseTS int64 // nano seconds
 	m           sync.Mutex
 }
 
@@ -97,6 +97,11 @@ func (do *Domain) InfoSchema() infoschema.InfoSchema {
 	return do.infoHandle.Get()
 }
 
+// PerfSchema gets performance schema from domain.
+func (do *Domain) PerfSchema() perfschema.PerfSchema {
+	return do.infoHandle.GetPerfHandle()
+}
+
 // DDL gets DDL from domain.
 func (do *Domain) DDL() ddl.DDL {
 	return do.ddl
@@ -109,8 +114,19 @@ func (do *Domain) Store() kv.Storage {
 
 // SetLease will reset the lease time for online DDL change.
 func (do *Domain) SetLease(lease time.Duration) {
-	do.leaseCh <- lease
+	if lease <= 0 {
+		log.Warnf("[ddl] set the current lease:%v into a new lease:%v failed, so do nothing",
+			do.ddl.GetLease(), lease)
+		return
+	}
 
+	if do.leaseCh == nil {
+		log.Errorf("[ddl] set the current lease:%v into a new lease:%v failed, so do nothing",
+			do.ddl.GetLease(), lease)
+		return
+	}
+
+	do.leaseCh <- lease
 	// let ddl to reset lease too.
 	do.ddl.SetLease(lease)
 }
@@ -184,7 +200,7 @@ func (do *Domain) reload() error {
 	case err := <-done:
 		return errors.Trace(err)
 	case <-time.After(timeout):
-		return errors.New("reload schema timeout")
+		return errLoadSchemaTimeOut
 	}
 }
 
@@ -200,10 +216,6 @@ func (do *Domain) mustReload() {
 const defaultLoadTime = 300 * time.Second
 
 func (do *Domain) loadSchemaInLoop(lease time.Duration) {
-	if lease <= 0 {
-		lease = defaultLoadTime
-	}
-
 	ticker := time.NewTicker(lease)
 	defer ticker.Stop()
 
@@ -219,10 +231,6 @@ func (do *Domain) loadSchemaInLoop(lease time.Duration) {
 				log.Fatalf("[ddl] reload schema err %v", errors.ErrorStack(err))
 			}
 		case newLease := <-do.leaseCh:
-			if newLease <= 0 {
-				newLease = defaultLoadTime
-			}
-
 			if lease == newLease {
 				// nothing to do
 				continue
@@ -253,18 +261,32 @@ func (c *ddlCallback) OnChanged(err error) error {
 
 // NewDomain creates a new domain.
 func NewDomain(store kv.Storage, lease time.Duration) (d *Domain, err error) {
-	d = &Domain{
-		store:   store,
-		leaseCh: make(chan time.Duration, 1),
-	}
+	d = &Domain{store: store}
 
-	d.infoHandle = infoschema.NewHandle(d.store)
+	d.infoHandle, err = infoschema.NewHandle(d.store)
+	if err != nil {
+		return nil, errors.Trace(err)
+	}
 	d.ddl = ddl.NewDDL(d.store, d.infoHandle, &ddlCallback{do: d}, lease)
 	d.mustReload()
 
 	variable.RegisterStatistics(d)
 
-	go d.loadSchemaInLoop(lease)
+	// Only when the store is local that the lease value is 0.
+	// If the store is local, it doesn't need loadSchemaInLoop.
+	if lease > 0 {
+		d.leaseCh = make(chan time.Duration, 1)
+		go d.loadSchemaInLoop(lease)
+	}
 
 	return d, nil
 }
+
+// Domain error codes.
+const (
+	codeLoadSchemaTimeOut terror.ErrCode = 1
+)
+
+var (
+	errLoadSchemaTimeOut = terror.ClassDomain.New(codeLoadSchemaTimeOut, "reload schema timeout")
+)

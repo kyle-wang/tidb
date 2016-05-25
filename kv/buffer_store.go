@@ -63,7 +63,20 @@ func (s *BufferStore) Seek(k Key) (Iterator, error) {
 	if err != nil {
 		return nil, errors.Trace(err)
 	}
-	return newUnionIter(bufferIt, retrieverIt), nil
+	return newUnionIter(bufferIt, retrieverIt, false), nil
+}
+
+// SeekReverse implements the Retriever interface.
+func (s *BufferStore) SeekReverse(k Key) (Iterator, error) {
+	buferIt, err := s.MemBuffer.SeekReverse(k)
+	if err != nil {
+		return nil, errors.Trace(err)
+	}
+	retrieverIt, err := s.r.SeekReverse(k)
+	if err != nil {
+		return nil, errors.Trace(err)
+	}
+	return newUnionIter(buferIt, retrieverIt, true), nil
 }
 
 // WalkBuffer iterates all buffered kv pairs.

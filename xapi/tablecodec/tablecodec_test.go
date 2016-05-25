@@ -17,19 +17,24 @@ import (
 	"testing"
 
 	. "github.com/pingcap/check"
+	"github.com/pingcap/tidb/model"
+	"github.com/pingcap/tidb/mysql"
 	"github.com/pingcap/tidb/util/codec"
+	"github.com/pingcap/tidb/util/testleak"
+	"github.com/pingcap/tidb/util/types"
 )
 
 func TestT(t *testing.T) {
 	TestingT(t)
 }
 
-var _ = Suite(&tableCodecSuite{})
+var _ = Suite(&testTableCodecSuite{})
 
-type tableCodecSuite struct{}
+type testTableCodecSuite struct{}
 
 // TODO: add more tests.
-func (s *tableCodecSuite) TestTableCodec(c *C) {
+func (s *testTableCodecSuite) TestTableCodec(c *C) {
+	defer testleak.AfterTest(c)()
 	key := EncodeRowKey(1, codec.EncodeInt(nil, 2))
 	h, err := DecodeRowKey(key)
 	c.Assert(err, IsNil)
@@ -39,5 +44,16 @@ func (s *tableCodecSuite) TestTableCodec(c *C) {
 	h, err = DecodeRowKey(key)
 	c.Assert(err, IsNil)
 	c.Assert(h, Equals, int64(2))
+}
 
+func (s *testTableCodecSuite) TestColumnToProto(c *C) {
+	defer testleak.AfterTest(c)()
+	// Make sure the Flag is set in tipb.ColumnInfo
+	tp := types.NewFieldType(mysql.TypeLong)
+	tp.Flag = 10
+	col := &model.ColumnInfo{
+		FieldType: *tp,
+	}
+	pc := columnToProto(col)
+	c.Assert(pc.GetFlag(), Equals, int32(10))
 }

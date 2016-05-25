@@ -215,9 +215,11 @@ func (t *Time) UnmarshalInLocation(b []byte, loc *time.Location) error {
 }
 
 const numberFormat = "20060102150405"
+const dateFormat = "20060102"
 
 // ToNumber returns a formatted number.
 // e.g,
+// 2012-12-12 -> 20121212
 // 2012-12-12T10:10:10 -> 20121212101010
 // 2012-12-12T10:10:10.123456 -> 20121212101010.123456
 func (t Time) ToNumber() Decimal {
@@ -225,7 +227,15 @@ func (t Time) ToNumber() Decimal {
 		return ZeroDecimal
 	}
 
-	tfStr := numberFormat
+	// Fix issue #1046
+	// Prevents from converting 2012-12-12 to 20121212000000
+	var tfStr string
+	if t.Type == TypeDate {
+		tfStr = dateFormat
+	} else {
+		tfStr = numberFormat
+	}
+
 	if t.Fsp > 0 {
 		tfStr = fmt.Sprintf("%s.%s", tfStr, strings.Repeat("0", t.Fsp))
 	}
@@ -280,10 +290,7 @@ func (t Time) ConvertToDuration() (Duration, error) {
 
 // Compare returns an integer comparing the time instant t to o.
 // If t is after o, return 1, equal o, return 0, before o, return -1.
-func (t *Time) Compare(o *Time) int {
-	if o == nil {
-		return 1
-	}
+func (t Time) Compare(o Time) int {
 	if t.Time.After(o.Time) {
 		return 1
 	} else if t.Time.Equal(o.Time) {
@@ -302,7 +309,7 @@ func (t Time) CompareString(str string) (int, error) {
 		return 0, errors.Trace(err)
 	}
 
-	return t.Compare(&o), nil
+	return t.Compare(o), nil
 }
 
 // RoundFrac rounds fractional seconds precision with new fsp and returns a new one.
@@ -335,7 +342,7 @@ func parseDateFormat(format string) []string {
 	start := 0
 	seps := []string{}
 	for i := 0; i < len(format); i++ {
-		// Date fromat must start and end with number.
+		// Date format must start and end with number.
 		if i == 0 || i == len(format)-1 {
 			if !unicode.IsNumber(rune(format[i])) {
 				return nil
@@ -344,7 +351,7 @@ func parseDateFormat(format string) []string {
 			continue
 		}
 
-		// Seperator is a single none-number char.
+		// Separator is a single none-number char.
 		if !unicode.IsNumber(rune(format[i])) {
 			if !unicode.IsNumber(rune(format[i-1])) {
 				return nil
@@ -559,8 +566,7 @@ func (d Duration) String() string {
 }
 
 func (d Duration) formatFrac(frac int) string {
-	format := fmt.Sprintf("%%0%dd", d.Fsp)
-	s := fmt.Sprintf(format, frac)
+	s := fmt.Sprintf("%06d", frac)
 	return s[0:d.Fsp]
 }
 
@@ -931,7 +937,7 @@ func parseDateTimeFromNum(num int64) (Time, error) {
 // Type is TypeDatetime, TypeTimestamp and TypeDate.
 // Fsp is in range [0, 6].
 // MySQL supports many valid datatime format, but still has some limitation.
-// If delimiter exists, the date part and time part is seperated by a space or T,
+// If delimiter exists, the date part and time part is separated by a space or T,
 // other punctuation character can be used as the delimiter between date parts or time parts.
 // If no delimiter, the format must be YYYYMMDDHHMMSS or YYMMDDHHMMSS
 // If we have fractional seconds part, we must use decimal points as the delimiter.
@@ -1030,10 +1036,7 @@ func checkTimestamp(t Time) bool {
 }
 
 // ExtractTimeNum extracts time value number from time unit and format.
-func ExtractTimeNum(unit string, t *Time) (int64, error) {
-	if t == nil {
-		return 0, errors.Errorf("invalid time t")
-	}
+func ExtractTimeNum(unit string, t Time) (int64, error) {
 	switch strings.ToUpper(unit) {
 	case "MICROSECOND":
 		return int64(t.Nanosecond() / 1000), nil

@@ -167,6 +167,7 @@ type ExecuteExec struct {
 	UsingVars []ast.ExprNode
 	ID        uint32
 	StmtExec  Executor
+	Stmt      ast.StmtNode
 }
 
 // Fields implements Executor Fields interface.
@@ -208,9 +209,10 @@ func (e *ExecuteExec) Build() error {
 		if err != nil {
 			return errors.Trace(err)
 		}
-		prepared.Params[i].SetValue(val)
+		prepared.Params[i].SetDatum(val)
 	}
 
+	ast.ResetEvaluatedFlag(prepared.Stmt)
 	if prepared.SchemaVersion != e.IS.SchemaMetaVersion() {
 		// If the schema version has changed we need to prepare it again,
 		// if this time it failed, the real reason for the error is schema changed.
@@ -231,6 +233,7 @@ func (e *ExecuteExec) Build() error {
 		return errors.Trace(b.err)
 	}
 	e.StmtExec = stmtExec
+	e.Stmt = prepared.Stmt
 	return nil
 }
 

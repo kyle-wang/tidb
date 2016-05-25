@@ -19,6 +19,7 @@ import (
 
 	. "github.com/pingcap/check"
 	"github.com/pingcap/tidb/ast"
+	"github.com/pingcap/tidb/util/testleak"
 )
 
 func TestT(t *testing.T) {
@@ -31,6 +32,7 @@ type testParserSuite struct {
 }
 
 func (s *testParserSuite) TestSimple(c *C) {
+	defer testleak.AfterTest(c)()
 	// Testcase for unreserved keywords
 	unreservedKws := []string{
 		"auto_increment", "after", "begin", "bit", "bool", "boolean", "charset", "columns", "commit",
@@ -42,7 +44,8 @@ func (s *testParserSuite) TestSimple(c *C) {
 		"max_rows", "min_rows", "national", "row", "quarter", "escape", "grants", "status", "fields", "triggers",
 		"delay_key_write", "isolation", "repeatable", "committed", "uncommitted", "only", "serializable", "level",
 		"curtime", "variables", "dayname", "version", "btree", "hash", "row_format", "dynamic", "fixed", "compressed",
-		"compact", "redundant",
+		"compact", "redundant", "sql_no_cache sql_no_cache", "sql_cache sql_cache", "action", "round",
+		"enable", "disable", "reverse",
 	}
 	for _, kw := range unreservedKws {
 		src := fmt.Sprintf("SELECT %s FROM tbl;", kw)
@@ -107,7 +110,6 @@ func (s *testParserSuite) TestSimple(c *C) {
 	c.Assert(cs.Cols, HasLen, 1)
 	c.Assert(cs.Cols[0].Options, HasLen, 1)
 	c.Assert(cs.Cols[0].Options[0].Tp, Equals, ast.ColumnOptionPrimaryKey)
-
 }
 
 type testCase struct {
@@ -127,6 +129,7 @@ func (s *testParserSuite) RunTest(c *C, table []testCase) {
 	}
 }
 func (s *testParserSuite) TestDMLStmt(c *C) {
+	defer testleak.AfterTest(c)()
 	table := []testCase{
 		{"", true},
 		{";", true},
@@ -195,6 +198,7 @@ func (s *testParserSuite) TestDMLStmt(c *C) {
 		// set
 		// user defined
 		{"SET @a = 1", true},
+		{"SET @b := 1", true},
 		// session system variables
 		{"SET SESSION autocommit = 1", true},
 		{"SET @@session.autocommit = 1", true},
@@ -239,6 +243,8 @@ func (s *testParserSuite) TestDMLStmt(c *C) {
 		{"ALTER TABLE t ADD COLUMN a SMALLINT UNSIGNED", true},
 		{"ALTER TABLE t ADD COLUMN a SMALLINT UNSIGNED FIRST", true},
 		{"ALTER TABLE t ADD COLUMN a SMALLINT UNSIGNED AFTER b", true},
+		{"ALTER TABLE t DISABLE KEYS", true},
+		{"ALTER TABLE t ENABLE KEYS", true},
 
 		// from join
 		{"SELECT * from t1, t2, t3", true},
@@ -291,6 +297,10 @@ func (s *testParserSuite) TestDMLStmt(c *C) {
 		{"CREATE TABLE sbtest (id INTEGER UNSIGNED NOT NULL AUTO_INCREMENT, k integer UNSIGNED DEFAULT '0' NOT NULL, c char(120) DEFAULT '' NOT NULL, pad char(60) DEFAULT '' NOT NULL, PRIMARY KEY  (id) )", true},
 		{"create table test (create_date TIMESTAMP NOT NULL COMMENT '创建日期 create date' DEFAULT now());", true},
 
+		// For truncate statement
+		{"TRUNCATE TABLE t1", true},
+		{"TRUNCATE t1", true},
+
 		// For delete statement
 		{"DELETE t1, t2 FROM t1 INNER JOIN t2 INNER JOIN t3 WHERE t1.id=t2.id AND t2.id=t3.id;", true},
 		{"DELETE FROM t1, t2 USING t1 INNER JOIN t2 INNER JOIN t3 WHERE t1.id=t2.id AND t2.id=t3.id;", true},
@@ -322,11 +332,15 @@ func (s *testParserSuite) TestDMLStmt(c *C) {
 
 		// For https://github.com/pingcap/tidb/issues/320
 		{`(select 1);`, true},
+
+		// For https://github.com/pingcap/tidb/issues/1050
+		{`SELECT /*!40001 SQL_NO_CACHE */ * FROM test WHERE 1 limit 0, 2000;`, true},
 	}
 	s.RunTest(c, table)
 }
 
 func (s *testParserSuite) TestExpression(c *C) {
+	defer testleak.AfterTest(c)()
 	table := []testCase{
 		// Sign expression
 		{"SELECT ++1", true},
@@ -351,6 +365,7 @@ func (s *testParserSuite) TestExpression(c *C) {
 }
 
 func (s *testParserSuite) TestBuiltin(c *C) {
+	defer testleak.AfterTest(c)()
 	table := []testCase{
 		// For buildin functions
 		{"SELECT POW(1, 2)", true},
@@ -359,6 +374,9 @@ func (s *testParserSuite) TestBuiltin(c *C) {
 		{"SELECT POW(-1, 1)", true},
 		{"SELECT RAND();", true},
 		{"SELECT RAND(1);", true},
+		{"SELECT MOD(10, 2);", true},
+		{"SELECT ROUND(-1.23);", true},
+		{"SELECT ROUND(1.23, 1);", true},
 
 		{"SELECT SUBSTR('Quadratically',5);", true},
 		{"SELECT SUBSTR('Quadratically',5, 3);", true},
@@ -383,7 +401,10 @@ func (s *testParserSuite) TestBuiltin(c *C) {
 		{"SELECT SUBSTRING_INDEX('www.mysql.com', '.', 2);", true},
 		{"SELECT SUBSTRING_INDEX('www.mysql.com', '.', -2);", true},
 
+		{`SELECT ASCII(""), ASCII("A"), ASCII(1);`, true},
+
 		{`SELECT LOWER("A"), UPPER("a")`, true},
+		{`SELECT LCASE("A"), UCASE("a")`, true},
 
 		{`SELECT REPLACE('www.mysql.com', 'w', 'Ww')`, true},
 
@@ -438,6 +459,9 @@ func (s *testParserSuite) TestBuiltin(c *C) {
 		{"SELECT DAYNAME('2007-02-03');", true},
 		{"SELECT WEEKDAY('2007-02-03');", true},
 
+		// For utc_date
+		{"SELECT UTC_DATE, UTC_DATE();", true},
+
 		// for week, month, year
 		{"SELECT WEEK('2007-02-03');", true},
 		{"SELECT WEEK('2007-02-03', 0);", true},
@@ -478,6 +502,9 @@ func (s *testParserSuite) TestBuiltin(c *C) {
 		{`SELECT TRIM(LEADING 'x' FROM 'xxxbarxxx');`, true},
 		{`SELECT TRIM(BOTH 'x' FROM 'xxxbarxxx');`, true},
 		{`SELECT TRIM(TRAILING 'xyz' FROM 'barxxyz');`, true},
+		{`SELECT LTRIM(' foo ');`, true},
+		{`SELECT RTRIM(' bar ');`, true},
+
 		// Repeat
 		{`SELECT REPEAT("a", 10);`, true},
 
@@ -579,6 +606,7 @@ func (s *testParserSuite) TestBuiltin(c *C) {
 }
 
 func (s *testParserSuite) TestIdentifier(c *C) {
+	defer testleak.AfterTest(c)()
 	table := []testCase{
 		// For quote identifier
 		{"select `a`, `a.b`, `a b` from t", true},
@@ -598,6 +626,7 @@ func (s *testParserSuite) TestIdentifier(c *C) {
 }
 
 func (s *testParserSuite) TestDDL(c *C) {
+	defer testleak.AfterTest(c)()
 	table := []testCase{
 		{"CREATE", false},
 		{"CREATE TABLE", false},
@@ -733,11 +762,30 @@ func (s *testParserSuite) TestDDL(c *C) {
 		INDEX FK_a3t0m9apja9jmrn60uab30pqd USING BTREE (user_id) comment ''
 		) ENGINE=InnoDB AUTO_INCREMENT=95 DEFAULT CHARACTER SET utf8 COLLATE utf8_general_ci ROW_FORMAT=COMPACT COMMENT='' CHECKSUM=0 DELAY_KEY_WRITE=0;`, true},
 		{`create table t (c int KEY);`, true},
+		{`CREATE TABLE address (
+		id bigint(20) NOT NULL AUTO_INCREMENT,
+		create_at datetime NOT NULL,
+		deleted tinyint(1) NOT NULL,
+		update_at datetime NOT NULL,
+		version bigint(20) DEFAULT NULL,
+		address varchar(128) NOT NULL,
+		address_detail varchar(128) NOT NULL,
+		cellphone varchar(16) NOT NULL,
+		latitude double NOT NULL,
+		longitude double NOT NULL,
+		name varchar(16) NOT NULL,
+		sex tinyint(1) NOT NULL,
+		user_id bigint(20) NOT NULL,
+		PRIMARY KEY (id),
+		CONSTRAINT FK_7rod8a71yep5vxasb0ms3osbg FOREIGN KEY (user_id) REFERENCES waimaiqa.user (id) ON DELETE CASCADE ON UPDATE NO ACTION,
+		INDEX FK_7rod8a71yep5vxasb0ms3osbg (user_id) comment ''
+		) ENGINE=InnoDB AUTO_INCREMENT=30 DEFAULT CHARACTER SET utf8 COLLATE utf8_general_ci ROW_FORMAT=COMPACT COMMENT='' CHECKSUM=0 DELAY_KEY_WRITE=0;`, true},
 	}
 	s.RunTest(c, table)
 }
 
 func (s *testParserSuite) TestType(c *C) {
+	defer testleak.AfterTest(c)()
 	table := []testCase{
 		// For time fsp
 		{"CREATE TABLE t( c1 TIME(2), c2 DATETIME(2), c3 TIMESTAMP(2) );", true},
@@ -746,6 +794,7 @@ func (s *testParserSuite) TestType(c *C) {
 		{"SELECT x'0a', X'11', 0x11", true},
 		{"select x'0xaa'", false},
 		{"select 0X11", false},
+		{"select 0x4920616D2061206C6F6E672068657820737472696E67", true},
 
 		// For bit
 		{"select 0b01, 0b0, b'11', B'11'", true},
@@ -774,6 +823,7 @@ func (s *testParserSuite) TestType(c *C) {
 }
 
 func (s *testParserSuite) TestPrivilege(c *C) {
+	defer testleak.AfterTest(c)()
 	table := []testCase{
 		// For create user
 		{`CREATE USER IF NOT EXISTS 'root'@'localhost' IDENTIFIED BY 'new-password'`, true},
@@ -796,6 +846,7 @@ func (s *testParserSuite) TestPrivilege(c *C) {
 }
 
 func (s *testParserSuite) TestComment(c *C) {
+	defer testleak.AfterTest(c)()
 	table := []testCase{
 		{"create table t (c int comment 'comment')", true},
 		{"create table t (c int) comment = 'comment'", true},
@@ -808,6 +859,7 @@ func (s *testParserSuite) TestComment(c *C) {
 	s.RunTest(c, table)
 }
 func (s *testParserSuite) TestSubquery(c *C) {
+	defer testleak.AfterTest(c)()
 	table := []testCase{
 		// For compare subquery
 		{"SELECT 1 > (select 1)", true},
@@ -827,6 +879,7 @@ func (s *testParserSuite) TestSubquery(c *C) {
 	s.RunTest(c, table)
 }
 func (s *testParserSuite) TestUnion(c *C) {
+	defer testleak.AfterTest(c)()
 	table := []testCase{
 		{"select c1 from t1 union select c2 from t2", true},
 		{"select c1 from t1 union (select c2 from t2)", true},
@@ -849,6 +902,7 @@ func (s *testParserSuite) TestUnion(c *C) {
 }
 
 func (s *testParserSuite) TestLikeEscape(c *C) {
+	defer testleak.AfterTest(c)()
 	table := []testCase{
 		// For like escape
 		{`select "abc_" like "abc\\_" escape ''`, true},
@@ -861,12 +915,28 @@ func (s *testParserSuite) TestLikeEscape(c *C) {
 }
 
 func (s *testParserSuite) TestMysqlDump(c *C) {
+	defer testleak.AfterTest(c)()
 	// Statements used by mysqldump.
 	table := []testCase{
 		{`UNLOCK TABLES;`, true},
 		{`LOCK TABLES t1 READ;`, true},
 		{`show table status like 't'`, true},
 		{`LOCK TABLES t2 WRITE`, true},
+	}
+	s.RunTest(c, table)
+}
+
+func (s *testParserSuite) TestIndexHint(c *C) {
+	defer testleak.AfterTest(c)()
+	table := []testCase{
+		{`select * from t use index ();`, true},
+		{`select * from t use index (idx);`, true},
+		{`select * from t use index (idx1, idx2);`, true},
+		{`select * from t ignore key (idx1)`, true},
+		{`select * from t force index for join (idx1)`, true},
+		{`select * from t use index for order by (idx1)`, true},
+		{`select * from t force index for group by (idx1)`, true},
+		{`select * from t use index for group by (idx1) use index for order by (idx2), t2`, true},
 	}
 	s.RunTest(c, table)
 }

@@ -17,13 +17,12 @@ import (
 	"fmt"
 	"reflect"
 	"runtime"
+	"sync/atomic"
 	"time"
 
 	"github.com/juju/errors"
 	"github.com/ngaut/log"
 	"github.com/pingcap/tidb/ast"
-	"github.com/pingcap/tidb/kv"
-	"github.com/pingcap/tidb/terror"
 	"github.com/pingcap/tidb/util/types"
 )
 
@@ -98,16 +97,6 @@ type StatementState struct {
 	noGoodIndexUsed uint8
 }
 
-const (
-	// Maximum allowed number of elements in table events_statements_history.
-	// TODO: make it configurable?
-	stmtsHistoryElemMax int = 1024
-)
-
-var (
-	stmtInfos = make(map[reflect.Type]*statementInfo)
-)
-
 func (ps *perfSchema) RegisterStatement(category, name string, elem interface{}) {
 	instrumentName := fmt.Sprintf("%s%s/%s", statementInstrumentPrefix, category, name)
 	key, err := ps.addInstrument(instrumentName)
@@ -117,7 +106,7 @@ func (ps *perfSchema) RegisterStatement(category, name string, elem interface{})
 		return
 	}
 
-	stmtInfos[reflect.TypeOf(elem)] = &statementInfo{
+	ps.stmtInfos[reflect.TypeOf(elem)] = &statementInfo{
 		key:  key,
 		name: instrumentName,
 	}
@@ -125,7 +114,7 @@ func (ps *perfSchema) RegisterStatement(category, name string, elem interface{})
 
 func (ps *perfSchema) StartStatement(sql string, connID uint64, callerName EnumCallerName, elem interface{}) *StatementState {
 	stmtType := reflect.TypeOf(elem)
-	info, ok := stmtInfos[stmtType]
+	info, ok := ps.stmtInfos[stmtType]
 	if !ok {
 		// just ignore, do nothing else.
 		log.Errorf("No instrument registered for statement %s", stmtType)
@@ -158,7 +147,9 @@ func (ps *perfSchema) StartStatement(sql string, connID uint64, callerName EnumC
 	// - table setup_objects
 
 	var source string
+	callerLock.RLock()
 	source, ok = callerNames[callerName]
+	callerLock.RUnlock()
 	if !ok {
 		_, fileName, fileLine, ok := runtime.Caller(1)
 		if !ok {
@@ -167,7 +158,10 @@ func (ps *perfSchema) StartStatement(sql string, connID uint64, callerName EnumC
 			return nil
 		}
 		source = fmt.Sprintf("%s:%d", fileName, fileLine)
+
+		callerLock.Lock()
 		callerNames[callerName] = source
+		callerLock.Unlock()
 	}
 
 	return &StatementState{
@@ -257,72 +251,64 @@ func state2Record(state *StatementState) []types.Datum {
 }
 
 func (ps *perfSchema) updateEventsStmtsCurrent(connID uint64, record []types.Datum) error {
-	// Try AddRecord
 	tbl := ps.mTables[TableStmtsCurrent]
-	_, err := tbl.AddRecord(nil, record)
-	if err == nil {
+	if tbl == nil {
 		return nil
 	}
-	if terror.ErrorNotEqual(err, kv.ErrKeyExists) {
+	index := connID % uint64(currentElemMax)
+	handle := atomic.LoadInt64(&ps.stmtHandles[index])
+	if handle == 0 {
+		newHandle, err := tbl.AddRecord(nil, record)
+		if err != nil {
+			return errors.Trace(err)
+		}
+		atomic.StoreInt64(&ps.stmtHandles[index], newHandle)
+		return nil
+	}
+	err := tbl.UpdateRecord(nil, handle, nil, record, nil)
+	if err != nil {
 		return errors.Trace(err)
 	}
-	// Update it
-	handle := int64(connID)
-	err = tbl.UpdateRecord(nil, handle, nil, record, nil)
-	return errors.Trace(err)
+	return nil
 }
 
 func (ps *perfSchema) appendEventsStmtsHistory(record []types.Datum) error {
 	tbl := ps.mTables[TableStmtsHistory]
-	if len(ps.historyHandles) < stmtsHistoryElemMax {
-		h, err := tbl.AddRecord(nil, record)
-		if err == nil {
-			ps.historyHandles = append(ps.historyHandles, h)
-			return nil
-		}
-		if terror.ErrorNotEqual(err, kv.ErrKeyExists) {
-			return errors.Trace(err)
-		}
-		// THREAD_ID is PK
-		handle := int64(record[0].GetUint64())
-		err = tbl.UpdateRecord(nil, handle, nil, record, nil)
+	if tbl == nil {
+		return nil
+	}
+	_, err := tbl.AddRecord(nil, record)
+	if err != nil {
 		return errors.Trace(err)
-
 	}
-	// If histroy is full, replace old data
-	if ps.historyCursor >= len(ps.historyHandles) {
-		ps.historyCursor = 0
-	}
-	h := ps.historyHandles[ps.historyCursor]
-	ps.historyCursor++
-	err := tbl.UpdateRecord(nil, h, nil, record, nil)
-	return errors.Trace(err)
+	return nil
 }
 
-func registerStatements() {
+func (ps *perfSchema) registerStatements() {
+	ps.stmtInfos = make(map[reflect.Type]*statementInfo)
 	// Existing instrument names are the same as MySQL 5.7
-	PerfHandle.RegisterStatement("sql", "alter_table", (*ast.AlterTableStmt)(nil))
-	PerfHandle.RegisterStatement("sql", "begin", (*ast.BeginStmt)(nil))
-	PerfHandle.RegisterStatement("sql", "commit", (*ast.CommitStmt)(nil))
-	PerfHandle.RegisterStatement("sql", "create_db", (*ast.CreateDatabaseStmt)(nil))
-	PerfHandle.RegisterStatement("sql", "create_index", (*ast.CreateIndexStmt)(nil))
-	PerfHandle.RegisterStatement("sql", "create_table", (*ast.CreateTableStmt)(nil))
-	PerfHandle.RegisterStatement("sql", "deallocate", (*ast.DeallocateStmt)(nil))
-	PerfHandle.RegisterStatement("sql", "delete", (*ast.DeleteStmt)(nil))
-	PerfHandle.RegisterStatement("sql", "do", (*ast.DoStmt)(nil))
-	PerfHandle.RegisterStatement("sql", "drop_db", (*ast.DropDatabaseStmt)(nil))
-	PerfHandle.RegisterStatement("sql", "drop_table", (*ast.DropTableStmt)(nil))
-	PerfHandle.RegisterStatement("sql", "drop_index", (*ast.DropIndexStmt)(nil))
-	PerfHandle.RegisterStatement("sql", "execute", (*ast.ExecuteStmt)(nil))
-	PerfHandle.RegisterStatement("sql", "explain", (*ast.ExplainStmt)(nil))
-	PerfHandle.RegisterStatement("sql", "insert", (*ast.InsertStmt)(nil))
-	PerfHandle.RegisterStatement("sql", "prepare", (*ast.PrepareStmt)(nil))
-	PerfHandle.RegisterStatement("sql", "rollback", (*ast.RollbackStmt)(nil))
-	PerfHandle.RegisterStatement("sql", "select", (*ast.SelectStmt)(nil))
-	PerfHandle.RegisterStatement("sql", "set", (*ast.SetStmt)(nil))
-	PerfHandle.RegisterStatement("sql", "show", (*ast.ShowStmt)(nil))
-	PerfHandle.RegisterStatement("sql", "truncate", (*ast.TruncateTableStmt)(nil))
-	PerfHandle.RegisterStatement("sql", "union", (*ast.UnionStmt)(nil))
-	PerfHandle.RegisterStatement("sql", "update", (*ast.UpdateStmt)(nil))
-	PerfHandle.RegisterStatement("sql", "use", (*ast.UseStmt)(nil))
+	ps.RegisterStatement("sql", "alter_table", (*ast.AlterTableStmt)(nil))
+	ps.RegisterStatement("sql", "begin", (*ast.BeginStmt)(nil))
+	ps.RegisterStatement("sql", "commit", (*ast.CommitStmt)(nil))
+	ps.RegisterStatement("sql", "create_db", (*ast.CreateDatabaseStmt)(nil))
+	ps.RegisterStatement("sql", "create_index", (*ast.CreateIndexStmt)(nil))
+	ps.RegisterStatement("sql", "create_table", (*ast.CreateTableStmt)(nil))
+	ps.RegisterStatement("sql", "deallocate", (*ast.DeallocateStmt)(nil))
+	ps.RegisterStatement("sql", "delete", (*ast.DeleteStmt)(nil))
+	ps.RegisterStatement("sql", "do", (*ast.DoStmt)(nil))
+	ps.RegisterStatement("sql", "drop_db", (*ast.DropDatabaseStmt)(nil))
+	ps.RegisterStatement("sql", "drop_table", (*ast.DropTableStmt)(nil))
+	ps.RegisterStatement("sql", "drop_index", (*ast.DropIndexStmt)(nil))
+	ps.RegisterStatement("sql", "execute", (*ast.ExecuteStmt)(nil))
+	ps.RegisterStatement("sql", "explain", (*ast.ExplainStmt)(nil))
+	ps.RegisterStatement("sql", "insert", (*ast.InsertStmt)(nil))
+	ps.RegisterStatement("sql", "prepare", (*ast.PrepareStmt)(nil))
+	ps.RegisterStatement("sql", "rollback", (*ast.RollbackStmt)(nil))
+	ps.RegisterStatement("sql", "select", (*ast.SelectStmt)(nil))
+	ps.RegisterStatement("sql", "set", (*ast.SetStmt)(nil))
+	ps.RegisterStatement("sql", "show", (*ast.ShowStmt)(nil))
+	ps.RegisterStatement("sql", "truncate", (*ast.TruncateTableStmt)(nil))
+	ps.RegisterStatement("sql", "union", (*ast.UnionStmt)(nil))
+	ps.RegisterStatement("sql", "update", (*ast.UpdateStmt)(nil))
+	ps.RegisterStatement("sql", "use", (*ast.UseStmt)(nil))
 }

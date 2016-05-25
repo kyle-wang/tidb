@@ -91,7 +91,6 @@ func (e *Evaluator) handleAndAnd(o *ast.BinaryOperationExpr) bool {
 
 func (e *Evaluator) handleOrOr(o *ast.BinaryOperationExpr) bool {
 	leftDatum := o.L.GetDatum()
-	righDatum := o.R.GetDatum()
 	if leftDatum.Kind() != types.KindNull {
 		x, err := leftDatum.ToBool()
 		if err != nil {
@@ -103,6 +102,7 @@ func (e *Evaluator) handleOrOr(o *ast.BinaryOperationExpr) bool {
 			return true
 		}
 	}
+	righDatum := o.R.GetDatum()
 	if righDatum.Kind() != types.KindNull {
 		y, err := righDatum.ToBool()
 		if err != nil {
@@ -416,7 +416,7 @@ func computeMul(a, b types.Datum) (d types.Datum, err error) {
 }
 
 func computeDiv(a, b types.Datum) (d types.Datum, err error) {
-	// MySQL support integer divison Div and division operator /
+	// MySQL support integer division Div and division operator /
 	// we use opcode.Div for division operator and will use another for integer division later.
 	// for division operator, we will use float64 for calculation.
 	switch a.Kind() {

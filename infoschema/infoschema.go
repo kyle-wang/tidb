@@ -19,7 +19,6 @@ import (
 
 	"github.com/juju/errors"
 	"github.com/pingcap/tidb/kv"
-	"github.com/pingcap/tidb/meta"
 	"github.com/pingcap/tidb/meta/autoid"
 	"github.com/pingcap/tidb/model"
 	"github.com/pingcap/tidb/mysql"
@@ -29,6 +28,33 @@ import (
 	// import table implementation to init table.TableFromMeta
 	_ "github.com/pingcap/tidb/table/tables"
 	"github.com/pingcap/tidb/util/types"
+)
+
+var (
+	// ErrDatabaseDropExists returns for dropping a non-existent database.
+	ErrDatabaseDropExists = terror.ClassSchema.New(codeDBDropExists, "database doesn't exist")
+	// ErrDatabaseNotExists returns for database not exists.
+	ErrDatabaseNotExists = terror.ClassSchema.New(codeDatabaseNotExists, "database not exists")
+	// ErrTableNotExists returns for table not exists.
+	ErrTableNotExists = terror.ClassSchema.New(codeTableNotExists, "table not exists")
+	// ErrColumnNotExists returns for column not exists.
+	ErrColumnNotExists = terror.ClassSchema.New(codeColumnNotExists, "field not exists")
+	// ErrForeignKeyNotMatch returns for foreign key not match.
+	ErrForeignKeyNotMatch = terror.ClassSchema.New(codeCannotAddForeign, "foreign key not match")
+	// ErrForeignKeyExists returns for foreign key exists.
+	ErrForeignKeyExists = terror.ClassSchema.New(codeCannotAddForeign, "foreign key already exists")
+	// ErrForeignKeyNotExists returns for foreign key not exists.
+	ErrForeignKeyNotExists = terror.ClassSchema.New(codeForeignKeyNotExists, "foreign key not exists")
+	// ErrDatabaseExists returns for database already exists.
+	ErrDatabaseExists = terror.ClassSchema.New(codeDatabaseExists, "database already exists")
+	// ErrTableExists returns for table already exists.
+	ErrTableExists = terror.ClassSchema.New(codeTableExists, "table already exists")
+	// ErrTableDropExists returns for dropping a non-existent table.
+	ErrTableDropExists = terror.ClassSchema.New(codeBadTable, "unknown table")
+	// ErrColumnExists returns for column already exists.
+	ErrColumnExists = terror.ClassSchema.New(codeColumnExists, "Duplicate column")
+	// ErrIndexExists returns for index already exists.
+	ErrIndexExists = terror.ClassSchema.New(codeIndexExists, "Duplicate Index")
 )
 
 // InfoSchema is the interface used to retrieve the schema information.
@@ -55,7 +81,7 @@ type InfoSchema interface {
 	SchemaMetaVersion() int64
 }
 
-// Infomation Schema Name.
+// Information Schema Name.
 const (
 	Name = "INFORMATION_SCHEMA"
 )
@@ -73,6 +99,23 @@ type infoSchema struct {
 
 	// We should check version when change schema.
 	schemaMetaVersion int64
+}
+
+// MockInfoSchema only serves for test.
+func MockInfoSchema(tbList []*model.TableInfo) InfoSchema {
+	result := &infoSchema{}
+	result.schemaNameToID = make(map[string]int64)
+	result.tableNameToID = make(map[tableName]int64)
+	result.schemas = make(map[int64]*model.DBInfo)
+	result.tables = make(map[int64]table.Table)
+
+	result.schemaNameToID["test"] = 0
+	result.schemas[0] = &model.DBInfo{ID: 0, Name: model.NewCIStr("test"), Tables: tbList}
+	for i, tb := range tbList {
+		result.tableNameToID[tableName{schema: "test", table: tb.Name.L}] = int64(i)
+		result.tables[int64(i)] = table.MockTableFromMeta(tb)
+	}
+	return result
 }
 
 var _ InfoSchema = (*infoSchema)(nil)
@@ -202,37 +245,45 @@ func (is *infoSchema) Clone() (result []*model.DBInfo) {
 
 // Handle handles information schema, including getting and setting.
 type Handle struct {
-	value atomic.Value
-	store kv.Storage
+	value     atomic.Value
+	store     kv.Storage
+	memSchema *memSchemaHandle
 }
 
 // NewHandle creates a new Handle.
-func NewHandle(store kv.Storage) *Handle {
+func NewHandle(store kv.Storage) (*Handle, error) {
 	h := &Handle{
 		store: store,
 	}
 	// init memory tables
-	initMemoryTables(store)
-	initPerfSchema(store)
-	return h
+	var err error
+	h.memSchema, err = newMemSchemaHandle()
+	if err != nil {
+		return nil, errors.Trace(err)
+	}
+	return h, nil
 }
 
-func initPerfSchema(store kv.Storage) {
-	perfHandle = perfschema.NewPerfHandle(store)
+// Init memory schemas including infoschema and perfshcema.
+func newMemSchemaHandle() (*memSchemaHandle, error) {
+	h := &memSchemaHandle{
+		nameToTable: make(map[string]table.Table),
+	}
+	err := initMemoryTables(h)
+	if err != nil {
+		return nil, errors.Trace(err)
+	}
+	initMemoryTables(h)
+	h.perfHandle, err = perfschema.NewPerfHandle()
+	if err != nil {
+		return nil, errors.Trace(err)
+	}
+	return h, nil
 }
 
-func genGlobalID(store kv.Storage) (int64, error) {
-	var globalID int64
-	err := kv.RunInNewTxn(store, true, func(txn kv.Transaction) error {
-		var err error
-		globalID, err = meta.NewMeta(txn).GenGlobalID()
-		return errors.Trace(err)
-	})
-	return globalID, errors.Trace(err)
-}
-
-var (
-	// Information_Schema
+// memSchemaHandle is used to store memory schema information.
+type memSchemaHandle struct {
+	// Information Schema
 	isDB          *model.DBInfo
 	schemataTbl   table.Table
 	tablesTbl     table.Table
@@ -243,70 +294,52 @@ var (
 	filesTbl      table.Table
 	defTbl        table.Table
 	profilingTbl  table.Table
+	partitionsTbl table.Table
 	nameToTable   map[string]table.Table
-
+	// Performance Schema
 	perfHandle perfschema.PerfSchema
-)
-
-func setColumnID(meta *model.TableInfo, store kv.Storage) error {
-	var err error
-	for _, c := range meta.Columns {
-		c.ID, err = genGlobalID(store)
-		if err != nil {
-			return errors.Trace(err)
-		}
-	}
-	return nil
 }
 
-func initMemoryTables(store kv.Storage) error {
+func initMemoryTables(h *memSchemaHandle) error {
 	// Init Information_Schema
 	var (
 		err error
 		tbl table.Table
 	)
-	dbID, err := genGlobalID(store)
-	if err != nil {
-		return errors.Trace(err)
-	}
-	nameToTable = make(map[string]table.Table)
+	dbID := autoid.GenLocalSchemaID()
 	isTables := make([]*model.TableInfo, 0, len(tableNameToColumns))
 	for name, cols := range tableNameToColumns {
 		meta := buildTableMeta(name, cols)
 		isTables = append(isTables, meta)
-		meta.ID, err = genGlobalID(store)
-		if err != nil {
-			return errors.Trace(err)
-		}
-		err = setColumnID(meta, store)
-		if err != nil {
-			return errors.Trace(err)
+		meta.ID = autoid.GenLocalSchemaID()
+		for _, c := range meta.Columns {
+			c.ID = autoid.GenLocalSchemaID()
 		}
 		alloc := autoid.NewMemoryAllocator(dbID)
 		tbl, err = createMemoryTable(meta, alloc)
 		if err != nil {
 			return errors.Trace(err)
 		}
-		nameToTable[meta.Name.L] = tbl
+		h.nameToTable[meta.Name.L] = tbl
 	}
-	schemataTbl = nameToTable[strings.ToLower(tableSchemata)]
-	tablesTbl = nameToTable[strings.ToLower(tableTables)]
-	columnsTbl = nameToTable[strings.ToLower(tableColumns)]
-	statisticsTbl = nameToTable[strings.ToLower(tableStatistics)]
-	charsetTbl = nameToTable[strings.ToLower(tableCharacterSets)]
-	collationsTbl = nameToTable[strings.ToLower(tableCollations)]
+	h.schemataTbl = h.nameToTable[strings.ToLower(tableSchemata)]
+	h.tablesTbl = h.nameToTable[strings.ToLower(tableTables)]
+	h.columnsTbl = h.nameToTable[strings.ToLower(tableColumns)]
+	h.statisticsTbl = h.nameToTable[strings.ToLower(tableStatistics)]
+	h.charsetTbl = h.nameToTable[strings.ToLower(tableCharacterSets)]
+	h.collationsTbl = h.nameToTable[strings.ToLower(tableCollations)]
 
 	// CharacterSets/Collations contain static data. Init them now.
-	err = insertData(charsetTbl, dataForCharacterSets())
+	err = insertData(h.charsetTbl, dataForCharacterSets())
 	if err != nil {
 		return errors.Trace(err)
 	}
-	err = insertData(collationsTbl, dataForColltions())
+	err = insertData(h.collationsTbl, dataForColltions())
 	if err != nil {
 		return errors.Trace(err)
 	}
 	// create db
-	isDB = &model.DBInfo{
+	h.isDB = &model.DBInfo{
 		ID:      dbID,
 		Name:    model.NewCIStr(Name),
 		Charset: mysql.DefaultCharset,
@@ -387,15 +420,15 @@ func (h *Handle) Set(newInfo []*model.DBInfo, schemaMetaVersion int64) error {
 		}
 	}
 	// Build Information_Schema
-	info.schemaNameToID[isDB.Name.L] = isDB.ID
-	info.schemas[isDB.ID] = isDB
-	for _, t := range isDB.Tables {
-		tbl, ok := nameToTable[t.Name.L]
+	info.schemaNameToID[h.memSchema.isDB.Name.L] = h.memSchema.isDB.ID
+	info.schemas[h.memSchema.isDB.ID] = h.memSchema.isDB
+	for _, t := range h.memSchema.isDB.Tables {
+		tbl, ok := h.memSchema.nameToTable[t.Name.L]
 		if !ok {
 			return ErrTableNotExists.Gen("table `%s` is missing.", t.Name)
 		}
 		info.tables[t.ID] = tbl
-		tname := tableName{isDB.Name.L, t.Name.L}
+		tname := tableName{h.memSchema.isDB.Name.L, t.Name.L}
 		info.tableNameToID[tname] = t.ID
 		for _, c := range t.Columns {
 			info.columns[c.ID] = c
@@ -404,11 +437,11 @@ func (h *Handle) Set(newInfo []*model.DBInfo, schemaMetaVersion int64) error {
 	}
 
 	// Add Performance_Schema
-	psDB := perfHandle.GetDBMeta()
+	psDB := h.memSchema.perfHandle.GetDBMeta()
 	info.schemaNameToID[psDB.Name.L] = psDB.ID
 	info.schemas[psDB.ID] = psDB
 	for _, t := range psDB.Tables {
-		tbl, ok := perfHandle.GetTable(t.Name.O)
+		tbl, ok := h.memSchema.perfHandle.GetTable(t.Name.O)
 		if !ok {
 			return ErrTableNotExists.Gen("table `%s` is missing.", t.Name)
 		}
@@ -428,19 +461,19 @@ func (h *Handle) Set(newInfo []*model.DBInfo, schemaMetaVersion int64) error {
 		dbNames = append(dbNames, v.Name.L)
 		dbInfos = append(dbInfos, v)
 	}
-	err = refillTable(schemataTbl, dataForSchemata(dbNames))
+	err = refillTable(h.memSchema.schemataTbl, dataForSchemata(dbNames))
 	if err != nil {
 		return errors.Trace(err)
 	}
-	err = refillTable(tablesTbl, dataForTables(dbInfos))
+	err = refillTable(h.memSchema.tablesTbl, dataForTables(dbInfos))
 	if err != nil {
 		return errors.Trace(err)
 	}
-	err = refillTable(columnsTbl, dataForColumns(dbInfos))
+	err = refillTable(h.memSchema.columnsTbl, dataForColumns(dbInfos))
 	if err != nil {
 		return errors.Trace(err)
 	}
-	err = refillTable(statisticsTbl, dataForStatistics(dbInfos))
+	err = refillTable(h.memSchema.statisticsTbl, dataForStatistics(dbInfos))
 	if err != nil {
 		return errors.Trace(err)
 	}
@@ -455,12 +488,20 @@ func (h *Handle) Get() InfoSchema {
 	return schema
 }
 
+// GetPerfHandle gets performance schema from handle.
+func (h *Handle) GetPerfHandle() perfschema.PerfSchema {
+	return h.memSchema.perfHandle
+}
+
 // Schema error codes.
 const (
-	codeDbDropExists      terror.ErrCode = 1008
+	codeDBDropExists      terror.ErrCode = 1008
 	codeDatabaseNotExists                = 1049
 	codeTableNotExists                   = 1146
 	codeColumnNotExists                  = 1054
+
+	codeCannotAddForeign    = 1215
+	codeForeignKeyNotExists = 1091
 
 	codeDatabaseExists = 1007
 	codeTableExists    = 1050
@@ -469,39 +510,19 @@ const (
 	codeIndexExists    = 1831
 )
 
-var (
-	// ErrDatabaseDropExists returns for dropping a non-existent database.
-	ErrDatabaseDropExists = terror.ClassSchema.New(codeDbDropExists, "database doesn't exist")
-	// ErrDatabaseNotExists returns for database not exists.
-	ErrDatabaseNotExists = terror.ClassSchema.New(codeDatabaseNotExists, "database not exists")
-	// ErrTableNotExists returns for table not exists.
-	ErrTableNotExists = terror.ClassSchema.New(codeTableNotExists, "table not exists")
-	// ErrColumnNotExists returns for column not exists.
-	ErrColumnNotExists = terror.ClassSchema.New(codeColumnNotExists, "field not exists")
-
-	// ErrDatabaseExists returns for database already exists.
-	ErrDatabaseExists = terror.ClassSchema.New(codeDatabaseExists, "database already exists")
-	// ErrTableExists returns for table already exists.
-	ErrTableExists = terror.ClassSchema.New(codeTableExists, "table already exists")
-	// ErrTableDropExists returns for dropping a non-existent table.
-	ErrTableDropExists = terror.ClassSchema.New(codeBadTable, "unknown table")
-	// ErrColumnExists returns for column already exists.
-	ErrColumnExists = terror.ClassSchema.New(codeColumnExists, "Duplicate column")
-	// ErrIndexExists returns for index already exists.
-	ErrIndexExists = terror.ClassSchema.New(codeIndexExists, "Duplicate Index")
-)
-
 func init() {
 	schemaMySQLErrCodes := map[terror.ErrCode]uint16{
-		codeDbDropExists:      mysql.ErrDbDropExists,
-		codeDatabaseNotExists: mysql.ErrBadDb,
-		codeTableNotExists:    mysql.ErrNoSuchTable,
-		codeColumnNotExists:   mysql.ErrBadField,
-		codeDatabaseExists:    mysql.ErrDbCreateExists,
-		codeTableExists:       mysql.ErrTableExists,
-		codeBadTable:          mysql.ErrBadTable,
-		codeColumnExists:      mysql.ErrDupFieldName,
-		codeIndexExists:       mysql.ErrDupIndex,
+		codeDBDropExists:        mysql.ErrDBDropExists,
+		codeDatabaseNotExists:   mysql.ErrBadDB,
+		codeTableNotExists:      mysql.ErrNoSuchTable,
+		codeColumnNotExists:     mysql.ErrBadField,
+		codeCannotAddForeign:    mysql.ErrCannotAddForeign,
+		codeForeignKeyNotExists: mysql.ErrCantDropFieldOrKey,
+		codeDatabaseExists:      mysql.ErrDBCreateExists,
+		codeTableExists:         mysql.ErrTableExists,
+		codeBadTable:            mysql.ErrBadTable,
+		codeColumnExists:        mysql.ErrDupFieldName,
+		codeIndexExists:         mysql.ErrDupIndex,
 	}
 	terror.ErrClassToMySQLCodes[terror.ClassSchema] = schemaMySQLErrCodes
 }

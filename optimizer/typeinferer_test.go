@@ -18,11 +18,13 @@ import (
 	"github.com/pingcap/tidb"
 	"github.com/pingcap/tidb/ast"
 	"github.com/pingcap/tidb/context"
+	"github.com/pingcap/tidb/model"
 	"github.com/pingcap/tidb/mysql"
 	"github.com/pingcap/tidb/optimizer"
 	"github.com/pingcap/tidb/sessionctx"
 	"github.com/pingcap/tidb/util/charset"
 	"github.com/pingcap/tidb/util/testkit"
+	"github.com/pingcap/tidb/util/testleak"
 )
 
 var _ = Suite(&testTypeInferrerSuite{})
@@ -51,6 +53,7 @@ func (ts *testTypeInferrerSuite) TestInferType(c *C) {
 
 		{"c1 is true", mysql.TypeLonglong, charset.CharsetBin},
 		{"c2 is null", mysql.TypeLonglong, charset.CharsetBin},
+		{"isnull(1/0)", mysql.TypeLonglong, charset.CharsetBin},
 		{"cast(1 as decimal)", mysql.TypeNewDecimal, charset.CharsetBin},
 
 		{"1 and 1", mysql.TypeLonglong, charset.CharsetBin},
@@ -79,6 +82,7 @@ func (ts *testTypeInferrerSuite) TestInferType(c *C) {
 		{"count(c1)", mysql.TypeLonglong, charset.CharsetBin},
 		{"abs(1)", mysql.TypeLonglong, charset.CharsetBin},
 		{"abs(1.1)", mysql.TypeNewDecimal, charset.CharsetBin},
+		{"abs(cast(\"20150817015609\" as DATETIME))", mysql.TypeDouble, charset.CharsetBin},
 		{"IF(1>2,2,3)", mysql.TypeLonglong, charset.CharsetBin},
 		{"IFNULL(1,0)", mysql.TypeLonglong, charset.CharsetBin},
 		{"POW(2,2)", mysql.TypeDouble, charset.CharsetBin},
@@ -118,9 +122,14 @@ func (ts *testTypeInferrerSuite) TestInferType(c *C) {
 		{"CONCAT_WS('-', 'T', 'i', 'DB')", mysql.TypeVarString, "utf8"},
 		{"left('TiDB', 2)", mysql.TypeVarString, "utf8"},
 		{"lower('TiDB')", mysql.TypeVarString, "utf8"},
+		{"lcase('TiDB')", mysql.TypeVarString, "utf8"},
 		{"repeat('TiDB', 3)", mysql.TypeVarString, "utf8"},
 		{"replace('TiDB', 'D', 'd')", mysql.TypeVarString, "utf8"},
 		{"upper('TiDB')", mysql.TypeVarString, "utf8"},
+		{"ucase('TiDB')", mysql.TypeVarString, "utf8"},
+		{"trim(' TiDB ')", mysql.TypeVarString, "utf8"},
+		{"ltrim(' TiDB')", mysql.TypeVarString, "utf8"},
+		{"rtrim('TiDB ')", mysql.TypeVarString, "utf8"},
 		{"connection_id()", mysql.TypeLonglong, charset.CharsetBin},
 		{"if(1>2, 2, 3)", mysql.TypeLonglong, charset.CharsetBin},
 		{"case c1 when null then 2 when 2 then 1.1 else 1 END", mysql.TypeNewDecimal, charset.CharsetBin},
@@ -141,4 +150,20 @@ func (ts *testTypeInferrerSuite) TestInferType(c *C) {
 		c.Assert(tp, Equals, ca.tp, Commentf("Tp for %s", ca.expr))
 		c.Assert(chs, Equals, ca.chs, Commentf("Charset for %s", ca.expr))
 	}
+}
+
+func (s *testTypeInferrerSuite) TestColumnInfoModified(c *C) {
+	defer testleak.AfterTest(c)()
+	store, err := tidb.NewStore(tidb.EngineGoLevelDBMemory)
+	c.Assert(err, IsNil)
+	defer store.Close()
+	testKit := testkit.NewTestKit(c, store)
+	testKit.MustExec("use test")
+	testKit.MustExec("drop table if exists tab0")
+	testKit.MustExec("CREATE TABLE tab0(col0 INTEGER, col1 INTEGER, col2 INTEGER)")
+	testKit.MustExec("SELECT + - (- CASE + col0 WHEN + CAST( col0 AS SIGNED ) THEN col1 WHEN 79 THEN NULL WHEN + - col1 THEN col0 / + col0 END ) * - 16 FROM tab0")
+	ctx := testKit.Se.(context.Context)
+	is := sessionctx.GetDomain(ctx).InfoSchema()
+	col, _ := is.ColumnByName(model.NewCIStr("test"), model.NewCIStr("tab0"), model.NewCIStr("col1"))
+	c.Assert(col.Tp, Equals, mysql.TypeLong)
 }

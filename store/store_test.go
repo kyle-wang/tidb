@@ -22,16 +22,18 @@ import (
 	"sync/atomic"
 	"testing"
 
+	"github.com/ngaut/log"
 	. "github.com/pingcap/check"
 	"github.com/pingcap/tidb"
 	"github.com/pingcap/tidb/kv"
 	"github.com/pingcap/tidb/store/localstore"
 	"github.com/pingcap/tidb/store/localstore/boltdb"
 	"github.com/pingcap/tidb/store/localstore/goleveldb"
+	"github.com/pingcap/tidb/util/testleak"
 )
 
 var (
-	testStore     = flag.String("teststore", "memory", "test store name, [memory, goleveldb, boltdb, hbase]")
+	testStore     = flag.String("teststore", "memory", "test store name, [memory, goleveldb, boltdb]")
 	testStorePath = flag.String("testpath", "testkv", "test storage path")
 )
 
@@ -58,9 +60,11 @@ func (s *testKVSuite) SetUpSuite(c *C) {
 
 	cacheS, _ := tidb.NewStore(fmt.Sprintf("%s://%s", *testStore, *testStorePath))
 	c.Assert(cacheS, Equals, store)
+	log.SetLevelByString("warn")
 }
 
 func (s *testKVSuite) TearDownSuite(c *C) {
+	log.SetLevelByString("debug")
 	err := s.s.Close()
 	c.Assert(err, IsNil)
 }
@@ -159,6 +163,7 @@ func mustGet(c *C, txn kv.Transaction) {
 }
 
 func (s *testKVSuite) TestGetSet(c *C) {
+	defer testleak.AfterTest(c)()
 	txn, err := s.s.Begin()
 	c.Assert(err, IsNil)
 
@@ -179,6 +184,7 @@ func (s *testKVSuite) TestGetSet(c *C) {
 }
 
 func (s *testKVSuite) TestSeek(c *C) {
+	defer testleak.AfterTest(c)()
 	txn, err := s.s.Begin()
 	c.Assert(err, IsNil)
 
@@ -198,6 +204,7 @@ func (s *testKVSuite) TestSeek(c *C) {
 }
 
 func (s *testKVSuite) TestInc(c *C) {
+	defer testleak.AfterTest(c)()
 	txn, err := s.s.Begin()
 	c.Assert(err, IsNil)
 
@@ -232,6 +239,7 @@ func (s *testKVSuite) TestInc(c *C) {
 }
 
 func (s *testKVSuite) TestDelete(c *C) {
+	defer testleak.AfterTest(c)()
 	txn, err := s.s.Begin()
 	c.Assert(err, IsNil)
 
@@ -267,6 +275,7 @@ func (s *testKVSuite) TestDelete(c *C) {
 }
 
 func (s *testKVSuite) TestDelete2(c *C) {
+	defer testleak.AfterTest(c)()
 	txn, err := s.s.Begin()
 	c.Assert(err, IsNil)
 	val := []byte("test")
@@ -295,10 +304,10 @@ func (s *testKVSuite) TestDelete2(c *C) {
 	it, _ = txn.Seek([]byte("DATA_test_tbl_department_record__000000000"))
 	c.Assert(it.Valid(), IsFalse)
 	txn.Commit()
-
 }
 
 func (s *testKVSuite) TestSetNil(c *C) {
+	defer testleak.AfterTest(c)()
 	txn, err := s.s.Begin()
 	defer txn.Commit()
 	c.Assert(err, IsNil)
@@ -307,6 +316,7 @@ func (s *testKVSuite) TestSetNil(c *C) {
 }
 
 func (s *testKVSuite) TestBasicSeek(c *C) {
+	defer testleak.AfterTest(c)()
 	txn, err := s.s.Begin()
 	c.Assert(err, IsNil)
 	txn.Set([]byte("1"), []byte("1"))
@@ -322,6 +332,7 @@ func (s *testKVSuite) TestBasicSeek(c *C) {
 }
 
 func (s *testKVSuite) TestBasicTable(c *C) {
+	defer testleak.AfterTest(c)()
 	txn, err := s.s.Begin()
 	c.Assert(err, IsNil)
 	for i := 1; i < 5; i++ {
@@ -369,6 +380,7 @@ func (s *testKVSuite) TestBasicTable(c *C) {
 }
 
 func (s *testKVSuite) TestRollback(c *C) {
+	defer testleak.AfterTest(c)()
 	txn, err := s.s.Begin()
 	c.Assert(err, IsNil)
 
@@ -396,6 +408,7 @@ func (s *testKVSuite) TestRollback(c *C) {
 }
 
 func (s *testKVSuite) TestSeekMin(c *C) {
+	defer testleak.AfterTest(c)()
 	kvs := []struct {
 		key   string
 		value string
@@ -430,6 +443,7 @@ func (s *testKVSuite) TestSeekMin(c *C) {
 }
 
 func (s *testKVSuite) TestConditionIfNotExist(c *C) {
+	defer testleak.AfterTest(c)()
 	var success int64
 	cnt := 100
 	b := []byte("1")
@@ -464,6 +478,7 @@ func (s *testKVSuite) TestConditionIfNotExist(c *C) {
 }
 
 func (s *testKVSuite) TestConditionIfEqual(c *C) {
+	defer testleak.AfterTest(c)()
 	var success int64
 	cnt := 100
 	b := []byte("1")
@@ -503,6 +518,7 @@ func (s *testKVSuite) TestConditionIfEqual(c *C) {
 }
 
 func (s *testKVSuite) TestConditionUpdate(c *C) {
+	defer testleak.AfterTest(c)()
 	txn, err := s.s.Begin()
 	c.Assert(err, IsNil)
 	txn.Delete([]byte("b"))
@@ -512,6 +528,7 @@ func (s *testKVSuite) TestConditionUpdate(c *C) {
 }
 
 func (s *testKVSuite) TestDBClose(c *C) {
+	defer testleak.AfterTest(c)()
 	path := "memory:test"
 	d := localstore.Driver{
 		Driver: goleveldb.MemoryDriver{},
@@ -560,6 +577,7 @@ func (s *testKVSuite) TestDBClose(c *C) {
 }
 
 func (s *testKVSuite) TestBoltDBDeadlock(c *C) {
+	defer testleak.AfterTest(c)()
 	d := localstore.Driver{
 		Driver: boltdb.Driver{},
 	}
@@ -596,6 +614,7 @@ func (s *testKVSuite) TestBoltDBDeadlock(c *C) {
 }
 
 func (s *testKVSuite) TestIsolationInc(c *C) {
+	defer testleak.AfterTest(c)()
 	threadCnt := 4
 
 	ids := make(map[int64]struct{}, threadCnt*100)
@@ -634,6 +653,7 @@ func (s *testKVSuite) TestIsolationInc(c *C) {
 }
 
 func (s *testKVSuite) TestIsolationMultiInc(c *C) {
+	defer testleak.AfterTest(c)()
 	threadCnt := 4
 	incCnt := 100
 	keyCnt := 4

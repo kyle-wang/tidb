@@ -17,6 +17,7 @@ import (
 	"strconv"
 
 	. "github.com/pingcap/check"
+	"github.com/pingcap/tidb/util/testleak"
 )
 
 var _ = Suite(&testHexSuite{})
@@ -25,6 +26,7 @@ type testHexSuite struct {
 }
 
 func (s *testHexSuite) TestHex(c *C) {
+	defer testleak.AfterTest(c)()
 	tbl := []struct {
 		Input  string
 		Expect int64
@@ -63,4 +65,21 @@ func (s *testHexSuite) TestHex(c *C) {
 
 	h.Value = 1
 	c.Assert(h.ToString(), Equals, "\x01")
+
+	/*
+	 mysql> select hex("I am a long hex string");
+	 +----------------------------------------------+
+	 | hex("I am a long hex string")                |
+	 +----------------------------------------------+
+	 | 4920616D2061206C6F6E672068657820737472696E67 |
+	 +----------------------------------------------+
+	 1 row in set (0.00 sec)
+	*/
+	str := "I am a long hex string"
+	hexStr := "0x4920616D2061206C6F6E672068657820737472696E67"
+	_, err = ParseHex(hexStr)
+	c.Assert(err, NotNil)
+	v, err := ParseHexStr(hexStr)
+	c.Assert(err, IsNil)
+	c.Assert(v, Equals, str)
 }

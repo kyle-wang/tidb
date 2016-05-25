@@ -113,8 +113,9 @@ func newOuterJoinPath(isRightJoin bool, leftPath, rightPath *joinPath, on *ast.O
 		conditions := splitWhere(on.Expr)
 		availablePaths := []*joinPath{outerJoin.outer}
 		for _, con := range conditions {
-			if !outerJoin.inner.attachCondition(con, availablePaths) {
+			if !outerJoin.inner.attachCondition(con, availablePaths, true) {
 				log.Errorf("Inner failed to attach ON condition")
+				outerJoin.conditions = append(outerJoin.conditions, con)
 			}
 		}
 	}
@@ -146,7 +147,7 @@ func newInnerJoinPath(leftPath, rightPath *joinPath, on *ast.OnCondition) *joinP
 	if on != nil {
 		conditions := splitWhere(on.Expr)
 		for _, con := range conditions {
-			if !innerJoin.attachCondition(con, nil) {
+			if !innerJoin.attachCondition(con, nil, true) {
 				innerJoin.conditions = append(innerJoin.conditions, con)
 			}
 		}
@@ -173,7 +174,8 @@ func (p *joinPath) resultFields() []*ast.ResultField {
 
 // attachCondition tries to attach a condition as deep as possible.
 // availablePaths are paths join before this path.
-func (p *joinPath) attachCondition(condition ast.ExprNode, availablePaths []*joinPath) (attached bool) {
+// onCond represents whether the conditions is from current join's on condition. The on condition from other joins is treated as where condition.
+func (p *joinPath) attachCondition(condition ast.ExprNode, availablePaths []*joinPath, onCond bool) (attached bool) {
 	filterRate := guesstimateFilterRate(condition)
 	// table
 	if p.table != nil || p.subquery != nil {
@@ -189,7 +191,7 @@ func (p *joinPath) attachCondition(condition ast.ExprNode, availablePaths []*joi
 	// inner join
 	if len(p.inners) > 0 {
 		for _, in := range p.inners {
-			if in.attachCondition(condition, availablePaths) {
+			if in.attachCondition(condition, availablePaths, false) {
 				p.filterRate *= filterRate
 				return true
 			}
@@ -205,11 +207,12 @@ func (p *joinPath) attachCondition(condition ast.ExprNode, availablePaths []*joi
 	}
 
 	// outer join
-	if p.outer.attachCondition(condition, availablePaths) {
+	if p.outer.attachCondition(condition, availablePaths, false) {
 		p.filterRate *= filterRate
 		return true
 	}
-	if p.inner.attachCondition(condition, append(availablePaths, p.outer)) {
+	// can't attach any where condition
+	if onCond && p.inner.attachCondition(condition, availablePaths, false) {
 		p.filterRate *= filterRate
 		return true
 	}
@@ -217,6 +220,9 @@ func (p *joinPath) attachCondition(condition ast.ExprNode, availablePaths []*joi
 }
 
 func (p *joinPath) containsTable(table *ast.TableName) bool {
+	if table == nil {
+		return false
+	}
 	if p.table != nil {
 		return p.table == table
 	}
@@ -231,7 +237,6 @@ func (p *joinPath) containsTable(table *ast.TableName) bool {
 		}
 		return false
 	}
-
 	return p.outer.containsTable(table) || p.inner.containsTable(table)
 }
 
@@ -270,6 +275,11 @@ func (p *joinPath) attachEqualCond(eqCon *equalCond, availablePaths []*joinPath)
 				return true
 			}
 		}
+		return false
+	}
+	// subquery join
+	if p.subquery != nil {
+		// TODO: find a way to attach condition to subquery.
 		return false
 	}
 	// outer join
@@ -469,7 +479,7 @@ func (p *joinPath) reattach(pathMap map[*joinPath]bool, availablePaths []*joinPa
 		for _, con := range p.conditions {
 			var attached bool
 			for path := range pathMap {
-				if path.attachCondition(con, availablePaths) {
+				if path.attachCondition(con, availablePaths, true) {
 					attached = true
 					break
 				}
@@ -597,12 +607,11 @@ func (b *planBuilder) buildJoin(sel *ast.SelectStmt) Plan {
 	path := b.buildBasicJoinPath(sel.From.TableRefs, nrfinder.nullRejectTables)
 	rfs := path.resultFields()
 
+	var filterConditions []ast.ExprNode
 	whereConditions := splitWhere(sel.Where)
 	for _, whereCond := range whereConditions {
-		if !path.attachCondition(whereCond, nil) {
-			// TODO: Find a better way to handle this condition.
-			path.conditions = append(path.conditions, whereCond)
-			log.Warnf("Failed to attach where condtion in %s", sel.Text())
+		if !path.attachCondition(whereCond, nil, false) {
+			filterConditions = append(filterConditions, whereCond)
 		}
 	}
 	path.extractEqualConditon()
@@ -610,6 +619,12 @@ func (b *planBuilder) buildJoin(sel *ast.SelectStmt) Plan {
 	path.optimizeJoinOrder(nil)
 	p := b.buildPlanFromJoinPath(path)
 	p.SetFields(rfs)
+	if filterConditions != nil {
+		filterPlan := &Filter{Conditions: filterConditions}
+		addChild(filterPlan, p)
+		filterPlan.SetFields(p.Fields())
+		return filterPlan
+	}
 	return p
 }
 
@@ -724,6 +739,8 @@ func (b *planBuilder) buildPlanFromJoinPath(path *joinPath) Plan {
 			Outer: b.buildPlanFromJoinPath(path.outer),
 			Inner: b.buildPlanFromJoinPath(path.inner),
 		}
+		addChild(join, join.Outer)
+		addChild(join, join.Inner)
 		if path.rightJoin {
 			join.SetFields(append(join.Inner.Fields(), join.Outer.Fields()...))
 		} else {
@@ -733,12 +750,21 @@ func (b *planBuilder) buildPlanFromJoinPath(path *joinPath) Plan {
 	}
 	join := &JoinInner{}
 	for _, in := range path.inners {
-		join.Inners = append(join.Inners, b.buildPlanFromJoinPath(in))
+		inPlan := b.buildPlanFromJoinPath(in)
+		join.Inners = append(join.Inners, inPlan)
 		join.fields = append(join.fields, in.resultFields()...)
+		addChild(join, inPlan)
 	}
 	join.Conditions = path.conditions
 	for _, equiv := range path.eqConds {
-		cond := &ast.BinaryOperationExpr{L: equiv.left.Expr, R: equiv.right.Expr, Op: opcode.EQ}
+		columnNameExpr := &ast.ColumnNameExpr{}
+		columnNameExpr.Name = &ast.ColumnName{}
+		columnNameExpr.Name.Name = equiv.left.Column.Name
+		columnNameExpr.Name.Table = equiv.left.Table.Name
+		columnNameExpr.Refer = equiv.left
+		ast.SetFlag(columnNameExpr)
+		cond := &ast.BinaryOperationExpr{L: columnNameExpr, R: equiv.right.Expr, Op: opcode.EQ}
+		ast.MergeChildrenFlags(cond, columnNameExpr, equiv.right.Expr)
 		join.Conditions = append(join.Conditions, cond)
 	}
 	return join
@@ -751,8 +777,10 @@ func (b *planBuilder) buildTablePlanFromJoinPath(path *joinPath) Plan {
 		columnNameExpr.Name.Name = equiv.left.Column.Name
 		columnNameExpr.Name.Table = equiv.left.Table.Name
 		columnNameExpr.Refer = equiv.left
+		columnNameExpr.Type = equiv.left.Expr.GetType()
+		ast.SetFlag(columnNameExpr)
 		condition := &ast.BinaryOperationExpr{L: columnNameExpr, R: equiv.right.Expr, Op: opcode.EQ}
-		ast.SetFlag(condition)
+		ast.MergeChildrenFlags(condition, columnNameExpr, equiv.right.Expr)
 		path.conditions = append(path.conditions, condition)
 	}
 	candidates := b.buildAllAccessMethodsPlan(path)
@@ -780,8 +808,10 @@ func (b *planBuilder) buildSubqueryJoinPath(path *joinPath) Plan {
 		columnNameExpr.Name.Name = equiv.left.Column.Name
 		columnNameExpr.Name.Table = equiv.left.Table.Name
 		columnNameExpr.Refer = equiv.left
+		columnNameExpr.Type = equiv.left.Expr.GetType()
+		ast.SetFlag(columnNameExpr)
 		condition := &ast.BinaryOperationExpr{L: columnNameExpr, R: equiv.right.Expr, Op: opcode.EQ}
-		ast.SetFlag(condition)
+		ast.MergeChildrenFlags(condition, columnNameExpr, equiv.right.Expr)
 		path.conditions = append(path.conditions, condition)
 	}
 	p := b.build(path.subquery)
@@ -789,7 +819,7 @@ func (b *planBuilder) buildSubqueryJoinPath(path *joinPath) Plan {
 		return p
 	}
 	filterPlan := &Filter{Conditions: path.conditions}
-	filterPlan.SetSrc(p)
+	addChild(filterPlan, p)
 	filterPlan.SetFields(p.Fields())
 	return filterPlan
 }
