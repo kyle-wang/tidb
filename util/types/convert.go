@@ -27,6 +27,11 @@ import (
 	"github.com/pingcap/tidb/mysql"
 )
 
+var (
+	// ErrValueTruncated is used when a value has been truncated during conversion.
+	ErrValueTruncated = errors.New("value has been truncated")
+)
+
 // InvConv returns a failed conversion error.
 func invConv(val interface{}, tp byte) (interface{}, error) {
 	return nil, errors.Errorf("cannot convert %v (type %T) to type %s", val, val, TypeStr(tp))
@@ -99,62 +104,6 @@ func convertUintToInt(val uint64, upperBound int64, tp byte) (int64, error) {
 	return int64(val), nil
 }
 
-func convertToInt(val interface{}, target *FieldType) (int64, error) {
-	tp := target.Tp
-	lowerBound := signedLowerBound[tp]
-	upperBound := signedUpperBound[tp]
-
-	switch v := val.(type) {
-	case bool:
-		if v {
-			return 1, nil
-		}
-		return 0, nil
-	case uint64:
-		return convertUintToInt(v, upperBound, tp)
-	case int:
-		return convertIntToInt(int64(v), lowerBound, upperBound, tp)
-	case int64:
-		return convertIntToInt(int64(v), lowerBound, upperBound, tp)
-	case float32:
-		return convertFloatToInt(float64(v), lowerBound, upperBound, tp)
-	case float64:
-		return convertFloatToInt(float64(v), lowerBound, upperBound, tp)
-	case string:
-		fval, err := StrToFloat(v)
-		if err != nil {
-			return 0, errors.Trace(err)
-		}
-		return convertFloatToInt(fval, lowerBound, upperBound, tp)
-	case []byte:
-		fval, err := StrToFloat(string(v))
-		if err != nil {
-			return 0, errors.Trace(err)
-		}
-		return convertFloatToInt(fval, lowerBound, upperBound, tp)
-	case mysql.Time:
-		// 2011-11-10 11:11:11.999999 -> 20111110111112
-		ival := v.ToNumber().Round(0).IntPart()
-		return convertIntToInt(ival, lowerBound, upperBound, tp)
-	case mysql.Duration:
-		// 11:11:11.999999 -> 111112
-		ival := v.ToNumber().Round(0).IntPart()
-		return convertIntToInt(ival, lowerBound, upperBound, tp)
-	case mysql.Decimal:
-		fval, _ := v.Float64()
-		return convertFloatToInt(fval, lowerBound, upperBound, tp)
-	case mysql.Hex:
-		return convertFloatToInt(v.ToNumber(), lowerBound, upperBound, tp)
-	case mysql.Bit:
-		return convertFloatToInt(v.ToNumber(), lowerBound, upperBound, tp)
-	case mysql.Enum:
-		return convertFloatToInt(v.ToNumber(), lowerBound, upperBound, tp)
-	case mysql.Set:
-		return convertFloatToInt(v.ToNumber(), lowerBound, upperBound, tp)
-	}
-	return 0, typeError(val, target)
-}
-
 func convertIntToUint(val int64, upperBound uint64, tp byte) (uint64, error) {
 	if val < 0 {
 		return 0, overflow(val, tp)
@@ -188,12 +137,6 @@ func convertFloatToUint(val float64, upperBound uint64, tp byte) (uint64, error)
 	return uint64(val), nil
 }
 
-// typeError returns error for invalid value type.
-func typeError(v interface{}, target *FieldType) error {
-	return errors.Errorf("cannot use %v (type %T) in assignment to, or comparison with, column type %s)",
-		v, v, target.String())
-}
-
 func isCastType(tp byte) bool {
 	switch tp {
 	case mysql.TypeString, mysql.TypeDuration, mysql.TypeDatetime,
@@ -201,15 +144,6 @@ func isCastType(tp byte) bool {
 		return true
 	}
 	return false
-}
-
-// Cast casts val to certain types and does not return error.
-func Cast(val interface{}, target *FieldType) (interface{}, error) {
-	if !isCastType(target.Tp) {
-		return nil, errors.Errorf("unknown cast type - %v", target)
-	}
-
-	return Convert(val, target)
 }
 
 // Convert converts the val with type tp.
@@ -257,79 +191,44 @@ func StrToFloat(str string) (float64, error) {
 	if len(str) == 0 {
 		return 0, nil
 	}
-
-	// MySQL uses a very loose conversation, e.g, 123.abc -> 123
-	// We should do a trade off whether supporting this feature or using a strict mode.
-	// Now we use a strict mode.
-	return strconv.ParseFloat(str, 64)
-}
-
-// ToInt64 converts an interface to an int64.
-func ToInt64(value interface{}) (int64, error) {
-	return convertToInt(value, NewFieldType(mysql.TypeLonglong))
-}
-
-// ToFloat64 converts an interface to a float64.
-func ToFloat64(value interface{}) (float64, error) {
-	switch v := value.(type) {
-	case bool:
-		if v {
-			return 1, nil
-		}
-		return 0, nil
-	case int:
-		return float64(v), nil
-	case int64:
-		return float64(v), nil
-	case uint64:
-		return float64(v), nil
-	case float32:
-		return float64(v), nil
-	case float64:
-		return float64(v), nil
-	case string:
-		return StrToFloat(v)
-	case []byte:
-		return StrToFloat(string(v))
-	case mysql.Time:
-		f, _ := v.ToNumber().Float64()
-		return f, nil
-	case mysql.Duration:
-		f, _ := v.ToNumber().Float64()
-		return f, nil
-	case mysql.Decimal:
-		vv, _ := v.Float64()
-		return vv, nil
-	case mysql.Hex:
-		return v.ToNumber(), nil
-	case mysql.Bit:
-		return v.ToNumber(), nil
-	case mysql.Enum:
-		return v.ToNumber(), nil
-	case mysql.Set:
-		return v.ToNumber(), nil
-	default:
-		return 0, errors.Errorf("cannot convert %v(type %T) to float64", value, value)
+	validStr := getValidFloatPrefix(str)
+	var err error
+	if validStr != str {
+		err = ErrValueTruncated
 	}
+	f, err2 := strconv.ParseFloat(validStr, 64)
+	if err == nil {
+		err = err2
+	}
+	return f, errors.Trace(err)
 }
 
-// ToDecimal converts an interface to a Decimal.
-func ToDecimal(value interface{}) (mysql.Decimal, error) {
-	switch v := value.(type) {
-	case bool:
-		if v {
-			return mysql.ConvertToDecimal(1)
+func getValidFloatPrefix(str string) string {
+	var (
+		hasDot bool
+		eIdx   = -1
+	)
+	for i := 0; i < len(str); i++ {
+		c := str[i]
+		if c == '-' || c == '+' {
+			if i != 0 && i != eIdx+1 {
+				return str[:i]
+			}
+		} else if c == '.' {
+			if hasDot {
+				return str[:i]
+			}
+			hasDot = true
+		} else if c == 'e' || c == 'E' {
+			if eIdx != -1 {
+				return str[:i]
+			}
+			eIdx = i
+		} else if c < '0' || c > '9' {
+			return str[:i]
 		}
-		return mysql.ConvertToDecimal(0)
-	case []byte:
-		return mysql.ConvertToDecimal(string(v))
-	case mysql.Time:
-		return v.ToNumber(), nil
-	case mysql.Duration:
-		return v.ToNumber(), nil
-	default:
-		return mysql.ConvertToDecimal(value)
 	}
+	return str
 }
 
 // ToString converts an interface to a string.
@@ -371,67 +270,4 @@ func ToString(value interface{}) (string, error) {
 	default:
 		return "", errors.Errorf("cannot convert %v(type %T) to string", value, value)
 	}
-}
-
-// ToBool converts an interface to a bool.
-// We will use 1 for true, and 0 for false.
-func ToBool(value interface{}) (int64, error) {
-	isZero := false
-	switch v := value.(type) {
-	case bool:
-		isZero = (v == false)
-	case int:
-		isZero = (v == 0)
-	case int64:
-		isZero = (v == 0)
-	case uint64:
-		isZero = (v == 0)
-	case float32:
-		isZero = (RoundFloat(float64(v)) == 0)
-	case float64:
-		isZero = (RoundFloat(v) == 0)
-	case string:
-		if len(v) == 0 {
-			isZero = true
-		} else {
-			n, err := StrToInt(v)
-			if err != nil {
-				return 0, err
-			}
-			isZero = (n == 0)
-		}
-	case []byte:
-		if len(v) == 0 {
-			isZero = true
-		} else {
-			n, err := StrToInt(string(v))
-			if err != nil {
-				return 0, err
-			}
-			isZero = (n == 0)
-		}
-	case mysql.Time:
-		isZero = v.IsZero()
-	case mysql.Duration:
-		isZero = (v.Duration == 0)
-	case mysql.Decimal:
-		vv, _ := v.Float64()
-		isZero = (RoundFloat(vv) == 0)
-	case mysql.Hex:
-		isZero = (v.ToNumber() == 0)
-	case mysql.Bit:
-		isZero = (v.ToNumber() == 0)
-	case mysql.Enum:
-		isZero = (v.ToNumber() == 0)
-	case mysql.Set:
-		isZero = (v.ToNumber() == 0)
-	default:
-		return 0, errors.Errorf("cannot convert %v(type %T) to bool", value, value)
-	}
-
-	if isZero {
-		return 0, nil
-	}
-
-	return 1, nil
 }

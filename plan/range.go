@@ -144,7 +144,7 @@ func (r *rangeBuilder) buildFromBinop(x *ast.BinaryOperationExpr) []rangePoint {
 		value = types.NewDatum(x.R.GetValue())
 		op = x.Op
 	}
-	if value.Kind() == types.KindNull {
+	if value.IsNull() {
 		return nil
 	}
 	switch op {
@@ -459,10 +459,10 @@ func (r *rangeBuilder) buildTableRanges(rangePoints []rangePoint) []TableRange {
 	tableRanges := make([]TableRange, 0, len(rangePoints)/2)
 	for i := 0; i < len(rangePoints); i += 2 {
 		startPoint := rangePoints[i]
-		if startPoint.value.Kind() == types.KindNull || startPoint.value.Kind() == types.KindMinNotNull {
+		if startPoint.value.IsNull() || startPoint.value.Kind() == types.KindMinNotNull {
 			startPoint.value.SetInt64(math.MinInt64)
 		}
-		startInt, err := types.ToInt64(startPoint.value.GetValue())
+		startInt, err := startPoint.value.ToInt64()
 		if err != nil {
 			r.err = errors.Trace(err)
 			return tableRanges
@@ -477,12 +477,12 @@ func (r *rangeBuilder) buildTableRanges(rangePoints []rangePoint) []TableRange {
 			startInt++
 		}
 		endPoint := rangePoints[i+1]
-		if endPoint.value.Kind() == types.KindNull {
+		if endPoint.value.IsNull() {
 			endPoint.value.SetInt64(math.MinInt64)
 		} else if endPoint.value.Kind() == types.KindMaxValue {
 			endPoint.value.SetInt64(math.MaxInt64)
 		}
-		endInt, err := types.ToInt64(endPoint.value.GetValue())
+		endInt, err := endPoint.value.ToInt64()
 		if err != nil {
 			r.err = errors.Trace(err)
 			return tableRanges

@@ -334,6 +334,7 @@ current_user	{c}{u}{r}{r}{e}{n}{t}_{u}{s}{e}{r}
 database	{d}{a}{t}{a}{b}{a}{s}{e}
 databases	{d}{a}{t}{a}{b}{a}{s}{e}{s}
 date_add	{d}{a}{t}{e}_{a}{d}{d}
+date_format	{d}{a}{t}{e}_{f}{o}{r}{m}{a}{t}
 date_sub	{d}{a}{t}{e}_{s}{u}{b}
 day		{d}{a}{y}
 dayname	{d}{a}{y}{n}{a}{m}{e}
@@ -402,6 +403,7 @@ join		{j}{o}{i}{n}
 key		{k}{e}{y}
 keys		{k}{e}{y}{s}
 key_block_size	{k}{e}{y}_{b}{l}{o}{c}{k}_{s}{i}{z}{e}
+last_insert_id  {l}{a}{s}{t}_{i}{n}{s}{e}{r}{t}_{i}{d}
 leading		{l}{e}{a}{d}{i}{n}{g}
 left		{l}{e}{f}{t}
 length		{l}{e}{n}{g}{t}{h}
@@ -422,6 +424,7 @@ min_rows	{m}{i}{n}_{r}{o}{w}{s}
 mod 		{m}{o}{d}
 mode		{m}{o}{d}{e}
 month		{m}{o}{n}{t}{h}
+monthname	{m}{o}{n}{t}{h}{n}{a}{m}{e}
 names		{n}{a}{m}{e}{s}
 national	{n}{a}{t}{i}{o}{n}{a}{l}
 not		{n}{o}{t}
@@ -755,6 +758,8 @@ action		{a}{c}{t}{i}{o}{n}
 {databases}		return databases
 {date_add}		lval.item = string(l.val)
 			return dateAdd
+{date_format}		lval.item = string(l.val)
+			return dateFormat
 {date_sub}		lval.item = string(l.val)
 			return dateSub
 {day}			lval.item = string(l.val)
@@ -871,6 +876,8 @@ action		{a}{c}{t}{i}{o}{n}
 {key_block_size}	lval.item = string(l.val)
 			return keyBlockSize
 {keys}			return keys
+{last_insert_id}	lval.item = string(l.val)
+			return lastInsertID
 {leading}		return leading
 {left}			lval.item = string(l.val)
 			return left
@@ -913,6 +920,8 @@ action		{a}{c}{t}{i}{o}{n}
 			return mode
 {month}			lval.item = string(l.val)
 			return month
+{monthname}		lval.item = string(l.val)
+			return monthname
 {names}			lval.item = string(l.val)
 			return names
 {national}		lval.item = string(l.val)
@@ -1229,13 +1238,8 @@ func (l *lexer) str(lval *yySymType, pref string) int {
 	// TODO: performance issue.
 	s := string(l.stringLit)
 	l.stringLit = l.stringLit[0:0]
-	if pref == "'" {
-		s = strings.Replace(s, "\\'", "'", -1)    
-		s = strings.TrimSuffix(s, "'") + "\""
-		pref = "\""
-	} 
 	v := stringutil.RemoveUselessBackslash(pref+s)
-	v, err := strconv.Unquote(v)
+	v, err := stringutil.Unquote(v)
 	if err != nil {
 		v = strings.TrimSuffix(s, pref)
 	}

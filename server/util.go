@@ -41,7 +41,6 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/juju/errors"
 	"github.com/pingcap/tidb/mysql"
 	"github.com/pingcap/tidb/util/arena"
 	"github.com/pingcap/tidb/util/hack"
@@ -249,7 +248,7 @@ func dumpRowValuesBinary(alloc arena.Allocator, columns []*ColumnInfo, row []typ
 	nullsLen := ((len(columns) + 7 + 2) / 8)
 	nulls := make([]byte, nullsLen)
 	for i, val := range row {
-		if val.Kind() == types.KindNull {
+		if val.IsNull() {
 			bytePos := (i + 2) / 8
 			bitPos := byte((i + 2) % 8)
 			nulls[bytePos] |= 1 << bitPos
@@ -336,6 +335,6 @@ func dumpTextValue(mysqlType uint8, value types.Datum) ([]byte, error) {
 	case types.KindMysqlHex:
 		return hack.Slice(value.GetMysqlHex().ToString()), nil
 	default:
-		return nil, errors.Errorf("invalid type %T", value)
+		return nil, errInvalidType.Gen("invalid type %T", value)
 	}
 }

@@ -116,6 +116,7 @@ import (
 	database	"DATABASE"
 	databases	"DATABASES"
 	dateAdd		"DATE_ADD"
+	dateFormat	"DATE_FORMAT"
 	dateSub		"DATE_SUB"
 	day		"DAY"
 	dayname		"DAYNAME"
@@ -188,6 +189,7 @@ import (
 	key		"KEY"
 	keyBlockSize	"KEY_BLOCK_SIZE"
 	keys		"KEYS"
+	lastInsertID	"LAST_INSERT_ID"
 	le		"<="
 	leading		"LEADING"
 	left		"LEFT"
@@ -212,6 +214,7 @@ import (
 	mod 		"MOD"
 	mode		"MODE"
 	month		"MONTH"
+	monthname	"MONTHNAME"
 	names		"NAMES"
 	national	"NATIONAL"
 	neq		"!="
@@ -457,6 +460,7 @@ import (
 	ExpressionList		"expression list"
 	ExpressionListOpt	"expression list opt"
 	ExpressionListList	"expression list list"
+	ExpressionListListItem	"expression list list item"
 	Factor			"expression factor"
 	PredicateExpr		"Predicate expression factor"
 	Field			"field expression"
@@ -1938,15 +1942,17 @@ UnReservedKeyword:
 |	"START" | "STATUS" | "GLOBAL" | "TABLES"| "TEXT" | "TIME" | "TIMESTAMP" | "TRANSACTION" | "TRUNCATE" | "UNKNOWN"
 |	"VALUE" | "WARNINGS" | "YEAR" |	"MODE" | "WEEK" | "ANY" | "SOME" | "USER" | "IDENTIFIED" | "COLLATION"
 |	"COMMENT" | "AVG_ROW_LENGTH" | "CONNECTION" | "CHECKSUM" | "COMPRESSION" | "KEY_BLOCK_SIZE" | "MAX_ROWS" | "MIN_ROWS"
-|	"NATIONAL" | "ROW" | "ROW_FORMAT" | "QUARTER" | "ESCAPE" | "GRANTS" | "FIELDS" | "TRIGGERS" | "DELAY_KEY_WRITE" | "ISOLATION"
-|	"REPEATABLE" | "COMMITTED" | "UNCOMMITTED" | "ONLY" | "SERIALIZABLE" | "LEVEL" | "VARIABLES" | "SQL_CACHE" | "SQL_NO_CACHE" | "ACTION" | "DISABLE" | "ENABLE" | "REVERSE"
+|	"NATIONAL" | "ROW" | "ROW_FORMAT" | "QUARTER" | "ESCAPE" | "GRANTS" | "FIELDS" | "TRIGGERS" | "DELAY_KEY_WRITE"
+|	"ISOLATION" |	"REPEATABLE" | "COMMITTED" | "UNCOMMITTED" | "ONLY" | "SERIALIZABLE" | "LEVEL" | "VARIABLES"
+|	"SQL_CACHE" | "SQL_NO_CACHE" | "ACTION" | "DISABLE" | "ENABLE" | "REVERSE"
 
 NotKeywordToken:
 	"ABS" | "ADDDATE" | "ADMIN" | "COALESCE" | "CONCAT" | "CONCAT_WS" | "CONNECTION_ID" | "CUR_TIME"| "COUNT" | "DAY"
-|	"DATE_ADD" | "DATE_SUB" | "DAYNAME" | "DAYOFMONTH" | "DAYOFWEEK" | "DAYOFYEAR" | "FOUND_ROWS" | "GROUP_CONCAT"| "HOUR"
-|	"IFNULL" | "ISNULL" | "LCASE" | "LENGTH" | "LOCATE" | "LOWER" | "LTRIM" | "MAX" | "MICROSECOND" | "MIN" | "MINUTE" | "NULLIF" | "MONTH" | "NOW" | "POW"
-|	"POWER" | "RAND" | "SECOND" | "SQL_CALC_FOUND_ROWS" | "SUBDATE" | "SUBSTRING" %prec lowerThanLeftParen
-|	"SUBSTRING_INDEX" | "SUM" | "TRIM" | "RTRIM" | "UCASE" | "UPPER" | "VERSION" | "WEEKDAY" | "WEEKOFYEAR" | "YEARWEEK" | "ROUND"
+|	"DATE_ADD" | "DATE_FORMAT" | "DATE_SUB" | "DAYNAME" | "DAYOFMONTH" | "DAYOFWEEK" | "DAYOFYEAR" | "FOUND_ROWS" | "GROUP_CONCAT"| "HOUR"
+|	"IFNULL" | "ISNULL" | "LAST_INSERT_ID" | "LCASE" | "LENGTH" | "LOCATE" | "LOWER" | "LTRIM" | "MAX" | "MICROSECOND" | "MIN"
+|	"MINUTE" | "NULLIF" | "MONTH" | "MONTHNAME" | "NOW" | "POW" | "POWER" | "RAND" | "SECOND" | "SQL_CALC_FOUND_ROWS" | "SUBDATE"
+|	"SUBSTRING" %prec lowerThanLeftParen | "SUBSTRING_INDEX" | "SUM" | "TRIM" | "RTRIM" | "UCASE" | "UPPER" | "VERSION"
+|	"WEEKDAY" | "WEEKOFYEAR" | "YEARWEEK" | "ROUND"
 
 /************************************************************************************
  *
@@ -2016,21 +2022,19 @@ ValueSym:
 |	"VALUES"
 
 ExpressionListList:
-	'(' ')'
+	ExpressionListListItem
 	{
-		$$ = [][]ast.ExprNode{[]ast.ExprNode{}}
+		$$ = [][]ast.ExprNode{$1.([]ast.ExprNode)}
 	}
-|	'(' ')' ',' ExpressionListList
+|	ExpressionListList ',' ExpressionListListItem
 	{
-		$$ = append([][]ast.ExprNode{[]ast.ExprNode{}}, $4.([][]ast.ExprNode)...)
+		$$ = append($1.([][]ast.ExprNode), $3.([]ast.ExprNode))
 	}
-|	'(' ExpressionList ')'
+
+ExpressionListListItem:
+	'(' ExpressionListOpt ')'
 	{
-		$$ = [][]ast.ExprNode{$2.([]ast.ExprNode)}
-	}
-|	'(' ExpressionList ')' ',' ExpressionListList
-	{
-		$$ = append([][]ast.ExprNode{$2.([]ast.ExprNode)}, $5.([][]ast.ExprNode)...)
+		$$ = $2
 	}
 
 ColumnSetValue:
@@ -2178,14 +2182,14 @@ Operand:
 			Offset: yyS[yypt].offset,
 		}
 	}
-|	"ROW" '(' Expression ',' ExpressionList ')'
+|	"ROW" '(' ExpressionList ',' Expression ')'
 	{
-		values := append([]ast.ExprNode{$3.(ast.ExprNode)}, $5.([]ast.ExprNode)...)
+		values := append($3.([]ast.ExprNode), $5.(ast.ExprNode))
 		$$ = &ast.RowExpr{Values: values}
 	}
-|	'(' Expression ',' ExpressionList ')'
+|	'(' ExpressionList ',' Expression ')'
 	{
-		values := append([]ast.ExprNode{$2.(ast.ExprNode)}, $4.([]ast.ExprNode)...)
+		values := append($2.([]ast.ExprNode), $4.(ast.ExprNode))
 		$$ = &ast.RowExpr{Values: values}
 	}
 |	"EXISTS" SubSelect
@@ -2497,6 +2501,16 @@ FunctionCallNonKeyword:
 			},
 		}
 	}
+|	"DATE_FORMAT" '(' Expression ',' Expression ')'
+	{
+		$$ = &ast.FuncCallExpr{
+			FnName: model.NewCIStr($1.(string)),
+			Args:	[]ast.ExprNode{
+				$3.(ast.ExprNode),
+				$5.(ast.ExprNode),
+			},
+		}
+	}
 |	"EXTRACT" '(' TimeUnit "FROM" Expression ')'
 	{
 		timeUnit := ast.NewValueExpr($3)
@@ -2520,6 +2534,14 @@ FunctionCallNonKeyword:
 |	"ISNULL" '(' Expression ')'
 	{
 		$$ = &ast.FuncCallExpr{FnName: model.NewCIStr($1.(string)), Args: []ast.ExprNode{$3.(ast.ExprNode)}}
+	}
+|	"LAST_INSERT_ID" '(' ExpressionOpt ')'
+	{
+		args := []ast.ExprNode{}
+		if $3 != nil {
+			args = append(args, $3.(ast.ExprNode))
+		}
+		$$ = &ast.FuncCallExpr{FnName: model.NewCIStr($1.(string)), Args: args}
 	}
 |	"LENGTH" '(' Expression ')'
 	{
@@ -2560,6 +2582,10 @@ FunctionCallNonKeyword:
 		$$ = &ast.FuncCallExpr{FnName: model.NewCIStr($1.(string)), Args: []ast.ExprNode{$3.(ast.ExprNode)}}
 	}
 |	"MONTH" '(' Expression ')'
+	{
+		$$ = &ast.FuncCallExpr{FnName: model.NewCIStr($1.(string)), Args: []ast.ExprNode{$3.(ast.ExprNode)}}
+	}
+|	"MONTHNAME" '(' Expression ')'
 	{
 		$$ = &ast.FuncCallExpr{FnName: model.NewCIStr($1.(string)), Args: []ast.ExprNode{$3.(ast.ExprNode)}}
 	}
@@ -2657,6 +2683,10 @@ FunctionCallNonKeyword:
 			args = append(args, $3.(ast.ExprNode))
 		}
 		$$ = &ast.FuncCallExpr{FnName: model.NewCIStr($1.(string)), Args: args}
+	}
+|	"TIME" '(' Expression ')'
+	{
+		$$ = &ast.FuncCallExpr{FnName: model.NewCIStr($1.(string)), Args: []ast.ExprNode{$3.(ast.ExprNode)}}
 	}
 |	"TRIM" '(' Expression ')'
 	{

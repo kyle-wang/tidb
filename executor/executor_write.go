@@ -21,6 +21,7 @@ import (
 	"github.com/pingcap/tidb/ast"
 	"github.com/pingcap/tidb/context"
 	"github.com/pingcap/tidb/evaluator"
+	"github.com/pingcap/tidb/expression"
 	"github.com/pingcap/tidb/kv"
 	"github.com/pingcap/tidb/mysql"
 	"github.com/pingcap/tidb/sessionctx"
@@ -49,6 +50,11 @@ type UpdateExec struct {
 	newRowsData [][]types.Datum // The new values to be set.
 	fetched     bool
 	cursor      int
+}
+
+// Schema implements Executor Schema interface.
+func (e *UpdateExec) Schema() expression.Schema {
+	return nil
 }
 
 // Next implements Executor Next interface.
@@ -173,7 +179,7 @@ func updateRecord(ctx context.Context, h int64, oldData, newData []types.Datum, 
 			newHandle = newData[i]
 		}
 		if mysql.HasAutoIncrementFlag(col.Flag) {
-			if newData[i].Kind() == types.KindNull {
+			if newData[i].IsNull() {
 				return errors.Errorf("Column '%v' cannot be null", col.Name.O)
 			}
 			val, err := newData[i].ToInt64()
@@ -226,7 +232,7 @@ func updateRecord(ctx context.Context, h int64, oldData, newData []types.Datum, 
 	}
 
 	var err error
-	if newHandle.Kind() != types.KindNull {
+	if !newHandle.IsNull() {
 		err = t.RemoveRecord(ctx, h, oldData)
 		if err != nil {
 			return errors.Trace(err)
@@ -274,6 +280,11 @@ type DeleteExec struct {
 	IsMultiTable bool
 
 	finished bool
+}
+
+// Schema implements Executor Schema interface.
+func (e *DeleteExec) Schema() expression.Schema {
+	return nil
 }
 
 // Next implements Executor Next interface.
@@ -396,9 +407,10 @@ func (e *DeleteExec) Close() error {
 
 // InsertValues is the data to insert.
 type InsertValues struct {
-	currRow    int
-	ctx        context.Context
-	SelectExec Executor
+	currRow      int
+	lastInsertID uint64
+	ctx          context.Context
+	SelectExec   Executor
 
 	Table     table.Table
 	Columns   []*ast.ColumnName
@@ -417,6 +429,11 @@ type InsertExec struct {
 	Priority int
 
 	finished bool
+}
+
+// Schema implements Executor Schema interface.
+func (e *InsertExec) Schema() expression.Schema {
+	return nil
 }
 
 // Next implements Executor Next interface.
@@ -464,6 +481,10 @@ func (e *InsertExec) Next() (*Row, error) {
 		if err = e.onDuplicateUpdate(row, h, toUpdateColumns); err != nil {
 			return nil, errors.Trace(err)
 		}
+	}
+
+	if e.lastInsertID != 0 {
+		variable.GetSessionVars(e.ctx).LastInsertID = e.lastInsertID
 	}
 	e.finished = true
 	return nil, nil
@@ -680,7 +701,7 @@ func (e *InsertValues) initDefaultValues(row []types.Datum, marked map[int]struc
 	var defaultValueCols []*table.Column
 	for i, c := range e.Table.Cols() {
 		// It's used for retry.
-		if mysql.HasAutoIncrementFlag(c.Flag) && row[i].Kind() == types.KindNull &&
+		if mysql.HasAutoIncrementFlag(c.Flag) && row[i].IsNull() &&
 			variable.GetSessionVars(e.ctx).RetryInfo.Retrying {
 			id, err := variable.GetSessionVars(e.ctx).RetryInfo.GetCurrAutoIncrementID()
 			if err != nil {
@@ -688,7 +709,7 @@ func (e *InsertValues) initDefaultValues(row []types.Datum, marked map[int]struc
 			}
 			row[i].SetInt64(id)
 		}
-		if row[i].Kind() != types.KindNull {
+		if !row[i].IsNull() {
 			// Column value isn't nil and column isn't auto-increment, continue.
 			if !mysql.HasAutoIncrementFlag(c.Flag) {
 				continue
@@ -714,12 +735,10 @@ func (e *InsertValues) initDefaultValues(row []types.Datum, marked map[int]struc
 				return errors.Trace(err)
 			}
 			row[i].SetInt64(recordID)
-			// Notes: incompatible with mysql
-			// MySQL will set last insert id to the first row, as follows:
-			// `t(id int AUTO_INCREMENT, c1 int, PRIMARY KEY (id))`
-			// `insert t (c1) values(1),(2),(3);`
-			// Last insert id will be 1, not 3.
-			variable.GetSessionVars(e.ctx).SetLastInsertID(uint64(recordID))
+			// It's compatible with mysql. So it sets last insert id to the first row.
+			if e.currRow == 0 {
+				e.lastInsertID = uint64(recordID)
+			}
 			// It's used for retry.
 			if !variable.GetSessionVars(e.ctx).RetryInfo.Retrying {
 				variable.GetSessionVars(e.ctx).RetryInfo.AddAutoIncrementID(recordID)
@@ -809,6 +828,11 @@ type ReplaceExec struct {
 	finished bool
 }
 
+// Schema implements Executor Schema interface.
+func (e *ReplaceExec) Schema() expression.Schema {
+	return nil
+}
+
 // Fields implements Executor Fields interface.
 // Returns nil to indicate there is no output.
 func (e *ReplaceExec) Fields() []*ast.ResultField {
@@ -892,6 +916,10 @@ func (e *ReplaceExec) Next() (*Row, error) {
 		}
 		getDirtyDB(e.ctx).deleteRow(e.Table.Meta().ID, h)
 		variable.GetSessionVars(e.ctx).AddAffectedRows(1)
+	}
+
+	if e.lastInsertID != 0 {
+		variable.GetSessionVars(e.ctx).LastInsertID = e.lastInsertID
 	}
 	e.finished = true
 	return nil, nil

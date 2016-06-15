@@ -147,9 +147,6 @@ func (ts *testTypeConvertSuite) TestToInt64(c *C) {
 	v, err := Convert(3.1415926, ft)
 	c.Assert(err, IsNil)
 	testDatumToInt64(c, v, int64(3))
-
-	_, err = ToInt64(&invalidMockType{})
-	c.Assert(err, NotNil)
 }
 
 func (ts *testTypeConvertSuite) TestToFloat32(c *C) {
@@ -174,4 +171,26 @@ func (ts *testTypeConvertSuite) TestToFloat32(c *C) {
 	// Convert to float32 and convert back to float64, we will get a different value.
 	c.Assert(converted.GetFloat64(), Not(Equals), 281.37)
 	c.Assert(converted.GetFloat64(), Equals, datum.GetFloat64())
+}
+
+func (ts *testDatumSuite) TestIsNull(c *C) {
+	testCases := []struct {
+		data   interface{}
+		isnull bool
+	}{
+		{nil, true},
+		{0, false},
+		{1, false},
+		{1.1, false},
+		{"string", false},
+		{"", false},
+	}
+	for _, t := range testCases {
+		testIsNull(c, t.data, t.isnull)
+	}
+}
+
+func testIsNull(c *C, data interface{}, isnull bool) {
+	d := NewDatum(data)
+	c.Assert(d.IsNull(), Equals, isnull, Commentf("data: %v, isnull: %v", data, isnull))
 }

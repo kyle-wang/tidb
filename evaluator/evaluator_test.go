@@ -313,8 +313,8 @@ func (s *testEvaluatorSuite) TestBinopNumeric(c *C) {
 			// we use float64 as the result type check for all.
 			f, err := v.ToFloat64()
 			c.Assert(err, IsNil)
-
-			r, err := types.ToFloat64(t.ret)
+			d := types.NewDatum(t.ret)
+			r, err := d.ToFloat64()
 			c.Assert(err, IsNil)
 			c.Assert(r, Equals, f)
 		}
@@ -640,6 +640,31 @@ func (s *testEvaluatorSuite) TestIsTruth(c *C) {
 	s.runTests(c, cases)
 }
 
+func (s *testEvaluatorSuite) TestLastInsertID(c *C) {
+	defer testleak.AfterTest(c)()
+	cases := []struct {
+		exprStr   []ast.ExprNode
+		resultStr string
+	}{
+		{nil, "0"},
+		{[]ast.ExprNode{ast.NewValueExpr(1)}, "1"},
+	}
+
+	ctx := mock.NewContext()
+	variable.BindSessionVars(ctx)
+	c.Log(ctx)
+	for _, ca := range cases {
+		expr := &ast.FuncCallExpr{
+			FnName: model.NewCIStr("last_insert_id"),
+			Args:   ca.exprStr,
+		}
+		val, err := Eval(ctx, expr)
+		c.Assert(err, IsNil)
+		valStr := fmt.Sprintf("%v", val.GetValue())
+		c.Assert(valStr, Equals, ca.resultStr, Commentf("for %s", ca.exprStr))
+	}
+}
+
 func (s *testEvaluatorSuite) TestLike(c *C) {
 	defer testleak.AfterTest(c)()
 	tbl := []struct {
@@ -883,8 +908,7 @@ func (s *testEvaluatorSuite) TestGetTimeValue(c *C) {
 	ctx := mock.NewContext()
 	variable.BindSessionVars(ctx)
 	sessionVars := variable.GetSessionVars(ctx)
-
-	sessionVars.Systems["timestamp"] = ""
+	sessionVars.SetSystemVar("timestamp", types.NewStringDatum(""))
 	v, err = GetTimeValue(ctx, "2012-12-12 00:00:00", mysql.TypeTimestamp, mysql.MinFsp)
 	c.Assert(err, IsNil)
 
@@ -892,7 +916,7 @@ func (s *testEvaluatorSuite) TestGetTimeValue(c *C) {
 	timeValue = v.GetMysqlTime()
 	c.Assert(timeValue.String(), Equals, "2012-12-12 00:00:00")
 
-	sessionVars.Systems["timestamp"] = "0"
+	sessionVars.SetSystemVar("timestamp", types.NewStringDatum("0"))
 	v, err = GetTimeValue(ctx, "2012-12-12 00:00:00", mysql.TypeTimestamp, mysql.MinFsp)
 	c.Assert(err, IsNil)
 
@@ -900,7 +924,7 @@ func (s *testEvaluatorSuite) TestGetTimeValue(c *C) {
 	timeValue = v.GetMysqlTime()
 	c.Assert(timeValue.String(), Equals, "2012-12-12 00:00:00")
 
-	delete(sessionVars.Systems, "timestamp")
+	sessionVars.SetSystemVar("timestamp", types.Datum{})
 	v, err = GetTimeValue(ctx, "2012-12-12 00:00:00", mysql.TypeTimestamp, mysql.MinFsp)
 	c.Assert(err, IsNil)
 
@@ -908,7 +932,7 @@ func (s *testEvaluatorSuite) TestGetTimeValue(c *C) {
 	timeValue = v.GetMysqlTime()
 	c.Assert(timeValue.String(), Equals, "2012-12-12 00:00:00")
 
-	sessionVars.Systems["timestamp"] = "1234"
+	sessionVars.SetSystemVar("timestamp", types.NewStringDatum("1234"))
 
 	tbl := []struct {
 		Expr interface{}

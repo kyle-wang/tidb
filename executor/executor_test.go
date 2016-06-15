@@ -23,12 +23,14 @@ import (
 	"github.com/ngaut/log"
 	. "github.com/pingcap/check"
 	"github.com/pingcap/tidb"
+	"github.com/pingcap/tidb/context"
 	"github.com/pingcap/tidb/domain"
 	"github.com/pingcap/tidb/executor"
 	"github.com/pingcap/tidb/inspectkv"
 	"github.com/pingcap/tidb/kv"
 	"github.com/pingcap/tidb/model"
-	"github.com/pingcap/tidb/optimizer/plan"
+	"github.com/pingcap/tidb/parser"
+	"github.com/pingcap/tidb/plan"
 	"github.com/pingcap/tidb/store/tikv"
 	"github.com/pingcap/tidb/util/testkit"
 	"github.com/pingcap/tidb/util/testleak"
@@ -630,6 +632,7 @@ func (s *testSuite) TestSelectLimit(c *C) {
 }
 
 func (s *testSuite) TestSelectOrderBy(c *C) {
+	plan.UseNewPlanner = true
 	defer testleak.AfterTest(c)()
 	tk := testkit.NewTestKit(c, s.store)
 	tk.MustExec("use test")
@@ -684,12 +687,13 @@ func (s *testSuite) TestSelectOrderBy(c *C) {
 		tk.MustExec(fmt.Sprintf("insert INTO select_order_test VALUES (%d, \"zz\");", i))
 	}
 	tk.MustExec("insert INTO select_order_test VALUES (1501, \"aa\");")
+	tk.MustExec("commit")
 	r = tk.MustQuery("select * from select_order_test order by name, id limit 1 offset 3;")
 	rowStr = fmt.Sprintf("%v %v", 11, []byte("hh"))
 	r.Check(testkit.Rows(rowStr))
-	tk.MustExec("commit")
 	executor.SortBufferSize = 500
 	tk.MustExec("drop table select_order_test")
+	plan.UseNewPlanner = false
 }
 
 func (s *testSuite) TestSelectDistinct(c *C) {
@@ -705,23 +709,6 @@ func (s *testSuite) TestSelectDistinct(c *C) {
 	tk.MustExec("commit")
 
 	tk.MustExec("drop table select_distinct_test")
-}
-
-func (s *testSuite) TestSelectHaving(c *C) {
-	defer testleak.AfterTest(c)()
-	tk := testkit.NewTestKit(c, s.store)
-	tk.MustExec("use test")
-	s.fillData(tk, "select_having_test")
-
-	tk.MustExec("begin")
-	r := tk.MustQuery("select id, name from select_having_test where id in (1,3) having name like 'he%';")
-	rowStr := fmt.Sprintf("%v %v", 1, []byte("hello"))
-	r.Check(testkit.Rows(rowStr))
-	tk.MustExec("commit")
-
-	r = tk.MustQuery("select * from select_having_test group by id having null is not null;")
-
-	tk.MustExec("drop table select_having_test")
 }
 
 func (s *testSuite) TestSelectErrorRow(c *C) {
@@ -1325,11 +1312,11 @@ func (s *testSuite) TestDatumXAPI(c *C) {
 	tk.MustExec("create table t (a decimal(10,6), b decimal, index idx_b (b))")
 	tk.MustExec("insert t values (1.1, 1.1)")
 	tk.MustExec("insert t values (2.2, 2.2)")
-	tk.MustExec("insert t values (3.3, 3.3)")
+	tk.MustExec("insert t values (3.3, 2.7)")
 	result := tk.MustQuery("select * from t where a > 1.5")
-	result.Check(testkit.Rows("2.200000 2.2", "3.300000 3.3"))
+	result.Check(testkit.Rows("2.200000 2", "3.300000 3"))
 	result = tk.MustQuery("select * from t where b > 1.5")
-	result.Check(testkit.Rows("2.200000 2.2", "3.300000 3.3"))
+	result.Check(testkit.Rows("2.200000 2", "3.300000 3"))
 
 	tk.MustExec("drop table if exists t")
 	tk.MustExec("create table t (a time(3), b time, index idx_a (a))")
@@ -1343,10 +1330,100 @@ func (s *testSuite) TestDatumXAPI(c *C) {
 }
 
 func (s *testSuite) TestJoinPanic(c *C) {
+	plan.UseNewPlanner = true
 	defer testleak.AfterTest(c)()
 	tk := testkit.NewTestKit(c, s.store)
 	tk.MustExec("use test")
 	tk.MustExec("drop table if exists events")
 	tk.MustExec("create table events (clock int, source int)")
 	tk.MustQuery("SELECT * FROM events e JOIN (SELECT MAX(clock) AS clock FROM events e2 GROUP BY e2.source) e3 ON e3.clock=e.clock")
+	plan.UseNewPlanner = false
+}
+
+func (s *testSuite) TestSQLMode(c *C) {
+	defer testleak.AfterTest(c)()
+	tk := testkit.NewTestKit(c, s.store)
+	tk.MustExec("use test")
+	tk.MustExec("drop table if exists t")
+	tk.MustExec("create table t (a tinyint not null)")
+	tk.MustExec("set sql_mode = 'STRICT_TRANS_TABLES'")
+	_, err := tk.Exec("insert t values ()")
+	c.Check(err, NotNil)
+
+	_, err = tk.Exec("insert t values ('1000')")
+	c.Check(err, NotNil)
+
+	tk.MustExec("set sql_mode = ''")
+	tk.MustExec("insert t values ()")
+	tk.MustExec("insert t values (1000)")
+	tk.MustQuery("select * from t").Check(testkit.Rows("0", "127"))
+}
+
+func (s *testSuite) TestAggregation(c *C) {
+	plan.UseNewPlanner = true
+	defer testleak.AfterTest(c)()
+	tk := testkit.NewTestKit(c, s.store)
+	tk.MustExec("use test")
+	tk.MustExec("drop table if exists t")
+	tk.MustExec("create table t (c int, d int)")
+	tk.MustExec("insert t values (NULL, 1)")
+	tk.MustExec("insert t values (1, 1)")
+	tk.MustExec("insert t values (1, 2)")
+	tk.MustExec("insert t values (1, 3)")
+	tk.MustExec("insert t values (1, 1)")
+	tk.MustExec("insert t values (3, 2)")
+	tk.MustExec("insert t values (4, 3)")
+	tk.MustExec("commit")
+	result := tk.MustQuery("select count(*) from t group by d")
+	result.Check(testkit.Rows("3", "2", "2"))
+	result = tk.MustQuery("select count(distinct c) from t group by d")
+	result.Check(testkit.Rows("1", "2", "2"))
+	result = tk.MustQuery("select sum(c) from t group by d")
+	result.Check(testkit.Rows("2", "4", "5"))
+	result = tk.MustQuery("select sum(distinct c) from t group by d")
+	result.Check(testkit.Rows("1", "4", "5"))
+	result = tk.MustQuery("select min(c) from t group by d")
+	result.Check(testkit.Rows("1", "1", "1"))
+	result = tk.MustQuery("select max(c) from t group by d")
+	result.Check(testkit.Rows("1", "3", "4"))
+	result = tk.MustQuery("select avg(c) from t group by d")
+	result.Check(testkit.Rows("1.0000", "2.0000", "2.5000"))
+	result = tk.MustQuery("select d, d + 1 from t group by d")
+	result.Check(testkit.Rows("1 2", "2 3", "3 4"))
+	result = tk.MustQuery("select count(*) from t")
+	result.Check(testkit.Rows("7"))
+	result = tk.MustQuery("select count(distinct d) from t")
+	result.Check(testkit.Rows("3"))
+	result = tk.MustQuery("select count(*) from t group by d having sum(c) > 3")
+	result.Check(testkit.Rows("2", "2"))
+	result = tk.MustQuery("select max(c) from t group by d having sum(c) > 3 order by avg(c) desc")
+	result.Check(testkit.Rows("4", "3"))
+	result = tk.MustQuery("select count(*) from t a , t b")
+	result.Check(testkit.Rows("49"))
+	result = tk.MustQuery("select count(*) from t a join t b having sum(a.c) < 0")
+	result.Check(testkit.Rows())
+	result = tk.MustQuery("select count(*) from t a join t b where a.c < 0")
+	result.Check(testkit.Rows("0"))
+	plan.UseNewPlanner = false
+}
+
+func (s *testSuite) TestAdapterStatement(c *C) {
+	defer testleak.AfterTest(c)()
+	se, err := tidb.CreateSession(s.store)
+	c.Check(err, IsNil)
+	compiler := &executor.Compiler{}
+	ctx := se.(context.Context)
+
+	stmtNode, err := parser.ParseOneStmt("select 1", "", "")
+	c.Check(err, IsNil)
+	stmt, err := compiler.Compile(ctx, stmtNode)
+	c.Check(err, IsNil)
+	c.Check(stmt.OriginText(), Equals, "select 1")
+	c.Check(stmt.IsDDL(), IsFalse)
+
+	stmtNode, err = parser.ParseOneStmt("create table t (a int)", "", "")
+	c.Check(err, IsNil)
+	stmt, err = compiler.Compile(ctx, stmtNode)
+	c.Check(err, IsNil)
+	c.Check(stmt.OriginText(), Equals, "create table t (a int)")
 }

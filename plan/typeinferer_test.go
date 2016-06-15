@@ -11,7 +11,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package optimizer_test
+package plan_test
 
 import (
 	. "github.com/pingcap/check"
@@ -20,7 +20,7 @@ import (
 	"github.com/pingcap/tidb/context"
 	"github.com/pingcap/tidb/model"
 	"github.com/pingcap/tidb/mysql"
-	"github.com/pingcap/tidb/optimizer"
+	"github.com/pingcap/tidb/plan"
 	"github.com/pingcap/tidb/sessionctx"
 	"github.com/pingcap/tidb/util/charset"
 	"github.com/pingcap/tidb/util/testkit"
@@ -69,6 +69,7 @@ func (ts *testTypeInferrerSuite) TestInferType(c *C) {
 		{"1 + '1'", mysql.TypeDouble, charset.CharsetBin},
 		{"1 + 1.1", mysql.TypeNewDecimal, charset.CharsetBin},
 		{"1 div 2", mysql.TypeLonglong, charset.CharsetBin},
+		{"1 / 2", mysql.TypeNewDecimal, charset.CharsetBin},
 
 		{"1 > any (select 1)", mysql.TypeLonglong, charset.CharsetBin},
 		{"exists (select 1)", mysql.TypeLonglong, charset.CharsetBin},
@@ -142,9 +143,9 @@ func (ts *testTypeInferrerSuite) TestInferType(c *C) {
 		c.Assert(stmts, HasLen, 1)
 		stmt := stmts[0].(*ast.SelectStmt)
 		is := sessionctx.GetDomain(ctx).InfoSchema()
-		err = optimizer.ResolveName(stmt, is, ctx)
+		err = plan.ResolveName(stmt, is, ctx)
 		c.Assert(err, IsNil)
-		optimizer.InferType(stmt)
+		plan.InferType(stmt)
 		tp := stmt.GetResultFields()[0].Column.Tp
 		chs := stmt.GetResultFields()[0].Column.Charset
 		c.Assert(tp, Equals, ca.tp, Commentf("Tp for %s", ca.expr))

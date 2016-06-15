@@ -165,12 +165,38 @@ func (s *tikvStore) UUID() string {
 }
 
 func (s *tikvStore) CurrentVersion() (kv.Version, error) {
-	startTS, err := s.oracle.GetTimestamp()
+	startTS, err := s.getTimestampWithRetry()
 	if err != nil {
 		return kv.NewVersion(0), errors.Trace(err)
 	}
 
 	return kv.NewVersion(startTS), nil
+}
+
+func (s *tikvStore) getTimestampWithRetry() (uint64, error) {
+	var backoffErr error
+	for backoff := pdBackoff(); backoffErr == nil; backoffErr = backoff() {
+		startTS, err := s.oracle.GetTimestamp()
+		if err != nil {
+			log.Warnf("get timestamp failed: %v, retry later", err)
+			continue
+		}
+		return startTS, nil
+	}
+	return 0, errors.Annotate(backoffErr, txnRetryableMark)
+}
+
+func (s *tikvStore) checkTimestampExpiredWithRetry(ts uint64, TTL uint64) (bool, error) {
+	var backoffErr error
+	for backoff := pdBackoff(); backoffErr == nil; backoffErr = backoff() {
+		expired, err := s.oracle.IsExpired(ts, TTL)
+		if err != nil {
+			log.Warnf("check expired failed: %v, retry later", err)
+			continue
+		}
+		return expired, nil
+	}
+	return false, errors.Annotate(backoffErr, txnRetryableMark)
 }
 
 // sendKVReq sends req to tikv server. It will retry internally to find the right
@@ -196,20 +222,20 @@ func (s *tikvStore) SendKVReq(req *pb.Request, regionID RegionVerID) (*pb.Respon
 		req.Context = region.GetContext()
 		resp, err := client.SendKVReq(req)
 		if err != nil {
-			log.Warnf("send tikv request error: %v, try next peer later", err)
+			log.Warnf("send tikv request error: %v, ctx: %s, try next peer later", err, req.Context)
 			s.regionCache.NextPeer(region.VerID())
 			continue
 		}
 		if regionErr := resp.GetRegionError(); regionErr != nil {
 			// Retry if error is `NotLeader`.
 			if notLeader := regionErr.GetNotLeader(); notLeader != nil {
-				log.Warnf("tikv reports `NotLeader`: %s, retry later", notLeader.String())
+				log.Warnf("tikv reports `NotLeader`: %s, ctx: %s, retry later", notLeader, req.Context)
 				s.regionCache.UpdateLeader(region.VerID(), notLeader.GetLeader().GetId())
 				continue
 			}
 			// For other errors, we only drop cache here.
 			// Because caller may need to re-split the request.
-			log.Warnf("tikv reports region error: %v", resp.GetRegionError())
+			log.Warnf("tikv reports region error: %s, ctx: %s", resp.GetRegionError(), req.Context)
 			s.regionCache.DropRegion(region.VerID())
 			return resp, nil
 		}

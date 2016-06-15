@@ -15,6 +15,8 @@ package parser
 
 import (
 	"fmt"
+	"runtime"
+	"strings"
 	"testing"
 
 	. "github.com/pingcap/check"
@@ -425,6 +427,10 @@ func (s *testParserSuite) TestBuiltin(c *C) {
 		// For cast with charset
 		{"SELECT *, CAST(data AS CHAR CHARACTER SET utf8) FROM t;", true},
 
+		// For last_insert_id
+		{"SELECT last_insert_id();", true},
+		{"SELECT last_insert_id(1);", true},
+
 		// For binary operator
 		{"SELECT binary 'a';", true},
 
@@ -435,6 +441,7 @@ func (s *testParserSuite) TestBuiltin(c *C) {
 		{"select now()", true},
 		{"select now(6)", true},
 		{"select sysdate(), sysdate(6)", true},
+		{"SELECT time('01:02:03');", true},
 
 		// Select current_time
 		{"select current_time", true},
@@ -450,8 +457,9 @@ func (s *testParserSuite) TestBuiltin(c *C) {
 		{"SELECT HOUR('10:05:03');", true},
 
 		// for date, day, weekday
-		{"SELECT DATE('2003-12-31 01:02:03');", true},
 		{"SELECT CURRENT_DATE, CURRENT_DATE(), CURDATE()", true},
+		{"SELECT DATE('2003-12-31 01:02:03');", true},
+		{"SELECT DATE_FORMAT('2003-12-31 01:02:03', '%W %M %Y');", true},
 		{"SELECT DAY('2007-02-03');", true},
 		{"SELECT DAYOFMONTH('2007-02-03');", true},
 		{"SELECT DAYOFWEEK('2007-02-03');", true},
@@ -467,6 +475,7 @@ func (s *testParserSuite) TestBuiltin(c *C) {
 		{"SELECT WEEK('2007-02-03', 0);", true},
 		{"SELECT WEEKOFYEAR('2007-02-03');", true},
 		{"SELECT MONTH('2007-02-03');", true},
+		{"SELECT MONTHNAME('2007-02-03');", true},
 		{"SELECT YEAR('2007-02-03');", true},
 		{"SELECT YEARWEEK('2007-02-03');", true},
 		{"SELECT YEARWEEK('2007-02-03', 0);", true},
@@ -939,4 +948,28 @@ func (s *testParserSuite) TestIndexHint(c *C) {
 		{`select * from t use index for group by (idx1) use index for order by (idx2), t2`, true},
 	}
 	s.RunTest(c, table)
+}
+
+func (s *testParserSuite) TestEscape(c *C) {
+	defer testleak.AfterTest(c)()
+	table := []testCase{
+		{`select """;`, false},
+		{`select """";`, true},
+		{`select "汉字";`, true},
+		{`select 'abc"def';`, true},
+		{`select 'a\r\n';`, true},
+		{`select "\a\r\n"`, true},
+		{`select "\xFF"`, true},
+	}
+	s.RunTest(c, table)
+}
+
+func (s *testParserSuite) TestInsertStatementMemoryAllocation(c *C) {
+	sql := "insert t values (1)" + strings.Repeat(",(1)", 1000)
+	var oldStats, newStats runtime.MemStats
+	runtime.ReadMemStats(&oldStats)
+	_, err := ParseOneStmt(sql, "", "")
+	c.Assert(err, IsNil)
+	runtime.ReadMemStats(&newStats)
+	c.Assert(int(newStats.TotalAlloc-oldStats.TotalAlloc), Less, 1024*500)
 }
