@@ -15,8 +15,9 @@ package ddl
 
 import (
 	"strings"
-	"time"
+	"sync"
 
+	"github.com/juju/errors"
 	. "github.com/pingcap/check"
 	"github.com/pingcap/tidb/ast"
 	"github.com/pingcap/tidb/context"
@@ -36,14 +37,10 @@ type testForeighKeySuite struct {
 }
 
 func (s *testForeighKeySuite) SetUpSuite(c *C) {
-	trySkipTest(c)
-
 	s.store = testCreateStore(c, "test_foreign")
 }
 
 func (s *testForeighKeySuite) TearDownSuite(c *C) {
-	trySkipTest(c)
-
 	err := s.store.Close()
 	c.Assert(err, IsNil)
 }
@@ -61,10 +58,7 @@ func (s *testForeighKeySuite) testCreateForeignKey(c *C, tblInfo *model.TableInf
 		RefKeys[i] = model.NewCIStr(key)
 	}
 
-	fkID, err := s.d.genGlobalID()
-	c.Assert(err, IsNil)
 	fkInfo := &model.FKInfo{
-		ID:       fkID,
 		Name:     FKName,
 		RefTable: RefTable,
 		RefCols:  RefKeys,
@@ -75,25 +69,29 @@ func (s *testForeighKeySuite) testCreateForeignKey(c *C, tblInfo *model.TableInf
 	}
 
 	job := &model.Job{
-		SchemaID: s.dbInfo.ID,
-		TableID:  tblInfo.ID,
-		Type:     model.ActionAddForeignKey,
-		Args:     []interface{}{fkInfo},
+		SchemaID:   s.dbInfo.ID,
+		TableID:    tblInfo.ID,
+		Type:       model.ActionAddForeignKey,
+		BinlogInfo: &model.HistoryInfo{},
+		Args:       []interface{}{fkInfo},
 	}
-	err = s.d.doDDLJob(s.ctx, job)
+	err := s.d.doDDLJob(s.ctx, job)
 	c.Assert(err, IsNil)
 	return job
 }
 
 func testDropForeignKey(c *C, ctx context.Context, d *ddl, dbInfo *model.DBInfo, tblInfo *model.TableInfo, foreignKeyName string) *model.Job {
 	job := &model.Job{
-		SchemaID: dbInfo.ID,
-		TableID:  tblInfo.ID,
-		Type:     model.ActionDropForeignKey,
-		Args:     []interface{}{model.NewCIStr(foreignKeyName)},
+		SchemaID:   dbInfo.ID,
+		TableID:    tblInfo.ID,
+		Type:       model.ActionDropForeignKey,
+		BinlogInfo: &model.HistoryInfo{},
+		Args:       []interface{}{model.NewCIStr(foreignKeyName)},
 	}
 	err := d.doDDLJob(ctx, job)
 	c.Assert(err, IsNil)
+	v := getSchemaVer(c, ctx)
+	checkHistoryJobArgs(c, ctx, job.ID, &historyJobArgs{ver: v, tbl: tblInfo})
 	return job
 }
 
@@ -110,65 +108,84 @@ func getForeignKey(t table.Table, name string) *model.FKInfo {
 	return nil
 }
 
-func (s *testForeighKeySuite) testForeignKeyExist(c *C, t table.Table, name string, isExist bool) {
-	fk := getForeignKey(t, name)
-	if isExist {
-		c.Assert(fk, NotNil)
-	} else {
-		c.Assert(fk, IsNil)
-	}
-}
-
 func (s *testForeighKeySuite) TestForeignKey(c *C) {
 	defer testleak.AfterTest(c)()
-	d := newDDL(s.store, nil, nil, 100*time.Millisecond)
+	d := newDDL(s.store, nil, nil, testLease)
 	s.d = d
 	s.dbInfo = testSchemaInfo(c, d, "test_foreign")
-	ctx := testNewContext(c, d)
+	ctx := testNewContext(d)
 	s.ctx = ctx
 	testCreateSchema(c, ctx, d, s.dbInfo)
 	tblInfo := testTableInfo(c, d, "t", 3)
 
-	_, err := ctx.GetTxn(true)
+	err := ctx.NewTxn()
 	c.Assert(err, IsNil)
 
 	testCreateTable(c, ctx, d, s.dbInfo, tblInfo)
 
-	err = ctx.CommitTxn()
+	err = ctx.Txn().Commit()
 	c.Assert(err, IsNil)
 
+	// fix data race
+	var mu sync.Mutex
 	checkOK := false
+	var hookErr error
 	tc := &testDDLCallback{}
 	tc.onJobUpdated = func(job *model.Job) {
 		if job.State != model.JobDone {
 			return
 		}
-
-		t := testGetTable(c, d, s.dbInfo.ID, tblInfo.ID)
-		s.testForeignKeyExist(c, t, "c1_fk", true)
+		mu.Lock()
+		defer mu.Unlock()
+		t, err := testGetTableWithError(d, s.dbInfo.ID, tblInfo.ID)
+		if err != nil {
+			hookErr = errors.Trace(err)
+			return
+		}
+		fk := getForeignKey(t, "c1_fk")
+		if fk == nil {
+			hookErr = errors.New("foreign key not exists")
+			return
+		}
 		checkOK = true
 	}
-
-	d.hook = tc
+	d.setHook(tc)
 
 	d.close()
 	d.start()
 
 	job := s.testCreateForeignKey(c, tblInfo, "c1_fk", []string{"c1"}, "t2", []string{"c1"}, ast.ReferOptionCascade, ast.ReferOptionSetNull)
-
 	testCheckJobDone(c, d, job, true)
-
-	err = ctx.CommitTxn()
+	err = ctx.Txn().Commit()
 	c.Assert(err, IsNil)
-	c.Assert(checkOK, IsTrue)
+	mu.Lock()
+	hErr := hookErr
+	ok := checkOK
+	mu.Unlock()
+	c.Assert(hErr, IsNil)
+	c.Assert(ok, IsTrue)
+	v := getSchemaVer(c, ctx)
+	checkHistoryJobArgs(c, ctx, job.ID, &historyJobArgs{ver: v, tbl: tblInfo})
 
+	mu.Lock()
 	checkOK = false
+	mu.Unlock()
 	tc.onJobUpdated = func(job *model.Job) {
 		if job.State != model.JobDone {
 			return
 		}
-		t := testGetTable(c, d, s.dbInfo.ID, tblInfo.ID)
-		s.testForeignKeyExist(c, t, "c1_fk", false)
+		mu.Lock()
+		defer mu.Unlock()
+		t, err := testGetTableWithError(d, s.dbInfo.ID, tblInfo.ID)
+		if err != nil {
+			hookErr = errors.Trace(err)
+			return
+		}
+		fk := getForeignKey(t, "c1_fk")
+		if fk != nil {
+			hookErr = errors.New("foreign key has not been dropped")
+			return
+		}
 		checkOK = true
 	}
 
@@ -177,9 +194,14 @@ func (s *testForeighKeySuite) TestForeignKey(c *C) {
 
 	job = testDropForeignKey(c, ctx, d, s.dbInfo, tblInfo, "c1_fk")
 	testCheckJobDone(c, d, job, false)
-	c.Assert(checkOK, IsTrue)
+	mu.Lock()
+	hErr = hookErr
+	ok = checkOK
+	mu.Unlock()
+	c.Assert(hErr, IsNil)
+	c.Assert(ok, IsTrue)
 
-	_, err = ctx.GetTxn(true)
+	err = ctx.NewTxn()
 	c.Assert(err, IsNil)
 
 	tc.onJobUpdated = func(job *model.Job) {
@@ -191,7 +213,7 @@ func (s *testForeighKeySuite) TestForeignKey(c *C) {
 	job = testDropTable(c, ctx, d, s.dbInfo, tblInfo)
 	testCheckJobDone(c, d, job, false)
 
-	err = ctx.CommitTxn()
+	err = ctx.Txn().Commit()
 	c.Assert(err, IsNil)
 
 	d.close()

@@ -19,13 +19,11 @@ import (
 	"github.com/juju/errors"
 	"github.com/pingcap/tidb/ast"
 	"github.com/pingcap/tidb/context"
-	"github.com/pingcap/tidb/evaluator"
 	"github.com/pingcap/tidb/expression"
 	"github.com/pingcap/tidb/infoschema"
 	"github.com/pingcap/tidb/parser"
 	"github.com/pingcap/tidb/plan"
-	"github.com/pingcap/tidb/sessionctx"
-	"github.com/pingcap/tidb/sessionctx/variable"
+	"github.com/pingcap/tidb/util/sqlexec"
 )
 
 var (
@@ -79,25 +77,18 @@ type PrepareExec struct {
 	Name    string
 	SQLText string
 
-	ID           uint32
-	ResultFields []*ast.ResultField
-	ParamCount   int
-	Err          error
+	ID         uint32
+	ParamCount int
+	Err        error
 }
 
-// Schema implements Executor Schema interface.
+// Schema implements the Executor Schema interface.
 func (e *PrepareExec) Schema() expression.Schema {
 	// Will never be called.
-	return nil
+	return expression.NewSchema(nil)
 }
 
-// Fields implements Executor Fields interface.
-func (e *PrepareExec) Fields() []*ast.ResultField {
-	// returns nil to indicate prepare will not return Recordset.
-	return nil
-}
-
-// Next implements Executor Next interface.
+// Next implements the Executor Next interface.
 func (e *PrepareExec) Next() (*Row, error) {
 	e.DoPrepare()
 	return nil, e.Err
@@ -111,7 +102,7 @@ func (e *PrepareExec) Close() error {
 // DoPrepare prepares the statement, it can be called multiple times without
 // side effect.
 func (e *PrepareExec) DoPrepare() {
-	vars := variable.GetSessionVars(e.Ctx)
+	vars := e.Ctx.GetSessionVars()
 	if e.ID != 0 {
 		// Must be the case when we retry a prepare.
 		// Make sure it is idempotent.
@@ -120,17 +111,29 @@ func (e *PrepareExec) DoPrepare() {
 			return
 		}
 	}
-	charset, collation := variable.GetCharsetInfo(e.Ctx)
-	stmts, err := parser.Parse(e.SQLText, charset, collation)
+	charset, collation := vars.GetCharsetInfo()
+	var (
+		stmts []ast.StmtNode
+		err   error
+	)
+	if sqlParser, ok := e.Ctx.(sqlexec.SQLParser); ok {
+		stmts, err = sqlParser.ParseSQL(e.SQLText, charset, collation)
+	} else {
+		stmts, err = parser.New().Parse(e.SQLText, charset, collation)
+	}
 	if err != nil {
 		e.Err = errors.Trace(err)
 		return
 	}
 	if len(stmts) != 1 {
-		e.Err = ErrPrepareMulti
+		e.Err = errors.Trace(ErrPrepareMulti)
 		return
 	}
 	stmt := stmts[0]
+	if _, ok := stmt.(ast.DDLNode); ok {
+		e.Err = errors.Trace(ErrPrepareDDL)
+		return
+	}
 	var extractor paramMarkerExtractor
 	stmt.Accept(&extractor)
 
@@ -151,9 +154,6 @@ func (e *PrepareExec) DoPrepare() {
 		e.Err = errors.Trace(err)
 		return
 	}
-	if resultSetNode, ok := stmt.(ast.ResultSetNode); ok {
-		e.ResultFields = resultSetNode.GetResultFields()
-	}
 
 	if e.ID == 0 {
 		e.ID = vars.GetNextPreparedStmtID()
@@ -165,30 +165,26 @@ func (e *PrepareExec) DoPrepare() {
 }
 
 // ExecuteExec represents an EXECUTE executor.
-// It executes a prepared statement.
+// It cannot be executed by itself, all it needs to do is to build
+// another Executor from a prepared statement.
 type ExecuteExec struct {
 	IS        infoschema.InfoSchema
 	Ctx       context.Context
 	Name      string
-	UsingVars []ast.ExprNode
+	UsingVars []expression.Expression
 	ID        uint32
 	StmtExec  Executor
 	Stmt      ast.StmtNode
+	Plan      plan.Plan
 }
 
-// Schema implements Executor Schema interface.
+// Schema implements the Executor Schema interface.
 func (e *ExecuteExec) Schema() expression.Schema {
 	// Will never be called.
-	return nil
+	return expression.NewSchema(nil)
 }
 
-// Fields implements Executor Fields interface.
-func (e *ExecuteExec) Fields() []*ast.ResultField {
-	// Will never be called.
-	return nil
-}
-
-// Next implements Executor Next interface.
+// Next implements the Executor Next interface.
 func (e *ExecuteExec) Next() (*Row, error) {
 	// Will never be called.
 	return nil, nil
@@ -201,41 +197,44 @@ func (e *ExecuteExec) Close() error {
 }
 
 // Build builds a prepared statement into an executor.
+// After Build, e.StmtExec will be used to do the real execution.
 func (e *ExecuteExec) Build() error {
-	vars := variable.GetSessionVars(e.Ctx)
+	vars := e.Ctx.GetSessionVars()
 	if e.Name != "" {
 		e.ID = vars.PreparedStmtNameToID[e.Name]
 	}
 	v := vars.PreparedStmts[e.ID]
 	if v == nil {
-		return ErrStmtNotFound
+		return errors.Trace(ErrStmtNotFound)
 	}
 	prepared := v.(*Prepared)
 
 	if len(prepared.Params) != len(e.UsingVars) {
-		return ErrWrongParamCount
+		return errors.Trace(ErrWrongParamCount)
 	}
 
 	for i, usingVar := range e.UsingVars {
-		val, err := evaluator.Eval(e.Ctx, usingVar)
+		val, err := usingVar.Eval(nil, e.Ctx)
 		if err != nil {
 			return errors.Trace(err)
 		}
 		prepared.Params[i].SetDatum(val)
 	}
 
-	ast.ResetEvaluatedFlag(prepared.Stmt)
 	if prepared.SchemaVersion != e.IS.SchemaMetaVersion() {
 		// If the schema version has changed we need to prepare it again,
 		// if this time it failed, the real reason for the error is schema changed.
 		err := plan.PrepareStmt(e.IS, e.Ctx, prepared.Stmt)
 		if err != nil {
-			return ErrSchemaChanged.Gen("Schema change casued error: %s", err.Error())
+			return ErrSchemaChanged.Gen("Schema change caused error: %s", err.Error())
 		}
 		prepared.SchemaVersion = e.IS.SchemaMetaVersion()
 	}
-	sb := &subqueryBuilder{is: e.IS}
-	p, err := plan.Optimize(e.Ctx, prepared.Stmt, sb)
+	p, err := plan.Optimize(e.Ctx, prepared.Stmt, e.IS)
+	if err != nil {
+		return errors.Trace(err)
+	}
+	err = e.Ctx.ActivePendingTxn()
 	if err != nil {
 		return errors.Trace(err)
 	}
@@ -246,6 +245,7 @@ func (e *ExecuteExec) Build() error {
 	}
 	e.StmtExec = stmtExec
 	e.Stmt = prepared.Stmt
+	e.Plan = p
 	return nil
 }
 
@@ -255,23 +255,18 @@ type DeallocateExec struct {
 	ctx  context.Context
 }
 
-// Schema implements Executor Schema interface.
+// Schema implements the Executor Schema interface.
 func (e *DeallocateExec) Schema() expression.Schema {
 	// Will never be called.
-	return nil
+	return expression.NewSchema(nil)
 }
 
-// Fields implements Executor Fields interface.
-func (e *DeallocateExec) Fields() []*ast.ResultField {
-	return nil
-}
-
-// Next implements Executor Next interface.
+// Next implements the Executor Next interface.
 func (e *DeallocateExec) Next() (*Row, error) {
-	vars := variable.GetSessionVars(e.ctx)
+	vars := e.ctx.GetSessionVars()
 	id, ok := vars.PreparedStmtNameToID[e.Name]
 	if !ok {
-		return nil, ErrStmtNotFound
+		return nil, errors.Trace(ErrStmtNotFound)
 	}
 	delete(vars.PreparedStmtNameToID, e.Name)
 	delete(vars.PreparedStmts, id)
@@ -286,12 +281,13 @@ func (e *DeallocateExec) Close() error {
 // CompileExecutePreparedStmt compiles a session Execute command to a stmt.Statement.
 func CompileExecutePreparedStmt(ctx context.Context, ID uint32, args ...interface{}) ast.Statement {
 	execPlan := &plan.Execute{ID: ID}
-	execPlan.UsingVars = make([]ast.ExprNode, len(args))
+	execPlan.UsingVars = make([]expression.Expression, len(args))
 	for i, val := range args {
-		execPlan.UsingVars[i] = ast.NewValueExpr(val)
+		value := ast.NewValueExpr(val)
+		execPlan.UsingVars[i] = &expression.Constant{Value: value.Datum, RetType: &value.Type}
 	}
 	sa := &statement{
-		is:   sessionctx.GetDomain(ctx).InfoSchema(),
+		is:   GetInfoSchema(ctx),
 		plan: execPlan,
 	}
 	return sa

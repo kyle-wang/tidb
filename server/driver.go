@@ -13,16 +13,20 @@
 
 package server
 
-import "github.com/pingcap/tidb/util/types"
+import (
+	"fmt"
+
+	"github.com/pingcap/tidb/util/types"
+)
 
 // IDriver opens IContext.
 type IDriver interface {
 	// OpenCtx opens an IContext with connection id, client capability, collation and dbname.
-	OpenCtx(connID uint64, capability uint32, collation uint8, dbname string) (IContext, error)
+	OpenCtx(connID uint64, capability uint32, collation uint8, dbname string) (QueryCtx, error)
 }
 
-// IContext is the interface to execute commant.
-type IContext interface {
+// QueryCtx is the interface to execute command.
+type QueryCtx interface {
 	// Status returns server status code.
 	Status() uint16
 
@@ -32,6 +36,18 @@ type IContext interface {
 	// AffectedRows returns affected rows of last executed command.
 	AffectedRows() uint64
 
+	// Value returns the value associated with this context for key.
+	Value(key fmt.Stringer) interface{}
+
+	// SetValue saves a value associated with this context for key.
+	SetValue(key fmt.Stringer, value interface{})
+
+	// CommitTxn commits the transaction operations.
+	CommitTxn() error
+
+	// RollbackTxn undoes the transaction operations.
+	RollbackTxn() error
+
 	// WarningCount returns warning count of last executed command.
 	WarningCount() uint16
 
@@ -39,13 +55,16 @@ type IContext interface {
 	CurrentDB() string
 
 	// Execute executes a SQL statement.
-	Execute(sql string) (ResultSet, error)
+	Execute(sql string) ([]ResultSet, error)
+
+	// SetClientCapability sets client capability flags
+	SetClientCapability(uint32)
 
 	// Prepare prepares a statement.
-	Prepare(sql string) (statement IStatement, columns, params []*ColumnInfo, err error)
+	Prepare(sql string) (statement PreparedStatement, columns, params []*ColumnInfo, err error)
 
-	// GetStatement gets IStatement by statement ID.
-	GetStatement(stmtID int) IStatement
+	// GetStatement gets PreparedStatement by statement ID.
+	GetStatement(stmtID int) PreparedStatement
 
 	// FieldList returns columns of a table.
 	FieldList(tableName string) (columns []*ColumnInfo, err error)
@@ -57,8 +76,8 @@ type IContext interface {
 	Auth(user string, auth []byte, salt []byte) bool
 }
 
-// IStatement is the interface to use a prepared statement.
-type IStatement interface {
+// PreparedStatement is the interface to use a prepared statement.
+type PreparedStatement interface {
 	// ID returns statement ID
 	ID() int
 
@@ -73,6 +92,12 @@ type IStatement interface {
 
 	// BoundParams returns bound parameters.
 	BoundParams() [][]byte
+
+	// SetParamsType sets type for parameters.
+	SetParamsType([]byte)
+
+	// GetParamsType returns the type for parameters.
+	GetParamsType() []byte
 
 	// Reset removes all bound parameters.
 	Reset()

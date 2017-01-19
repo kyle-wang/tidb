@@ -43,33 +43,47 @@ const (
 	IntDiv
 	LogicXor
 	NullEQ
+	In
+	Like
+	Case
+	Regexp
+	IsNull
+	IsTruth
+	IsFalsity
 )
 
 // Ops maps opcode to string.
 var Ops = map[Op]string{
-	AndAnd:     "&&",
-	LeftShift:  "<<",
-	RightShift: ">>",
-	OrOr:       "||",
-	GE:         ">=",
-	LE:         "<=",
-	EQ:         "=",
-	NE:         "!=",
-	LT:         "<",
-	GT:         ">",
-	Plus:       "+",
-	Minus:      "-",
-	And:        "&",
-	Or:         "|",
-	Mod:        "%",
-	Xor:        "^",
-	Div:        "/",
-	Mul:        "*",
-	Not:        "!",
-	BitNeg:     "~",
-	IntDiv:     "DIV",
-	LogicXor:   "XOR",
-	NullEQ:     "<=>",
+	AndAnd:     "and",
+	LeftShift:  "leftshift",
+	RightShift: "rightshift",
+	OrOr:       "or",
+	GE:         "ge",
+	LE:         "le",
+	EQ:         "eq",
+	NE:         "ne",
+	LT:         "lt",
+	GT:         "gt",
+	Plus:       "plus",
+	Minus:      "minus",
+	And:        "bitand",
+	Or:         "bitor",
+	Mod:        "mod",
+	Xor:        "bitxor",
+	Div:        "div",
+	Mul:        "mul",
+	Not:        "not",
+	BitNeg:     "bitneg",
+	IntDiv:     "intdiv",
+	LogicXor:   "xor",
+	NullEQ:     "nulleq",
+	In:         "in",
+	Like:       "like",
+	Case:       "case",
+	Regexp:     "regexp",
+	IsNull:     "isnull",
+	IsTruth:    "istrue",
+	IsFalsity:  "isfalse",
 }
 
 // String implements Stringer interface.

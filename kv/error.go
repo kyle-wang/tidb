@@ -32,6 +32,8 @@ const (
 	codeInvalidTxn                                = 8
 	codeNotCommitted                              = 9
 	codeNotImplemented                            = 10
+	codeTxnTooLarge                               = 11
+	codeEntryTooLarge                             = 12
 
 	codeKeyExists = 1062
 )
@@ -54,6 +56,10 @@ var (
 	ErrCannotSetNilValue = terror.ClassKV.New(codeCantSetNilValue, "can not set nil value")
 	// ErrInvalidTxn is the error when commits or rollbacks in an invalid transaction.
 	ErrInvalidTxn = terror.ClassKV.New(codeInvalidTxn, "invalid transaction")
+	// ErrTxnTooLarge is the error when transaction is too large, lock time reached the maximum value.
+	ErrTxnTooLarge = terror.ClassKV.New(codeTxnTooLarge, "transaction is too large")
+	// ErrEntryTooLarge is the error when a key value entry is too large.
+	ErrEntryTooLarge = terror.ClassKV.New(codeEntryTooLarge, "entry is too large")
 
 	// ErrNotCommitted is the error returned by CommitVersion when this
 	// transaction is not committed.
@@ -81,7 +87,7 @@ func IsRetryableError(err error) bool {
 	if terror.ErrorEqual(err, ErrRetryable) ||
 		terror.ErrorEqual(err, ErrLockConflict) ||
 		terror.ErrorEqual(err, ErrConditionNotMatch) ||
-		// HBase exception message will tell you if you should retry or not
+		// TiKV exception message will tell you if you should retry or not
 		strings.Contains(err.Error(), "try again later") {
 		return true
 	}

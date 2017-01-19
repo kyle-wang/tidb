@@ -14,8 +14,6 @@
 package plan_test
 
 import (
-	"testing"
-
 	. "github.com/pingcap/check"
 	"github.com/pingcap/tidb"
 	"github.com/pingcap/tidb/ast"
@@ -23,17 +21,17 @@ import (
 	"github.com/pingcap/tidb/parser"
 	"github.com/pingcap/tidb/plan"
 	"github.com/pingcap/tidb/sessionctx"
-	"github.com/pingcap/tidb/sessionctx/db"
 	"github.com/pingcap/tidb/util/testkit"
 )
 
-func TestT(t *testing.T) {
-	TestingT(t)
-}
-
 var _ = Suite(&testNameResolverSuite{})
 
+func (s *testNameResolverSuite) SetUpSuite(c *C) {
+	s.Parser = parser.New()
+}
+
 type testNameResolverSuite struct {
+	*parser.Parser
 }
 
 type resolverVerifier struct {
@@ -64,16 +62,12 @@ var resolverTestCases = []resolverTestCase{
 	{"select c1 from t1", true},
 	{"select c3 from t1", false},
 	{"select c1 from t4", false},
-	{"select c1 from t1, t2", false},
 	{"select * from t1", true},
 	{"select t1.* from t1", true},
 	{"select t2.* from t1", false},
-	{"select c1 as a, c2 as a from t1 group by a", false},
 	{"select c1 as a, c1 as a from t1 group by a", true},
 	{"select 1 as a, c1 as a, c2 as a from t1 group by a", true},
-	{"select c1, c2 as c1 from t1 group by c1", false},
 	{"select c1, c2 as c1 from t1 group by c1+1", true},
-	{"select c1, c2 as c1 from t1 order by c1", false},
 	{"select c1, c2 as c1 from t1 order by c1+1", true},
 	{"select * from t1, t2 join t3 on t1.c1 = t2.c1", false},
 	{"select * from t1, t2 join t3 on t2.c1 = t3.c1", true},
@@ -93,9 +87,9 @@ func (ts *testNameResolverSuite) TestNameResolver(c *C) {
 	testKit.MustExec("create table t3 (c1 int, c2 int)")
 	ctx := testKit.Se.(context.Context)
 	domain := sessionctx.GetDomain(ctx)
-	db.BindCurrentSchema(ctx, "test")
+	ctx.GetSessionVars().CurrentDB = "test"
 	for _, tc := range resolverTestCases {
-		node, err := parser.ParseOneStmt(tc.src, "", "")
+		node, err := ts.ParseOneStmt(tc.src, "", "")
 		c.Assert(err, IsNil)
 		resolveErr := plan.ResolveName(node, domain.InfoSchema(), ctx)
 		if tc.valid {

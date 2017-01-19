@@ -36,8 +36,9 @@ var (
 	errDuplicateColumn = terror.ClassTable.New(codeDuplicateColumn, "duplicate column")
 
 	errGetDefaultFailed = terror.ClassTable.New(codeGetDefaultFailed, "get default value fail")
-	errIndexOutBound    = terror.ClassTable.New(codeIndexOutBound, "index column offset out of bound")
 
+	// ErrIndexOutBound returns for index column offset out of bound.
+	ErrIndexOutBound = terror.ClassTable.New(codeIndexOutBound, "index column offset out of bound")
 	// ErrUnsupportedOp returns for unsupported operation.
 	ErrUnsupportedOp = terror.ClassTable.New(codeUnsupportedOp, "operation not supported")
 	// ErrRowNotFound returns for row not found.
@@ -71,8 +72,12 @@ type Table interface {
 	// Cols returns the columns of the table which is used in select.
 	Cols() []*Column
 
+	// WritableCols returns columns of the table in writable states.
+	// Writable states includes Public, WriteOnly, WriteOnlyReorganization.
+	WritableCols() []*Column
+
 	// Indices returns the indices of the table.
-	Indices() []*IndexedColumn
+	Indices() []Index
 
 	// RecordPrefix returns the record key prefix.
 	RecordPrefix() kv.Key
@@ -83,11 +88,8 @@ type Table interface {
 	// FirstKey returns the first key.
 	FirstKey() kv.Key
 
-	// RecordKey returns the key in KV storage for the column.
-	RecordKey(h int64, col *Column) kv.Key
-
-	// Truncate truncates the table.
-	Truncate(ctx context.Context) (err error)
+	// RecordKey returns the key in KV storage for the row.
+	RecordKey(h int64) kv.Key
 
 	// AddRecord inserts a row into the table.
 	AddRecord(ctx context.Context, r []types.Datum) (recordID int64, err error)
@@ -101,6 +103,9 @@ type Table interface {
 	// AllocAutoID allocates an auto_increment ID for a new row.
 	AllocAutoID() (int64, error)
 
+	// Allocator returns Allocator.
+	Allocator() autoid.Allocator
+
 	// RebaseAutoID rebases the auto_increment ID base.
 	// If allocIDs is true, it will allocate some IDs and save to the cache.
 	// If allocIDs is false, it will not allocate IDs.
@@ -108,9 +113,6 @@ type Table interface {
 
 	// Meta returns TableInfo.
 	Meta() *model.TableInfo
-
-	// LockRow locks a row.
-	LockRow(ctx context.Context, h int64, forRead bool) error
 
 	// Seek returns the handle greater or equal to h.
 	Seek(ctx context.Context, h int64) (handle int64, found bool, err error)
@@ -140,6 +142,17 @@ const (
 	codeDuplicateColumn = 1110
 	codeNoDefaultValue  = 1364
 )
+
+// Slice is used for table sorting.
+type Slice []Table
+
+func (s Slice) Len() int { return len(s) }
+
+func (s Slice) Less(i, j int) bool {
+	return s[i].Meta().Name.O < s[j].Meta().Name.O
+}
+
+func (s Slice) Swap(i, j int) { s[i], s[j] = s[j], s[i] }
 
 func init() {
 	tableMySQLErrCodes := map[terror.ErrCode]uint16{

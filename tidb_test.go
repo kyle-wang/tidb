@@ -16,10 +16,10 @@ package tidb
 import (
 	"flag"
 	"fmt"
-	"net/url"
 	"os"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -27,7 +27,10 @@ import (
 	"github.com/ngaut/log"
 	. "github.com/pingcap/check"
 	"github.com/pingcap/tidb/ast"
+	"github.com/pingcap/tidb/context"
 	"github.com/pingcap/tidb/kv"
+	"github.com/pingcap/tidb/sessionctx"
+	"github.com/pingcap/tidb/store/localstore"
 	"github.com/pingcap/tidb/util/testleak"
 	"github.com/pingcap/tidb/util/types"
 )
@@ -35,6 +38,9 @@ import (
 var store = flag.String("store", "memory", "registered store name, [memory, goleveldb, boltdb]")
 
 func TestT(t *testing.T) {
+	logLevel := os.Getenv("log_level")
+	log.SetLevelByString(logLevel)
+	CustomVerboseFlag = true
 	TestingT(t)
 }
 
@@ -67,8 +73,6 @@ func (s *testMainSuite) SetUpSuite(c *C) {
     CREATE TABLE tbl_test2(id INT NOT NULL DEFAULT 3, name varchar(255), PRIMARY KEY(id));`
 	s.selectSQL = `SELECT * from tbl_test;`
 	runtime.GOMAXPROCS(runtime.NumCPU())
-
-	log.SetLevelByString("error")
 }
 
 func (s *testMainSuite) TearDownSuite(c *C) {
@@ -180,6 +184,10 @@ func (s *testMainSuite) TestCaseInsensitive(c *C) {
 	c.Assert(err, IsNil)
 	c.Assert(fields[0].ColumnAsName.O, Equals, "A")
 	c.Assert(fields[1].ColumnAsName.O, Equals, "b")
+	rs = mustExecSQL(c, se, "select a as A from t where A > 0")
+	fields, err = rs.Fields()
+	c.Assert(err, IsNil)
+	c.Assert(fields[0].ColumnAsName.O, Equals, "A")
 	mustExecSQL(c, se, "update T set b = B + 1")
 	mustExecSQL(c, se, "update T set B = b + 1")
 	rs = mustExecSQL(c, se, "select b from T")
@@ -256,63 +264,100 @@ func (s *testMainSuite) TestRetryOpenStore(c *C) {
 	c.Assert(uint64(elapse), GreaterEqual, uint64(3*time.Second))
 }
 
-func (s *testMainSuite) TestParseDSN(c *C) {
-	tbl := []struct {
-		dsn      string
-		ok       bool
-		storeDSN string
-		dbName   string
-	}{
-		{"s://path/db", true, "s://path", "db"},
-		{"s://path/db/", true, "s://path", "db"},
-		{"s:///path/db", true, "s:///path", "db"},
-		{"s:///path/db/", true, "s:///path", "db"},
-		{"s://zk1,zk2/tbl/db", true, "s://zk1,zk2/tbl", "db"},
-		{"s://zk1:80,zk2:81/tbl/db", true, "s://zk1:80,zk2:81/tbl", "db"},
-		{"s://path/db?p=v", true, "s://path?p=v", "db"},
-		{"s:///path/db?p1=v1&p2=v2", true, "s:///path?p1=v1&p2=v2", "db"},
-		{"s://z,k,zk/tbl/db?p=v", true, "s://z,k,zk/tbl?p=v", "db"},
-		{"", false, "", ""},
-		{"/", false, "", ""},
-		{"s://", false, "", ""},
-		{"s:///", false, "", ""},
-		{"s:///db", false, "", ""},
-	}
-
-	for _, t := range tbl {
-		params, err := parseDriverDSN(t.dsn)
-		if t.ok {
-			c.Assert(err, IsNil, Commentf("dsn=%v", t.dsn))
-			c.Assert(params.storePath, Equals, t.storeDSN, Commentf("dsn=%v", t.dsn))
-			c.Assert(params.dbName, Equals, t.dbName, Commentf("dsn=%v", t.dsn))
-			_, err = url.Parse(params.storePath)
-			c.Assert(err, IsNil, Commentf("dsn=%v", t.dsn))
-		} else {
-			c.Assert(err, NotNil, Commentf("dsn=%v", t.dsn))
-		}
-	}
-}
-
-func (s *testMainSuite) TestTPS(c *C) {
-	store := newStore(c, s.dbName)
+// TODO: Merge TestIssue1435 in session test.
+func (s *testMainSuite) TestSchemaValidity(c *C) {
+	localstore.MockRemoteStore = true
+	store := newStore(c, s.dbName+"schema_validity")
 	se := newSession(c, store, s.dbName)
-	defer store.Close()
+	se1 := newSession(c, store, s.dbName)
+	se2 := newSession(c, store, s.dbName)
 
-	mustExecSQL(c, se, "set @@autocommit=0;")
-	for i := 1; i < 6; i++ {
-		for j := 0; j < 5; j++ {
-			for k := 0; k < i; k++ {
-				mustExecSQL(c, se, "begin;")
-				mustExecSQL(c, se, "select 1;")
-				mustExecSQL(c, se, "commit;")
-			}
-			time.Sleep(220 * time.Millisecond)
-		}
-		// It is hard to get the accurate tps because there is another timeline in tpsMetrics.
-		// We could only get the upper/lower boundary for tps
-		c.Assert(GetTPS(), GreaterEqual, int64(4*(i-1)))
+	ctx := se.(context.Context)
+	mustExecSQL(c, se, "drop table if exists t;")
+	mustExecSQL(c, se, "create table t (a int);")
+	mustExecSQL(c, se, "drop table if exists t1;")
+	mustExecSQL(c, se, "create table t1 (a int);")
+	mustExecSQL(c, se, "drop table if exists t2;")
+	mustExecSQL(c, se, "create table t2 (a int);")
+	startCh1 := make(chan struct{})
+	startCh2 := make(chan struct{})
+	endCh1 := make(chan error)
+	endCh2 := make(chan error)
+	execFailedFunc := func(s Session, tbl string, start chan struct{}, end chan error) {
+		// execute successfully
+		_, err := exec(s, "begin;")
+		c.Check(err, IsNil)
+		<-start
+		<-start
+
+		_, err = exec(s, fmt.Sprintf("insert into %s values(1)", tbl))
+		c.Check(err, IsNil)
+
+		// table t1 executes failed
+		// table t2 executes successfully
+		_, err = exec(s, "commit")
+		end <- err
 	}
+
+	go execFailedFunc(se1, "t1", startCh1, endCh1)
+	go execFailedFunc(se2, "t2", startCh2, endCh2)
+	// Make sure two insert transactions are begin.
+	startCh1 <- struct{}{}
+	startCh2 <- struct{}{}
+
+	select {
+	case <-endCh1:
+		// Make sure the first insert statement isn't finish.
+		c.Error("The statement shouldn't be executed")
+		c.FailNow()
+	default:
+	}
+	// Make sure loading information schema is failed and server is invalid.
+	sessionctx.GetDomain(ctx).MockReloadFailed.SetValue(true)
+	sessionctx.GetDomain(ctx).Reload()
+	lease := sessionctx.GetDomain(ctx).DDL().GetLease()
+	time.Sleep(lease + time.Millisecond) // time.Sleep maybe not very reliable
+	// Make sure insert to table t1 transaction executes.
+	startCh1 <- struct{}{}
+	// Make sure executing insert statement is failed when server is invalid.
+	mustExecFailed(c, se, "insert t values (100);")
+	err := <-endCh1
+	c.Assert(err, NotNil)
+
+	// recover
+	select {
+	case <-endCh2:
+		// Make sure the second insert statement isn't finish.
+		c.Error("The statement shouldn't be executed")
+		c.FailNow()
+	default:
+	}
+
+	ver, err := store.CurrentVersion()
+	c.Assert(err, IsNil)
+	c.Assert(ver, NotNil)
+	sessionctx.GetDomain(ctx).MockReloadFailed.SetValue(false)
+	sessionctx.GetDomain(ctx).Reload()
+	mustExecSQL(c, se, "drop table if exists t;")
+	mustExecSQL(c, se, "create table t (a int);")
+	mustExecSQL(c, se, "insert t values (1);")
+	// Make sure insert to table t2 transaction executes.
+	startCh2 <- struct{}{}
+	err = <-endCh2
+	c.Assert(err, IsNil, Commentf("err:%v", err))
+
+	sessionctx.GetDomain(ctx).Close()
+	err = se.Close()
+	c.Assert(err, IsNil)
+	err = se1.Close()
+	c.Assert(err, IsNil)
+	err = se2.Close()
+	c.Assert(err, IsNil)
+	err = store.Close()
+	c.Assert(err, IsNil)
+	localstore.MockRemoteStore = false
 }
+
 func sessionExec(c *C, se Session, sql string) ([]ast.RecordSet, error) {
 	se.Execute("BEGIN;")
 	r, err := se.Execute(sql)
@@ -327,10 +372,15 @@ func newStore(c *C, dbPath string) kv.Storage {
 	return store
 }
 
+var testConnID uint64
+
 func newSession(c *C, store kv.Storage, dbName string) Session {
 	se, err := CreateSession(store)
+	id := atomic.AddUint64(&testConnID, 1)
+	se.SetConnectionID(id)
 	c.Assert(err, IsNil)
-	se.Auth("root@%", nil, []byte("012345678901234567890"))
+	se.GetSessionVars().SkipDDLWait = true
+	se.Auth(`root@%`, nil, []byte("012345678901234567890"))
 	mustExecSQL(c, se, "create database if not exists "+dbName)
 	mustExecSQL(c, se, "use "+dbName)
 	return se
@@ -340,7 +390,7 @@ func removeStore(c *C, dbPath string) {
 	os.RemoveAll(dbPath)
 }
 
-func exec(c *C, se Session, sql string, args ...interface{}) (ast.RecordSet, error) {
+func exec(se Session, sql string, args ...interface{}) (ast.RecordSet, error) {
 	if len(args) == 0 {
 		rs, err := se.Execute(sql)
 		if err == nil && len(rs) > 0 {
@@ -360,7 +410,7 @@ func exec(c *C, se Session, sql string, args ...interface{}) (ast.RecordSet, err
 }
 
 func mustExecSQL(c *C, se Session, sql string, args ...interface{}) ast.RecordSet {
-	rs, err := exec(c, se, sql, args...)
+	rs, err := exec(se, sql, args...)
 	c.Assert(err, IsNil)
 	return rs
 }
@@ -389,7 +439,7 @@ func mustExecMatch(c *C, se Session, sql string, expected [][]interface{}) {
 }
 
 func mustExecFailed(c *C, se Session, sql string, args ...interface{}) {
-	r, err := exec(c, se, sql, args...)
+	r, err := exec(se, sql, args...)
 	if err == nil && r != nil {
 		// sometimes we may meet error after executing first row.
 		_, err = r.Next()

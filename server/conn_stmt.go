@@ -78,7 +78,7 @@ func (cc *clientConn) handleStmtPrepare(sql string) error {
 			}
 		}
 
-		if err := cc.writeEOF(); err != nil {
+		if err := cc.writeEOF(false); err != nil {
 			return errors.Trace(err)
 		}
 	}
@@ -93,7 +93,7 @@ func (cc *clientConn) handleStmtPrepare(sql string) error {
 			}
 		}
 
-		if err := cc.writeEOF(); err != nil {
+		if err := cc.writeEOF(false); err != nil {
 			return errors.Trace(err)
 		}
 
@@ -141,7 +141,7 @@ func (cc *clientConn) handleStmtExecute(data []byte) (err error) {
 		nullBitmaps = data[pos : pos+nullBitmapLen]
 		pos += nullBitmapLen
 
-		//new param bound flag
+		// new param bound flag
 		if data[pos] == 1 {
 			pos++
 			if len(data) < (pos + (numParams << 1)) {
@@ -151,9 +151,14 @@ func (cc *clientConn) handleStmtExecute(data []byte) (err error) {
 			paramTypes = data[pos : pos+(numParams<<1)]
 			pos += (numParams << 1)
 			paramValues = data[pos:]
+			// Just the first StmtExecute packet contain parameters type,
+			// we need save it for further use.
+			stmt.SetParamsType(paramTypes)
+		} else {
+			paramValues = data[pos+1:]
 		}
 
-		err = parseStmtArgs(args, stmt.BoundParams(), nullBitmaps, paramTypes, paramValues)
+		err = parseStmtArgs(args, stmt.BoundParams(), nullBitmaps, stmt.GetParamsType(), paramValues)
 		if err != nil {
 			return errors.Trace(err)
 		}
@@ -166,7 +171,7 @@ func (cc *clientConn) handleStmtExecute(data []byte) (err error) {
 		return errors.Trace(cc.writeOK())
 	}
 
-	return errors.Trace(cc.writeResultset(rs, true))
+	return errors.Trace(cc.writeResultset(rs, true, false))
 }
 
 func parseStmtArgs(args []interface{}, boundParams [][]byte, nullBitmap, paramTypes, paramValues []byte) (err error) {
@@ -183,6 +188,10 @@ func parseStmtArgs(args []interface{}, boundParams [][]byte, nullBitmap, paramTy
 		if boundParams[i] != nil {
 			args[i] = boundParams[i]
 			continue
+		}
+
+		if (i<<1)+1 >= len(paramTypes) {
+			return mysql.ErrMalformPacket
 		}
 
 		tp := paramTypes[i<<1]
@@ -344,4 +353,27 @@ func (cc *clientConn) handleStmtReset(data []byte) (err error) {
 	}
 	stmt.Reset()
 	return cc.writeOK()
+}
+
+// See https://dev.mysql.com/doc/internals/en/com-set-option.html
+func (cc *clientConn) handleSetOption(data []byte) (err error) {
+	if len(data) < 2 {
+		return mysql.ErrMalformPacket
+	}
+
+	switch binary.LittleEndian.Uint16(data[:2]) {
+	case 0:
+		cc.capability |= mysql.ClientMultiStatements
+		cc.ctx.SetClientCapability(cc.capability)
+	case 1:
+		cc.capability &^= mysql.ClientMultiStatements
+		cc.ctx.SetClientCapability(cc.capability)
+	default:
+		return mysql.ErrMalformPacket
+	}
+	if err = cc.writeEOF(false); err != nil {
+		return errors.Trace(err)
+	}
+
+	return errors.Trace(cc.flush())
 }

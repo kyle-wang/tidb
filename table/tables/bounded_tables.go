@@ -23,6 +23,7 @@ import (
 	"github.com/pingcap/tidb/meta/autoid"
 	"github.com/pingcap/tidb/model"
 	"github.com/pingcap/tidb/table"
+	"github.com/pingcap/tidb/tablecodec"
 	"github.com/pingcap/tidb/util/types"
 )
 
@@ -62,7 +63,7 @@ func BoundedTableFromMeta(alloc autoid.Allocator, tblInfo *model.TableInfo, capa
 	columns := make([]*table.Column, 0, len(tblInfo.Columns))
 	var pkHandleColumn *table.Column
 	for _, colInfo := range tblInfo.Columns {
-		col := &table.Column{ColumnInfo: *colInfo}
+		col := table.ToColumn(colInfo)
 		columns = append(columns, col)
 		if col.IsPKHandleColumn(tblInfo) {
 			pkHandleColumn = col
@@ -82,7 +83,7 @@ func newBoundedTable(tableID int64, tableName string, cols []*table.Column, allo
 		Name:         name,
 		alloc:        alloc,
 		Columns:      cols,
-		recordPrefix: genTableRecordPrefix(tableID),
+		recordPrefix: tablecodec.GenTableRecordPrefix(tableID),
 		records:      make([]unsafe.Pointer, capacity),
 		capacity:     capacity,
 		cursor:       0,
@@ -130,7 +131,7 @@ func (t *BoundedTable) Seek(ctx context.Context, handle int64) (int64, bool, err
 }
 
 // Indices implements table.Table Indices interface.
-func (t *BoundedTable) Indices() []*table.IndexedColumn {
+func (t *BoundedTable) Indices() []table.Index {
 	return nil
 }
 
@@ -141,6 +142,11 @@ func (t *BoundedTable) Meta() *model.TableInfo {
 
 // Cols implements table.Table Cols interface.
 func (t *BoundedTable) Cols() []*table.Column {
+	return t.Columns
+}
+
+// WritableCols implements table.Table WritableCols interface.
+func (t *BoundedTable) WritableCols() []*table.Column {
 	return t.Columns
 }
 
@@ -155,27 +161,22 @@ func (t *BoundedTable) IndexPrefix() kv.Key {
 }
 
 // RecordKey implements table.Table RecordKey interface.
-func (t *BoundedTable) RecordKey(h int64, col *table.Column) kv.Key {
-	colID := int64(0)
-	if col != nil {
-		colID = col.ID
-	}
-	return encodeRecordKey(t.recordPrefix, h, colID)
+func (t *BoundedTable) RecordKey(h int64) kv.Key {
+	return tablecodec.EncodeRecordKey(t.recordPrefix, h)
 }
 
 // FirstKey implements table.Table FirstKey interface.
 func (t *BoundedTable) FirstKey() kv.Key {
-	return t.RecordKey(0, nil)
+	return t.RecordKey(0)
 }
 
-// Truncate implements table.Table Truncate interface.
-func (t *BoundedTable) Truncate(ctx context.Context) error {
+// Truncate drops all data in BoundedTable.
+func (t *BoundedTable) Truncate() {
 	// just reset everything.
 	for i := int64(0); i < t.capacity; i++ {
 		atomic.StorePointer(&t.records[i], unsafe.Pointer(nil))
 	}
 	t.cursor = 0
-	return nil
 }
 
 // UpdateRecord implements table.Table UpdateRecord interface.
@@ -201,7 +202,7 @@ func (t *BoundedTable) AddRecord(ctx context.Context, r []types.Datum) (int64, e
 	var recordID int64
 	var err error
 	if t.pkHandleCol != nil {
-		recordID, err = r[t.pkHandleCol.Offset].ToInt64()
+		recordID, err = r[t.pkHandleCol.Offset].ToInt64(ctx.GetSessionVars().StmtCtx)
 		if err != nil {
 			return invalidRecordID, errors.Trace(err)
 		}
@@ -254,11 +255,6 @@ func (t *BoundedTable) Row(ctx context.Context, h int64) ([]types.Datum, error) 
 	return r, nil
 }
 
-// LockRow implements table.Table LockRow interface.
-func (t *BoundedTable) LockRow(ctx context.Context, h int64, forRead bool) error {
-	return nil
-}
-
 // RemoveRecord implements table.Table RemoveRecord interface.
 func (t *BoundedTable) RemoveRecord(ctx context.Context, h int64, r []types.Datum) error {
 	// not supported, BoundedTable is TRUNCATE only
@@ -272,6 +268,11 @@ func (t *BoundedTable) AllocAutoID() (int64, error) {
 		return invalidRecordID, errors.Trace(err)
 	}
 	return recordID + initialRecordID, nil
+}
+
+// Allocator implements table.Table Allocator interface.
+func (t *BoundedTable) Allocator() autoid.Allocator {
+	return t.alloc
 }
 
 // RebaseAutoID implements table.Table RebaseAutoID interface.

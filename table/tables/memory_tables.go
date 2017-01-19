@@ -24,6 +24,7 @@ import (
 	"github.com/pingcap/tidb/meta/autoid"
 	"github.com/pingcap/tidb/model"
 	"github.com/pingcap/tidb/table"
+	"github.com/pingcap/tidb/tablecodec"
 	"github.com/pingcap/tidb/util/types"
 )
 
@@ -76,7 +77,7 @@ func MemoryTableFromMeta(alloc autoid.Allocator, tblInfo *model.TableInfo) (tabl
 	columns := make([]*table.Column, 0, len(tblInfo.Columns))
 	var pkHandleColumn *table.Column
 	for _, colInfo := range tblInfo.Columns {
-		col := &table.Column{ColumnInfo: *colInfo}
+		col := table.ToColumn(colInfo)
 		columns = append(columns, col)
 		if col.IsPKHandleColumn(tblInfo) {
 			pkHandleColumn = col
@@ -96,7 +97,7 @@ func newMemoryTable(tableID int64, tableName string, cols []*table.Column, alloc
 		Name:         name,
 		alloc:        alloc,
 		Columns:      cols,
-		recordPrefix: genTableRecordPrefix(tableID),
+		recordPrefix: tablecodec.GenTableRecordPrefix(tableID),
 		tree:         llrb.New(),
 	}
 	return t
@@ -117,7 +118,7 @@ func (t *MemoryTable) Seek(ctx context.Context, handle int64) (int64, bool, erro
 }
 
 // Indices implements table.Table Indices interface.
-func (t *MemoryTable) Indices() []*table.IndexedColumn {
+func (t *MemoryTable) Indices() []table.Index {
 	return nil
 }
 
@@ -128,6 +129,11 @@ func (t *MemoryTable) Meta() *model.TableInfo {
 
 // Cols implements table.Table Cols interface.
 func (t *MemoryTable) Cols() []*table.Column {
+	return t.Columns
+}
+
+// WritableCols implements table.Table WritableCols interface.
+func (t *MemoryTable) WritableCols() []*table.Column {
 	return t.Columns
 }
 
@@ -142,23 +148,18 @@ func (t *MemoryTable) IndexPrefix() kv.Key {
 }
 
 // RecordKey implements table.Table RecordKey interface.
-func (t *MemoryTable) RecordKey(h int64, col *table.Column) kv.Key {
-	colID := int64(0)
-	if col != nil {
-		colID = col.ID
-	}
-	return encodeRecordKey(t.recordPrefix, h, colID)
+func (t *MemoryTable) RecordKey(h int64) kv.Key {
+	return tablecodec.EncodeRecordKey(t.recordPrefix, h)
 }
 
 // FirstKey implements table.Table FirstKey interface.
 func (t *MemoryTable) FirstKey() kv.Key {
-	return t.RecordKey(0, nil)
+	return t.RecordKey(0)
 }
 
-// Truncate implements table.Table Truncate interface.
-func (t *MemoryTable) Truncate(ctx context.Context) error {
+// Truncate drops all data in Memory Table.
+func (t *MemoryTable) Truncate() {
 	t.tree = llrb.New()
-	return nil
 }
 
 // UpdateRecord implements table.Table UpdateRecord interface.
@@ -177,7 +178,7 @@ func (t *MemoryTable) UpdateRecord(ctx context.Context, h int64, oldData []types
 // AddRecord implements table.Table AddRecord interface.
 func (t *MemoryTable) AddRecord(ctx context.Context, r []types.Datum) (recordID int64, err error) {
 	if t.pkHandleCol != nil {
-		recordID, err = r[t.pkHandleCol.Offset].ToInt64()
+		recordID, err = r[t.pkHandleCol.Offset].ToInt64(ctx.GetSessionVars().StmtCtx)
 		if err != nil {
 			return 0, errors.Trace(err)
 		}
@@ -228,11 +229,6 @@ func (t *MemoryTable) Row(ctx context.Context, h int64) ([]types.Datum, error) {
 	return r, nil
 }
 
-// LockRow implements table.Table LockRow interface.
-func (t *MemoryTable) LockRow(ctx context.Context, h int64, forRead bool) error {
-	return nil
-}
-
 // RemoveRecord implements table.Table RemoveRecord interface.
 func (t *MemoryTable) RemoveRecord(ctx context.Context, h int64, r []types.Datum) error {
 	t.mu.Lock()
@@ -244,6 +240,11 @@ func (t *MemoryTable) RemoveRecord(ctx context.Context, h int64, r []types.Datum
 // AllocAutoID implements table.Table AllocAutoID interface.
 func (t *MemoryTable) AllocAutoID() (int64, error) {
 	return t.alloc.Alloc(t.ID)
+}
+
+// Allocator implements table.Table Allocator interface.
+func (t *MemoryTable) Allocator() autoid.Allocator {
+	return t.alloc
 }
 
 // RebaseAutoID implements table.Table RebaseAutoID interface.

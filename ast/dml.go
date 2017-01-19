@@ -24,6 +24,7 @@ var (
 	_ DMLNode = &UpdateStmt{}
 	_ DMLNode = &SelectStmt{}
 	_ DMLNode = &ShowStmt{}
+	_ DMLNode = &LoadDataStmt{}
 
 	_ Node = &Assignment{}
 	_ Node = &ByItem{}
@@ -276,6 +277,10 @@ type SelectField struct {
 	Expr ExprNode
 	// Alias name for Expr.
 	AsName model.CIStr
+	// Auxiliary stands for if this field is auxiliary.
+	// When we add a Field into SelectField list which is used for having/orderby clause but the field is not in select clause,
+	// we should set its Auxiliary to true. Then the TrimExec will trim the field.
+	Auxiliary bool
 }
 
 // Accept implements Node Accept interface.
@@ -433,7 +438,7 @@ func (n *OrderByClause) Accept(v Visitor) (Node, bool) {
 }
 
 // SelectStmt represents the select query node.
-// See: https://dev.mysql.com/doc/refman/5.7/en/select.html
+// See https://dev.mysql.com/doc/refman/5.7/en/select.html
 type SelectStmt struct {
 	dmlNode
 	resultSetNode
@@ -550,7 +555,7 @@ func (n *UnionSelectList) Accept(v Visitor) (Node, bool) {
 }
 
 // UnionStmt represents "union statement"
-// See: https://dev.mysql.com/doc/refman/5.7/en/union.html
+// See https://dev.mysql.com/doc/refman/5.7/en/union.html
 type UnionStmt struct {
 	dmlNode
 	resultSetNode
@@ -622,7 +627,7 @@ func (n *Assignment) Accept(v Visitor) (Node, bool) {
 }
 
 // Priority const values.
-// See: https://dev.mysql.com/doc/refman/5.7/en/insert.html
+// See https://dev.mysql.com/doc/refman/5.7/en/insert.html
 const (
 	NoPriority = iota
 	LowPriority
@@ -630,12 +635,55 @@ const (
 	DelayedPriority
 )
 
+// LoadDataStmt is a statement to load data from a specified file, then insert this rows into an existing table.
+// See https://dev.mysql.com/doc/refman/5.7/en/load-data.html
+type LoadDataStmt struct {
+	dmlNode
+
+	IsLocal    bool
+	Path       string
+	Table      *TableName
+	FieldsInfo *FieldsClause
+	LinesInfo  *LinesClause
+}
+
+// Accept implements Node Accept interface.
+func (n *LoadDataStmt) Accept(v Visitor) (Node, bool) {
+	newNode, skipChildren := v.Enter(n)
+	if skipChildren {
+		return v.Leave(newNode)
+	}
+	n = newNode.(*LoadDataStmt)
+	if n.Table != nil {
+		node, ok := n.Table.Accept(v)
+		if !ok {
+			return n, false
+		}
+		n.Table = node.(*TableName)
+	}
+	return v.Leave(n)
+}
+
+// FieldsClause represents fields references clause in load data statement.
+type FieldsClause struct {
+	Terminated string
+	Enclosed   byte
+	Escaped    byte
+}
+
+// LinesClause represents lines references clause in load data statement.
+type LinesClause struct {
+	Starting   string
+	Terminated string
+}
+
 // InsertStmt is a statement to insert new rows into an existing table.
-// See: https://dev.mysql.com/doc/refman/5.7/en/insert.html
+// See https://dev.mysql.com/doc/refman/5.7/en/insert.html
 type InsertStmt struct {
 	dmlNode
 
 	IsReplace   bool
+	Ignore      bool
 	Table       *TableRefsClause
 	Columns     []*ColumnName
 	Lists       [][]ExprNode
@@ -701,7 +749,7 @@ func (n *InsertStmt) Accept(v Visitor) (Node, bool) {
 }
 
 // DeleteStmt is a statement to delete rows from table.
-// See: https://dev.mysql.com/doc/refman/5.7/en/delete.html
+// See https://dev.mysql.com/doc/refman/5.7/en/delete.html
 type DeleteStmt struct {
 	dmlNode
 
@@ -764,7 +812,7 @@ func (n *DeleteStmt) Accept(v Visitor) (Node, bool) {
 }
 
 // UpdateStmt is a statement to update columns of existing rows in tables with new values.
-// See: https://dev.mysql.com/doc/refman/5.7/en/update.html
+// See https://dev.mysql.com/doc/refman/5.7/en/update.html
 type UpdateStmt struct {
 	dmlNode
 
@@ -825,8 +873,8 @@ func (n *UpdateStmt) Accept(v Visitor) (Node, bool) {
 type Limit struct {
 	node
 
-	Offset uint64
-	Count  uint64
+	Count  ExprNode
+	Offset ExprNode
 }
 
 // Accept implements Node Accept interface.
@@ -835,6 +883,21 @@ func (n *Limit) Accept(v Visitor) (Node, bool) {
 	if skipChildren {
 		return v.Leave(newNode)
 	}
+	if n.Count != nil {
+		node, ok := n.Count.Accept(v)
+		if !ok {
+			return n, false
+		}
+		n.Count = node.(ExprNode)
+	}
+	if n.Offset != nil {
+		node, ok := n.Offset.Accept(v)
+		if !ok {
+			return n, false
+		}
+		n.Offset = node.(ExprNode)
+	}
+
 	n = newNode.(*Limit)
 	return v.Leave(n)
 }
@@ -860,10 +923,13 @@ const (
 	ShowTriggers
 	ShowProcedureStatus
 	ShowIndex
+	ShowProcessList
+	ShowCreateDatabase
+	ShowEvents
 )
 
 // ShowStmt is a statement to provide information about databases, tables, columns and so on.
-// See: https://dev.mysql.com/doc/refman/5.7/en/show.html
+// See https://dev.mysql.com/doc/refman/5.7/en/show.html
 type ShowStmt struct {
 	dmlNode
 	resultSetNode
@@ -910,6 +976,14 @@ func (n *ShowStmt) Accept(v Visitor) (Node, bool) {
 		}
 		n.Pattern = node.(*PatternLikeExpr)
 	}
+
+	switch n.Tp {
+	case ShowTriggers, ShowProcedureStatus, ShowProcessList, ShowEvents:
+		// We don't have any data to return for those types,
+		// but visiting Where may cause resolving error, so return here to avoid error.
+		return v.Leave(n)
+	}
+
 	if n.Where != nil {
 		node, ok := n.Where.Accept(v)
 		if !ok {

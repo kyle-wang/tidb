@@ -14,20 +14,20 @@
 package domain
 
 import (
-	"sync/atomic"
 	"testing"
 	"time"
 
 	. "github.com/pingcap/check"
 	"github.com/pingcap/tidb/ast"
 	"github.com/pingcap/tidb/model"
-	"github.com/pingcap/tidb/sessionctx/variable"
 	"github.com/pingcap/tidb/store/localstore"
 	"github.com/pingcap/tidb/store/localstore/goleveldb"
 	"github.com/pingcap/tidb/util/mock"
+	"github.com/pingcap/tidb/util/testleak"
 )
 
 func TestT(t *testing.T) {
+	CustomVerboseFlag = true
 	TestingT(t)
 }
 
@@ -40,15 +40,15 @@ func (*testSuite) TestT(c *C) {
 	driver := localstore.Driver{Driver: goleveldb.MemoryDriver{}}
 	store, err := driver.Open("memory")
 	c.Assert(err, IsNil)
-	defer store.Close()
-
-	ctx := mock.NewContext()
-
-	dom, err := NewDomain(store, 0)
+	defer testleak.AfterTest(c)()
+	dom, err := NewDomain(store, 80*time.Millisecond)
 	c.Assert(err, IsNil)
 	store = dom.Store()
+	ctx := mock.NewContext()
+	ctx.Store = store
 	dd := dom.DDL()
 	c.Assert(dd, NotNil)
+	c.Assert(dd.GetLease(), Equals, 80*time.Millisecond)
 	cs := &ast.CharsetOpt{
 		Chs: "utf8",
 		Col: "utf8_bin",
@@ -57,22 +57,40 @@ func (*testSuite) TestT(c *C) {
 	c.Assert(err, IsNil)
 	is := dom.InfoSchema()
 	c.Assert(is, NotNil)
-	dom, err = NewDomain(store, 0)
+
+	// for setting lease
+	lease := 100 * time.Millisecond
+
+	// for schemaValidator
+	schemaVer := dom.SchemaValidator.Latest()
+	ver, err := store.CurrentVersion()
 	c.Assert(err, IsNil)
+	ts := ver.Ver
 
-	dom.SetLease(10 * time.Second)
+	succ := dom.SchemaValidator.Check(ts, schemaVer)
+	c.Assert(succ, IsTrue)
+	dom.MockReloadFailed.SetValue(true)
+	err = dom.Reload()
+	c.Assert(err, NotNil)
+	succ = dom.SchemaValidator.Check(ts, schemaVer)
+	c.Assert(succ, IsTrue)
+	time.Sleep(lease)
 
-	m, err := dom.Stats()
+	ver, err = store.CurrentVersion()
 	c.Assert(err, IsNil)
-	c.Assert(m[ddlLastReloadSchemaTS], GreaterEqual, int64(0))
+	ts = ver.Ver
+	succ = dom.SchemaValidator.Check(ts, schemaVer)
+	c.Assert(succ, IsFalse)
+	dom.MockReloadFailed.SetValue(false)
+	err = dom.Reload()
+	c.Assert(err, IsNil)
+	succ = dom.SchemaValidator.Check(ts, schemaVer)
+	c.Assert(succ, IsTrue)
+	ver, err = store.CurrentVersion()
+	c.Assert(err, IsNil)
+	succ = dom.SchemaValidator.Check(ver.Ver, schemaVer)
+	c.Assert(succ, IsTrue)
 
-	c.Assert(dom.GetScope("dummy_status"), Equals, variable.DefaultScopeFlag)
-
-	dom.SetLease(10 * time.Millisecond)
-	time.Sleep(20 * time.Millisecond)
-	atomic.StoreInt64(&dom.lastLeaseTS, 0)
-	dom.tryReload()
-
-	store.Close()
-	time.Sleep(1 * time.Second)
+	err = store.Close()
+	c.Assert(err, IsNil)
 }

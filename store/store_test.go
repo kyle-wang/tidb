@@ -44,6 +44,7 @@ const (
 )
 
 func TestT(t *testing.T) {
+	CustomVerboseFlag = true
 	TestingT(t)
 }
 
@@ -60,11 +61,11 @@ func (s *testKVSuite) SetUpSuite(c *C) {
 
 	cacheS, _ := tidb.NewStore(fmt.Sprintf("%s://%s", *testStore, *testStorePath))
 	c.Assert(cacheS, Equals, store)
-	log.SetLevelByString("warn")
+	logLevel := os.Getenv("log_level")
+	log.SetLevelByString(logLevel)
 }
 
 func (s *testKVSuite) TearDownSuite(c *C) {
-	log.SetLevelByString("debug")
 	err := s.s.Close()
 	c.Assert(err, IsNil)
 }
@@ -572,8 +573,6 @@ func (s *testKVSuite) TestDBClose(c *C) {
 
 	err = txn.Commit()
 	c.Assert(err, NotNil)
-
-	snap.Release()
 }
 
 func (s *testKVSuite) TestBoltDBDeadlock(c *C) {
@@ -670,17 +669,17 @@ func (s *testKVSuite) TestIsolationMultiInc(c *C) {
 		go func() {
 			defer wg.Done()
 			for j := 0; j < incCnt; j++ {
-				err1 := kv.RunInNewTxn(s.s, true, func(txn kv.Transaction) error {
+				err := kv.RunInNewTxn(s.s, true, func(txn kv.Transaction) error {
 					for _, key := range keys {
-						_, err2 := kv.IncInt64(txn, key, 1)
-						if err2 != nil {
-							return err2
+						_, err1 := kv.IncInt64(txn, key, 1)
+						if err1 != nil {
+							return err1
 						}
 					}
 
 					return nil
 				})
-				c.Assert(err1, IsNil)
+				c.Assert(err, IsNil)
 			}
 		}()
 	}

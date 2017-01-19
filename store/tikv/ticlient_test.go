@@ -19,14 +19,13 @@ import (
 	"time"
 
 	. "github.com/pingcap/check"
+	"github.com/pingcap/tidb/kv"
 	"github.com/pingcap/tidb/util/codec"
 )
 
 var (
-	withTiKV     = flag.Bool("with-tikv", false, "run tests with TiKV cluster started. (not use the mock server)")
-	etcdAddrs    = flag.String("etcd-addrs", "127.0.0.1:2379", "etcd addrs")
-	pdLeaderPath = flag.String("pd-path", "/pd", "PD leader path on etcd")
-	clusterID    = flag.Int("cluster", 1, "cluster ID")
+	withTiKV = flag.Bool("with-tikv", false, "run tests with TiKV cluster started. (not use the mock server)")
+	pdAddrs  = flag.String("pd-addrs", "127.0.0.1:2379", "pd addrs")
 )
 
 func newTestStore(c *C) *tikvStore {
@@ -36,11 +35,13 @@ func newTestStore(c *C) *tikvStore {
 
 	if *withTiKV {
 		var d Driver
-		store, err := d.Open(fmt.Sprintf("tikv://%s%s?cluster=%d", *etcdAddrs, *pdLeaderPath, *clusterID))
+		store, err := d.Open(fmt.Sprintf("tikv://%s", *pdAddrs))
 		c.Assert(err, IsNil)
 		return store.(*tikvStore)
 	}
-	return NewMockTikvStore().(*tikvStore)
+	store, err := NewMockTikvStore()
+	c.Assert(err, IsNil)
+	return store.(*tikvStore)
 }
 
 type testTiclientSuite struct {
@@ -129,31 +130,20 @@ func (s *testTiclientSuite) TestMultiKeys(c *C) {
 	c.Assert(err, IsNil)
 }
 
-func (s *testTiclientSuite) TestCleanLock(c *C) {
-	const keyNum = 10
-
-	txn := s.beginTxn(c)
-	for i := 0; i < keyNum; i++ {
-		err := txn.Set(encodeKey(s.prefix, s08d("key", i)), valueBytes(i))
-		c.Assert(err, IsNil)
-	}
-	txn.DONOTCOMMIT = true
-	err := txn.Commit()
-	c.Assert(err, IsNil)
-
-	txn2 := s.beginTxn(c)
-	for i := 0; i < keyNum; i++ {
-		err2 := txn2.Set(encodeKey(s.prefix, s08d("key", i)), valueBytes(i+1))
-		c.Assert(err2, IsNil)
-	}
-	err2 := txn2.Commit()
-	c.Assert(err2, IsNil)
-}
-
 func (s *testTiclientSuite) TestNotExist(c *C) {
 	txn := s.beginTxn(c)
 	_, err := txn.Get(encodeKey(s.prefix, "noSuchKey"))
 	c.Assert(err, NotNil)
+}
+
+func (s *testTiclientSuite) TestLargeRequest(c *C) {
+	largeValue := make([]byte, 5*1024*1024) // 5M value.
+	txn := s.beginTxn(c)
+	err := txn.Set([]byte("key"), largeValue)
+	c.Assert(err, IsNil)
+	err = txn.Commit()
+	c.Assert(err, NotNil)
+	c.Assert(kv.IsRetryableError(err), IsFalse)
 }
 
 func encodeKey(prefix, s string) []byte {

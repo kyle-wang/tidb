@@ -21,18 +21,19 @@ import (
 	"github.com/pingcap/tidb/context"
 	"github.com/pingcap/tidb/kv"
 	"github.com/pingcap/tidb/model"
-	"github.com/pingcap/tidb/mysql"
 	"github.com/pingcap/tidb/sessionctx"
 	"github.com/pingcap/tidb/store/localstore"
 	"github.com/pingcap/tidb/store/localstore/goleveldb"
 	"github.com/pingcap/tidb/table"
 	"github.com/pingcap/tidb/table/tables"
+	"github.com/pingcap/tidb/tablecodec"
 	"github.com/pingcap/tidb/util"
 	"github.com/pingcap/tidb/util/testleak"
 	"github.com/pingcap/tidb/util/types"
 )
 
 func TestT(t *testing.T) {
+	CustomVerboseFlag = true
 	TestingT(t)
 }
 
@@ -56,6 +57,7 @@ func (ts *testSuite) TestBasic(c *C) {
 	_, err := ts.se.Execute("CREATE TABLE test.t (a int primary key auto_increment, b varchar(255) unique)")
 	c.Assert(err, IsNil)
 	ctx := ts.se.(context.Context)
+	c.Assert(ctx.NewTxn(), IsNil)
 	dom := sessionctx.GetDomain(ctx)
 	tb, err := dom.InfoSchema().TableByName(model.NewCIStr("test"), model.NewCIStr("t"))
 	c.Assert(err, IsNil)
@@ -92,8 +94,8 @@ func (ts *testSuite) TestBasic(c *C) {
 	})
 
 	indexCnt := func() int {
-		cnt, err2 := countEntriesWithPrefix(ctx, tb.IndexPrefix())
-		c.Assert(err2, IsNil)
+		cnt, err1 := countEntriesWithPrefix(ctx, tb.IndexPrefix())
+		c.Assert(err1, IsNil)
 		return cnt
 	}
 
@@ -116,21 +118,13 @@ func (ts *testSuite) TestBasic(c *C) {
 	_, err = tb.AddRecord(ctx, types.MakeDatums(1, "abc"))
 	c.Assert(err, IsNil)
 	c.Assert(indexCnt(), Greater, 0)
-	// Make sure index data is also removed after tb.Truncate().
-	c.Assert(tb.Truncate(ctx), IsNil)
-	c.Assert(indexCnt(), Equals, 0)
-
 	_, err = ts.se.Execute("drop table test.t")
 	c.Assert(err, IsNil)
 }
 
 func countEntriesWithPrefix(ctx context.Context, prefix []byte) (int, error) {
-	txn, err := ctx.GetTxn(false)
-	if err != nil {
-		return 0, err
-	}
 	cnt := 0
-	err = util.ScanMetaWithPrefix(txn, prefix, func(k kv.Key, v []byte) bool {
+	err := util.ScanMetaWithPrefix(ctx.Txn(), prefix, func(k kv.Key, v []byte) bool {
 		cnt++
 		return true
 	})
@@ -138,7 +132,7 @@ func countEntriesWithPrefix(ctx context.Context, prefix []byte) (int, error) {
 }
 
 func (ts *testSuite) TestTypes(c *C) {
-	_, err := ts.se.Execute("CREATE TABLE test.t (c1 tinyint, c2 smallint, c3 int, c4 bigint, c5 text, c6 blob, c7 varchar(64), c8 time, c9 timestamp not null default CURRENT_TIMESTAMP, c10 decimal)")
+	_, err := ts.se.Execute("CREATE TABLE test.t (c1 tinyint, c2 smallint, c3 int, c4 bigint, c5 text, c6 blob, c7 varchar(64), c8 time, c9 timestamp not null default CURRENT_TIMESTAMP, c10 decimal(10,1))")
 	c.Assert(err, IsNil)
 	ctx := ts.se.(context.Context)
 	dom := sessionctx.GetDomain(ctx)
@@ -163,7 +157,7 @@ func (ts *testSuite) TestTypes(c *C) {
 	row, err = rs[0].Next()
 	c.Assert(err, IsNil)
 	c.Assert(row.Data, NotNil)
-	c.Assert(row.Data[5].GetMysqlBit(), Equals, mysql.Bit{Value: 6, Width: 8})
+	c.Assert(row.Data[5].GetMysqlBit(), Equals, types.Bit{Value: 6, Width: 8})
 	_, err = ts.se.Execute("drop table test.t")
 	c.Assert(err, IsNil)
 
@@ -200,11 +194,12 @@ func (ts *testSuite) TestUniqueIndexMultipleNullEntries(c *C) {
 	autoid, err := tb.AllocAutoID()
 	c.Assert(err, IsNil)
 	c.Assert(autoid, Greater, int64(0))
-
+	c.Assert(ctx.NewTxn(), IsNil)
 	_, err = tb.AddRecord(ctx, types.MakeDatums(1, nil))
 	c.Assert(err, IsNil)
 	_, err = tb.AddRecord(ctx, types.MakeDatums(2, nil))
 	c.Assert(err, IsNil)
+	c.Assert(ctx.Txn().Rollback(), IsNil)
 	_, err = ts.se.Execute("drop table test.t")
 	c.Assert(err, IsNil)
 }
@@ -222,14 +217,13 @@ func (ts *testSuite) TestRowKeyCodec(c *C) {
 	}
 
 	for _, t := range table {
-		b := tables.EncodeRecordKey(t.tableID, t.h, t.ID)
-		tableID, handle, columnID, err := tables.DecodeRecordKey(b)
+		b := tablecodec.EncodeRowKeyWithHandle(t.tableID, t.h)
+		tableID, handle, err := tablecodec.DecodeRecordKey(b)
 		c.Assert(err, IsNil)
 		c.Assert(tableID, Equals, t.tableID)
 		c.Assert(handle, Equals, t.h)
-		c.Assert(columnID, Equals, t.ID)
 
-		handle, err = tables.DecodeRecordKeyHandle(b)
+		handle, err = tablecodec.DecodeRowKey(b)
 		c.Assert(err, IsNil)
 		c.Assert(handle, Equals, t.h)
 	}
@@ -243,11 +237,10 @@ func (ts *testSuite) TestRowKeyCodec(c *C) {
 		"t12345678_i",
 		"t12345678_r1",
 		"t12345678_r1234567",
-		"t12345678_r123456781",
 	}
 
 	for _, t := range tbl {
-		_, err := tables.DecodeRecordKeyHandle(kv.Key(t))
+		_, err := tablecodec.DecodeRowKey(kv.Key(t))
 		c.Assert(err, NotNil)
 	}
 }
@@ -260,11 +253,34 @@ func (ts *testSuite) TestUnsignedPK(c *C) {
 	dom := sessionctx.GetDomain(ctx)
 	tb, err := dom.InfoSchema().TableByName(model.NewCIStr("test"), model.NewCIStr("tPK"))
 	c.Assert(err, IsNil)
-
+	c.Assert(ctx.NewTxn(), IsNil)
 	rid, err := tb.AddRecord(ctx, types.MakeDatums(1, "abc"))
 	c.Assert(err, IsNil)
 	row, err := tb.Row(ctx, rid)
 	c.Assert(err, IsNil)
 	c.Assert(len(row), Equals, 2)
 	c.Assert(row[0].Kind(), Equals, types.KindUint64)
+	c.Assert(ctx.Txn().Commit(), IsNil)
+}
+
+func (ts *testSuite) TestIterRecords(c *C) {
+	defer testleak.AfterTest(c)()
+	_, err := ts.se.Execute("CREATE TABLE test.tIter (a int primary key, b int)")
+	c.Assert(err, IsNil)
+	_, err = ts.se.Execute("INSERT test.tIter VALUES (1, 2), (2, NULL)")
+	c.Assert(err, IsNil)
+	ctx := ts.se.(context.Context)
+	c.Assert(ctx.NewTxn(), IsNil)
+	dom := sessionctx.GetDomain(ctx)
+	tb, err := dom.InfoSchema().TableByName(model.NewCIStr("test"), model.NewCIStr("tIter"))
+	c.Assert(err, IsNil)
+	totalCount := 0
+	err = tb.IterRecords(ctx, tb.FirstKey(), tb.Cols(), func(h int64, rec []types.Datum, cols []*table.Column) (bool, error) {
+		totalCount++
+		c.Assert(rec[0].IsNull(), IsFalse)
+		return true, nil
+	})
+	c.Assert(err, IsNil)
+	c.Assert(totalCount, Equals, 2)
+	c.Assert(ctx.Txn().Commit(), IsNil)
 }

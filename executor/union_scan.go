@@ -17,9 +17,7 @@ import (
 	"sort"
 
 	"github.com/juju/errors"
-	"github.com/pingcap/tidb/ast"
 	"github.com/pingcap/tidb/context"
-	"github.com/pingcap/tidb/evaluator"
 	"github.com/pingcap/tidb/expression"
 	"github.com/pingcap/tidb/model"
 	"github.com/pingcap/tidb/table"
@@ -74,21 +72,12 @@ type dirtyTable struct {
 	truncated   bool
 }
 
-type dirtyDBKeyType int
-
-func (u dirtyDBKeyType) String() string {
-	return "dirtyDBKeyType"
-}
-
-// DirtyDBKey is the key to *dirtyDB for a context.
-const DirtyDBKey dirtyDBKeyType = 1
-
 func getDirtyDB(ctx context.Context) *dirtyDB {
 	var udb *dirtyDB
-	x := ctx.Value(DirtyDBKey)
+	x := ctx.GetSessionVars().TxnCtx.DirtyDB
 	if x == nil {
 		udb = &dirtyDB{tables: make(map[int64]*dirtyTable)}
-		ctx.SetValue(DirtyDBKey, udb)
+		ctx.GetSessionVars().TxnCtx.DirtyDB = udb
 	} else {
 		udb = x.(*dirtyDB)
 	}
@@ -100,26 +89,21 @@ type UnionScanExec struct {
 	ctx   context.Context
 	Src   Executor
 	dirty *dirtyTable
-	// srcUsedIndex is the column offsets of the index which Src executor has used.
+	// usedIndex is the column offsets of the index which Src executor has used.
 	usedIndex []int
 	desc      bool
-	condition ast.ExprNode
+	condition expression.Expression
 
 	addedRows   []*Row
 	cursor      int
 	sortErr     error
 	snapshotRow *Row
+	schema      expression.Schema
 }
 
-// Schema implements Executor Schema interface.
+// Schema implements the Executor Schema interface.
 func (us *UnionScanExec) Schema() expression.Schema {
-	return nil
-
-}
-
-// Fields implements Executor Fields interface.
-func (us *UnionScanExec) Fields() []*ast.ResultField {
-	return us.Src.Fields()
+	return us.schema
 }
 
 // Next implements Execution Next interface.
@@ -148,9 +132,6 @@ func (us *UnionScanExec) Next() (*Row, error) {
 			us.snapshotRow = nil
 		} else {
 			us.cursor++
-		}
-		for i, field := range us.Src.Fields() {
-			field.Expr.SetDatum(row.Data[i])
 		}
 		return row, nil
 	}
@@ -219,16 +200,17 @@ func (us *UnionScanExec) pickRow(a, b *Row) (*Row, error) {
 	return row, nil
 }
 
-// Close implements Executor Close interface.
+// Close implements the Executor Close interface.
 func (us *UnionScanExec) Close() error {
 	return us.Src.Close()
 }
 
 func (us *UnionScanExec) compare(a, b *Row) (int, error) {
+	sc := us.ctx.GetSessionVars().StmtCtx
 	for _, colOff := range us.usedIndex {
 		aColumn := a.Data[colOff]
 		bColumn := b.Data[colOff]
-		cmp, err := aColumn.CompareDatum(bColumn)
+		cmp, err := aColumn.CompareDatum(sc, bColumn)
 		if err != nil {
 			return 0, errors.Trace(err)
 		}
@@ -252,11 +234,23 @@ func (us *UnionScanExec) compare(a, b *Row) (int, error) {
 func (us *UnionScanExec) buildAndSortAddedRows(t table.Table, asName *model.CIStr) error {
 	us.addedRows = make([]*Row, 0, len(us.dirty.addedRows))
 	for h, data := range us.dirty.addedRows {
-		for i, field := range us.Src.Fields() {
-			field.Expr.SetDatum(data[i])
+		var newData []types.Datum
+		if us.Src.Schema().Len() == len(data) {
+			newData = data
+		} else {
+			newData = make([]types.Datum, 0, us.Src.Schema().Len())
+			var columns []*model.ColumnInfo
+			if t, ok := us.Src.(*XSelectTableExec); ok {
+				columns = t.Columns
+			} else {
+				columns = us.Src.(*XSelectIndexExec).indexPlan.Columns
+			}
+			for _, col := range columns {
+				newData = append(newData, data[col.Offset])
+			}
 		}
 		if us.condition != nil {
-			matched, err := evaluator.EvalBool(us.ctx, us.condition)
+			matched, err := expression.EvalBool(us.condition, newData, us.ctx)
 			if err != nil {
 				return errors.Trace(err)
 			}
@@ -265,7 +259,7 @@ func (us *UnionScanExec) buildAndSortAddedRows(t table.Table, asName *model.CISt
 			}
 		}
 		rowKeyEntry := &RowKeyEntry{Handle: h, Tbl: t, TableAsName: asName}
-		row := &Row{Data: data, RowKeys: []*RowKeyEntry{rowKeyEntry}}
+		row := &Row{Data: newData, RowKeys: []*RowKeyEntry{rowKeyEntry}}
 		us.addedRows = append(us.addedRows, row)
 	}
 	if us.desc {

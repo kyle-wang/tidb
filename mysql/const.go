@@ -15,9 +15,11 @@ package mysql
 
 // Version informations.
 const (
-	MinProtocolVersion byte   = 10
-	MaxPayloadLen      int    = 1<<24 - 1
-	ServerVersion      string = "5.5.31-TiDB-1.0"
+	MinProtocolVersion byte = 10
+	MaxPayloadLen      int  = 1<<24 - 1
+	// The version number should be three digits.
+	// See https://dev.mysql.com/doc/refman/5.7/en/which-version.html
+	ServerVersion string = "5.7.1-TiDB-1.0"
 )
 
 // Header informations.
@@ -42,6 +44,13 @@ const (
 	ServerStatusMetadataChanged    uint16 = 0x0400
 	ServerStatusWasSlow            uint16 = 0x0800
 	ServerPSOutParams              uint16 = 0x1000
+)
+
+// Identifier length limitations.
+const (
+	MaxTableNameLength    int = 64
+	MaxDatabaseNameLength int = 64
+	MaxColumnNameLength   int = 64
 )
 
 // Command informations.
@@ -259,3 +268,39 @@ var AllColumnPrivs = []PrivilegeType{SelectPriv, InsertPriv, UpdatePriv}
 
 // AllPrivilegeLiteral is the string literal for All Privilege.
 const AllPrivilegeLiteral = "ALL PRIVILEGES"
+
+// DefaultLengthOfMysqlTypes is the map for default physical length of MySQL data types.
+// See http://dev.mysql.com/doc/refman/5.7/en/storage-requirements.html
+var DefaultLengthOfMysqlTypes = map[byte]int{
+	TypeYear:      1,
+	TypeDate:      3,
+	TypeDuration:  3,
+	TypeDatetime:  8,
+	TypeTimestamp: 4,
+
+	TypeTiny:     1,
+	TypeShort:    2,
+	TypeInt24:    3,
+	TypeLong:     4,
+	TypeLonglong: 8,
+	TypeFloat:    4,
+	TypeDouble:   8,
+
+	TypeEnum:   2,
+	TypeString: 1,
+	TypeSet:    8,
+}
+
+// DefaultLengthOfTimeFraction is the map for default physical length of time fractions.
+var DefaultLengthOfTimeFraction = map[int]int{
+	0: 0,
+
+	1: 1,
+	2: 1,
+
+	3: 2,
+	4: 2,
+
+	5: 3,
+	6: 3,
+}

@@ -16,7 +16,6 @@ package variable
 import (
 	"strings"
 
-	"github.com/pingcap/tidb/context"
 	"github.com/pingcap/tidb/mysql"
 	"github.com/pingcap/tidb/terror"
 )
@@ -58,12 +57,16 @@ func GetSysVar(name string) *SysVar {
 const (
 	CodeUnknownStatusVar terror.ErrCode = 1
 	CodeUnknownSystemVar terror.ErrCode = 1193
+	CodeIncorrectScope   terror.ErrCode = 1238
 )
+
+var tidbSysVars map[string]bool
 
 // Variable errors
 var (
-	UnknownStatusVar = terror.ClassVariable.New(CodeUnknownStatusVar, "unknown status variable")
-	UnknownSystemVar = terror.ClassVariable.New(CodeUnknownSystemVar, "unknown system variable")
+	UnknownStatusVar  = terror.ClassVariable.New(CodeUnknownStatusVar, "unknown status variable")
+	UnknownSystemVar  = terror.ClassVariable.New(CodeUnknownSystemVar, "unknown system variable '%s'")
+	ErrIncorrectScope = terror.ClassVariable.New(CodeIncorrectScope, "Incorrect variable scope")
 )
 
 func init() {
@@ -75,8 +78,16 @@ func init() {
 	// Register terror to mysql error map.
 	mySQLErrCodes := map[terror.ErrCode]uint16{
 		CodeUnknownSystemVar: mysql.ErrUnknownSystemVariable,
+		CodeIncorrectScope:   mysql.ErrIncorrectGlobalLocalVar,
 	}
 	terror.ErrClassToMySQLCodes[terror.ClassVariable] = mySQLErrCodes
+
+	tidbSysVars = make(map[string]bool)
+	tidbSysVars[DistSQLScanConcurrencyVar] = true
+	tidbSysVars[DistSQLJoinConcurrencyVar] = true
+	tidbSysVars[TiDBSnapshot] = true
+	tidbSysVars[TiDBSkipConstraintCheck] = true
+	tidbSysVars[TiDBSkipDDLWait] = true
 }
 
 // we only support MySQL now
@@ -121,7 +132,7 @@ var defaultSysVars = []*SysVar{
 	{ScopeNone, "skip_name_resolve", "OFF"},
 	{ScopeNone, "performance_schema_max_file_handles", "32768"},
 	{ScopeSession, "transaction_allow_batching", ""},
-	{ScopeGlobal | ScopeSession, "sql_mode", "STRICT_TRANS_TABLES,NO_ENGINE_SUBSTITUTION"},
+	{ScopeGlobal | ScopeSession, SQLModeVar, "STRICT_TRANS_TABLES,NO_ENGINE_SUBSTITUTION"},
 	{ScopeNone, "performance_schema_max_statement_classes", "168"},
 	{ScopeGlobal, "server_id", "0"},
 	{ScopeGlobal, "innodb_flushing_avg_loops", "30"},
@@ -357,7 +368,7 @@ var defaultSysVars = []*SysVar{
 	{ScopeGlobal | ScopeSession, "binlog_direct_non_transactional_updates", "OFF"},
 	{ScopeGlobal, "innodb_change_buffering", "all"},
 	{ScopeGlobal | ScopeSession, "sql_big_selects", "ON"},
-	{ScopeGlobal | ScopeSession, "character_set_results", "latin1"},
+	{ScopeGlobal | ScopeSession, CharacterSetResults, "latin1"},
 	{ScopeGlobal, "innodb_max_purge_lag_delay", "0"},
 	{ScopeGlobal | ScopeSession, "session_track_schema", ""},
 	{ScopeGlobal, "innodb_io_capacity_max", "2000"},
@@ -472,7 +483,7 @@ var defaultSysVars = []*SysVar{
 	{ScopeNone, "explicit_defaults_for_timestamp", "OFF"},
 	{ScopeNone, "performance_schema_events_waits_history_size", "10"},
 	{ScopeGlobal, "log_syslog_tag", ""},
-	{ScopeGlobal | ScopeSession, "tx_read_only", "OFF"},
+	{ScopeGlobal | ScopeSession, "tx_read_only", "0"},
 	{ScopeGlobal, "rpl_semi_sync_master_wait_point", ""},
 	{ScopeGlobal, "innodb_undo_log_truncate", ""},
 	{ScopeNone, "simplified_binlog_gtid_recovery", "OFF"},
@@ -553,7 +564,7 @@ var defaultSysVars = []*SysVar{
 	{ScopeGlobal | ScopeSession, "ndbinfo_show_hidden", ""},
 	{ScopeGlobal | ScopeSession, "net_read_timeout", "30"},
 	{ScopeNone, "innodb_page_size", "16384"},
-	{ScopeGlobal, "max_allowed_packet", "4194304"},
+	{ScopeGlobal, MaxAllowedPacket, "4194304"},
 	{ScopeNone, "innodb_log_file_size", "50331648"},
 	{ScopeGlobal, "sync_relay_log_info", "10000"},
 	{ScopeGlobal | ScopeSession, "optimizer_trace_limit", "1"},
@@ -580,7 +591,21 @@ var defaultSysVars = []*SysVar{
 	{ScopeGlobal | ScopeSession, "min_examined_row_limit", "0"},
 	{ScopeGlobal, "sync_frm", "ON"},
 	{ScopeGlobal, "innodb_online_alter_log_max_size", "134217728"},
+	{ScopeSession, TiDBSnapshot, ""},
+	{ScopeGlobal | ScopeSession, DistSQLScanConcurrencyVar, "10"},
+	{ScopeGlobal | ScopeSession, DistSQLJoinConcurrencyVar, "5"},
+	{ScopeSession, TiDBSkipConstraintCheck, "0"},
+	{ScopeSession, TiDBSkipDDLWait, "0"},
 }
+
+// TiDB system variables
+const (
+	TiDBSnapshot              = "tidb_snapshot"
+	DistSQLScanConcurrencyVar = "tidb_distsql_scan_concurrency"
+	DistSQLJoinConcurrencyVar = "tidb_distsql_join_concurrency"
+	TiDBSkipConstraintCheck   = "tidb_skip_constraint_check"
+	TiDBSkipDDLWait           = "tidb_skip_ddl_wait"
+)
 
 // SetNamesVariables is the system variable names related to set names statements.
 var SetNamesVariables = []string{
@@ -592,7 +617,7 @@ var SetNamesVariables = []string{
 const (
 	// CollationConnection is the name for collation_connection system variable.
 	CollationConnection = "collation_connection"
-	// CharsetDatabase is the name for charactor_set_database system variable.
+	// CharsetDatabase is the name for character_set_database system variable.
 	CharsetDatabase = "character_set_database"
 	// CollationDatabase is the name for collation_database system variable.
 	CollationDatabase = "collation_database"
@@ -601,31 +626,7 @@ const (
 // GlobalVarAccessor is the interface for accessing global scope system and status variables.
 type GlobalVarAccessor interface {
 	// GetGlobalSysVar gets the global system variable value for name.
-	GetGlobalSysVar(ctx context.Context, name string) (string, error)
+	GetGlobalSysVar(name string) (string, error)
 	// SetGlobalSysVar sets the global system variable name to value.
-	SetGlobalSysVar(ctx context.Context, name string, value string) error
-}
-
-// globalSysVarAccessorKeyType is a dummy type to avoid naming collision in context.
-type globalSysVarAccessorKeyType int
-
-// String defines a Stringer function for debugging and pretty printing.
-func (k globalSysVarAccessorKeyType) String() string {
-	return "global_sysvar_accessor"
-}
-
-const accessorKey globalSysVarAccessorKeyType = 0
-
-// BindGlobalVarAccessor binds global var accessor to context.
-func BindGlobalVarAccessor(ctx context.Context, accessor GlobalVarAccessor) {
-	ctx.SetValue(accessorKey, accessor)
-}
-
-// GetGlobalVarAccessor gets accessor from ctx.
-func GetGlobalVarAccessor(ctx context.Context) GlobalVarAccessor {
-	v, ok := ctx.Value(accessorKey).(GlobalVarAccessor)
-	if !ok {
-		panic("Miss global sysvar accessor")
-	}
-	return v
+	SetGlobalSysVar(name string, value string) error
 }

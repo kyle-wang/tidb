@@ -23,26 +23,17 @@ import (
 	"github.com/juju/errors"
 	"github.com/ngaut/log"
 	"github.com/pingcap/tidb/context"
-	"github.com/pingcap/tidb/evaluator"
+	"github.com/pingcap/tidb/expression"
 	"github.com/pingcap/tidb/model"
 	"github.com/pingcap/tidb/mysql"
-	"github.com/pingcap/tidb/sessionctx/variable"
 	"github.com/pingcap/tidb/util/types"
 )
 
 // Column provides meta data describing a table column.
-type Column struct {
-	model.ColumnInfo
-}
+type Column model.ColumnInfo
 
 // PrimaryKeyName defines primary key name.
 const PrimaryKeyName = "PRIMARY"
-
-// IndexedColumn defines an index with info.
-type IndexedColumn struct {
-	model.IndexInfo
-	X Index
-}
 
 // String implements fmt.Stringer interface.
 func (c *Column) String() string {
@@ -56,6 +47,11 @@ func (c *Column) String() string {
 	return strings.Join(ans, " ")
 }
 
+// ToInfo casts Column to model.ColumnInfo
+func (c *Column) ToInfo() *model.ColumnInfo {
+	return (*model.ColumnInfo)(c)
+}
+
 // FindCol finds column in cols by name.
 func FindCol(cols []*Column, name string) *Column {
 	for _, col := range cols {
@@ -64,6 +60,11 @@ func FindCol(cols []*Column, name string) *Column {
 		}
 	}
 	return nil
+}
+
+// ToColumn converts a *model.ColumnInfo to *Column.
+func ToColumn(col *model.ColumnInfo) *Column {
+	return (*Column)(col)
 }
 
 // FindCols finds columns in cols by names.
@@ -94,12 +95,16 @@ func FindOnUpdateCols(cols []*Column) []*Column {
 }
 
 // CastValues casts values based on columns type.
-func CastValues(ctx context.Context, rec []types.Datum, cols []*Column) (err error) {
+func CastValues(ctx context.Context, rec []types.Datum, cols []*Column, ignoreErr bool) (err error) {
 	for _, c := range cols {
 		var converted types.Datum
-		converted, err = CastValue(ctx, rec[c.Offset], c)
+		converted, err = CastValue(ctx, rec[c.Offset], c.ToInfo())
 		if err != nil {
-			return errors.Trace(err)
+			if ignoreErr {
+				log.Warnf("cast values failed:%v", err)
+			} else {
+				return errors.Trace(err)
+			}
 		}
 		rec[c.Offset] = converted
 	}
@@ -107,10 +112,10 @@ func CastValues(ctx context.Context, rec []types.Datum, cols []*Column) (err err
 }
 
 // CastValue casts a value based on column type.
-func CastValue(ctx context.Context, val types.Datum, col *Column) (casted types.Datum, err error) {
-	casted, err = val.ConvertTo(&col.FieldType)
+func CastValue(ctx context.Context, val types.Datum, col *model.ColumnInfo) (casted types.Datum, err error) {
+	casted, err = val.ConvertTo(ctx.GetSessionVars().StmtCtx, &col.FieldType)
 	if err != nil {
-		if variable.GetSessionVars(ctx).StrictSQLMode {
+		if ctx.GetSessionVars().StrictSQLMode {
 			return casted, errors.Trace(err)
 		}
 		// TODO: add warnings.
@@ -234,28 +239,16 @@ func CheckNotNull(cols []*Column, row []types.Datum) error {
 	return nil
 }
 
-// FetchValues fetches indexed values from a row.
-func (idx *IndexedColumn) FetchValues(r []types.Datum) ([]types.Datum, error) {
-	vals := make([]types.Datum, len(idx.Columns))
-	for i, ic := range idx.Columns {
-		if ic.Offset < 0 || ic.Offset > len(r) {
-			return nil, errIndexOutBound.Gen("Index column offset out of bound")
-		}
-		vals[i] = r[ic.Offset]
-	}
-	return vals, nil
-}
-
 // GetColDefaultValue gets default value of the column.
 func GetColDefaultValue(ctx context.Context, col *model.ColumnInfo) (types.Datum, bool, error) {
 	// Check no default value flag.
 	if mysql.HasNoDefaultValueFlag(col.Flag) && col.Tp != mysql.TypeEnum {
 		err := errNoDefaultValue.Gen("Field '%s' doesn't have a default value", col.Name)
 		if ctx != nil {
-			sessVars := variable.GetSessionVars(ctx)
+			sessVars := ctx.GetSessionVars()
 			if !sessVars.StrictSQLMode {
 				// TODO: add warning.
-				return getZeroValue(col), true, nil
+				return GetZeroValue(col), true, nil
 			}
 		}
 		return types.Datum{}, false, errors.Trace(err)
@@ -267,7 +260,7 @@ func GetColDefaultValue(ctx context.Context, col *model.ColumnInfo) (types.Datum
 			return types.Datum{}, true, nil
 		}
 
-		value, err := evaluator.GetTimeValue(ctx, col.DefaultValue, col.Tp, col.Decimal)
+		value, err := expression.GetTimeValue(ctx, col.DefaultValue, col.Tp, col.Decimal)
 		if err != nil {
 			return types.Datum{}, true, errGetDefaultFailed.Gen("Field '%s' get default value fail - %s",
 				col.Name, errors.Trace(err))
@@ -280,11 +273,15 @@ func GetColDefaultValue(ctx context.Context, col *model.ColumnInfo) (types.Datum
 			return types.NewDatum(col.FieldType.Elems[0]), true, nil
 		}
 	}
-
-	return types.NewDatum(col.DefaultValue), true, nil
+	value, err := CastValue(ctx, types.NewDatum(col.DefaultValue), col)
+	if err != nil {
+		return types.Datum{}, false, errors.Trace(err)
+	}
+	return value, true, nil
 }
 
-func getZeroValue(col *model.ColumnInfo) types.Datum {
+// GetZeroValue gets zero value for given column type.
+func GetZeroValue(col *model.ColumnInfo) types.Datum {
 	var d types.Datum
 	switch col.Tp {
 	case mysql.TypeTiny, mysql.TypeInt24, mysql.TypeShort, mysql.TypeLong, mysql.TypeLonglong, mysql.TypeYear:
@@ -298,23 +295,23 @@ func getZeroValue(col *model.ColumnInfo) types.Datum {
 	case mysql.TypeDouble:
 		d.SetFloat64(0)
 	case mysql.TypeNewDecimal:
-		d.SetMysqlDecimal(mysql.NewDecimalFromInt(0, 0))
+		d.SetMysqlDecimal(new(types.MyDecimal))
 	case mysql.TypeString, mysql.TypeVarString, mysql.TypeVarchar:
 		d.SetString("")
 	case mysql.TypeBlob, mysql.TypeTinyBlob, mysql.TypeMediumBlob, mysql.TypeLongBlob:
 		d.SetBytes([]byte{})
 	case mysql.TypeDuration:
-		d.SetMysqlDuration(mysql.ZeroDuration)
+		d.SetMysqlDuration(types.ZeroDuration)
 	case mysql.TypeDate, mysql.TypeNewDate:
-		d.SetMysqlTime(mysql.ZeroDate)
+		d.SetMysqlTime(types.ZeroDate)
 	case mysql.TypeTimestamp:
-		d.SetMysqlTime(mysql.ZeroTimestamp)
+		d.SetMysqlTime(types.ZeroTimestamp)
 	case mysql.TypeDatetime:
-		d.SetMysqlTime(mysql.ZeroDatetime)
+		d.SetMysqlTime(types.ZeroDatetime)
 	case mysql.TypeBit:
-		d.SetMysqlBit(mysql.Bit{Value: 0, Width: mysql.MinBitWidth})
+		d.SetMysqlBit(types.Bit{Value: 0, Width: types.MinBitWidth})
 	case mysql.TypeSet:
-		d.SetMysqlSet(mysql.Set{})
+		d.SetMysqlSet(types.Set{})
 	}
 	return d
 }

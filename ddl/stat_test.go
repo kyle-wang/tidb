@@ -39,27 +39,27 @@ func (s *testStatSuite) TestStat(c *C) {
 	store := testCreateStore(c, "test_stat")
 	defer store.Close()
 
-	lease := 50 * time.Millisecond
-
-	d := newDDL(store, nil, nil, lease)
+	d := newDDL(store, nil, nil, testLease)
 	defer d.close()
 
-	time.Sleep(lease)
+	time.Sleep(testLease)
 
 	dbInfo := testSchemaInfo(c, d, "test")
-	testCreateSchema(c, mock.NewContext(), d, dbInfo)
+	testCreateSchema(c, testNewContext(d), d, dbInfo)
 
 	m, err := d.Stats()
 	c.Assert(err, IsNil)
 	c.Assert(m[ddlOwnerID], Equals, d.uuid)
 
 	job := &model.Job{
-		SchemaID: dbInfo.ID,
-		Type:     model.ActionDropSchema,
-		Args:     []interface{}{dbInfo.Name},
+		SchemaID:   dbInfo.ID,
+		Type:       model.ActionDropSchema,
+		BinlogInfo: &model.HistoryInfo{},
+		Args:       []interface{}{dbInfo.Name},
 	}
 
 	ctx := mock.NewContext()
+	ctx.Store = store
 	done := make(chan error, 1)
 	go func() {
 		done <- d.doDDLJob(ctx, job)
