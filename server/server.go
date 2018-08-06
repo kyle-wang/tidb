@@ -29,7 +29,10 @@
 package server
 
 import (
-	"encoding/json"
+	"crypto/tls"
+	"crypto/x509"
+	"fmt"
+	"io/ioutil"
 	"math/rand"
 	"net"
 	"net/http"
@@ -39,13 +42,15 @@ import (
 	// For pprof
 	_ "net/http/pprof"
 
+	"github.com/blacktear23/go-proxyprotocol"
 	"github.com/juju/errors"
-	"github.com/ngaut/log"
+	"github.com/pingcap/tidb/config"
+	"github.com/pingcap/tidb/metrics"
 	"github.com/pingcap/tidb/mysql"
+	"github.com/pingcap/tidb/sessionctx/variable"
 	"github.com/pingcap/tidb/terror"
-	"github.com/pingcap/tidb/util/arena"
-	"github.com/pingcap/tidb/util/printer"
-	"github.com/prometheus/client_golang/prometheus"
+	"github.com/pingcap/tidb/util"
+	log "github.com/sirupsen/logrus"
 )
 
 var (
@@ -57,18 +62,34 @@ var (
 	errInvalidPayloadLen = terror.ClassServer.New(codeInvalidPayloadLen, "invalid payload length")
 	errInvalidSequence   = terror.ClassServer.New(codeInvalidSequence, "invalid sequence")
 	errInvalidType       = terror.ClassServer.New(codeInvalidType, "invalid type")
-	errNotAllowedCommand = terror.ClassServer.New(codeNotAllowedCommand,
-		"the used command is not allowed with this TiDB version")
+	errNotAllowedCommand = terror.ClassServer.New(codeNotAllowedCommand, "the used command is not allowed with this TiDB version")
+	errAccessDenied      = terror.ClassServer.New(codeAccessDenied, mysql.MySQLErrName[mysql.ErrAccessDenied])
 )
+
+// DefaultCapability is the capability of the server when it is created using the default configuration.
+// When server is configured with SSL, the server will have extra capabilities compared to DefaultCapability.
+const defaultCapability = mysql.ClientLongPassword | mysql.ClientLongFlag |
+	mysql.ClientConnectWithDB | mysql.ClientProtocol41 |
+	mysql.ClientTransactions | mysql.ClientSecureConnection | mysql.ClientFoundRows |
+	mysql.ClientMultiStatements | mysql.ClientMultiResults | mysql.ClientLocalFiles |
+	mysql.ClientConnectAtts | mysql.ClientPluginAuth
 
 // Server is the MySQL protocol server
 type Server struct {
-	cfg               *Config
+	cfg               *config.Config
+	tlsConfig         *tls.Config
 	driver            IDriver
 	listener          net.Listener
 	rwlock            *sync.RWMutex
 	concurrentLimiter *TokenLimiter
 	clients           map[uint32]*clientConn
+	capability        uint32
+
+	// stopListenerCh is used when a critical error occurred, we don't want to exit the process, because there may be
+	// a supervisor automatically restart it, then new client connection will be created, but we can't server it.
+	// So we just stop the listener and store to force clients to chose other TiDB servers.
+	stopListenerCh chan struct{}
+	statusServer   *http.Server
 }
 
 // ConnectionCount gets current connection count.
@@ -81,83 +102,142 @@ func (s *Server) ConnectionCount() int {
 }
 
 func (s *Server) getToken() *Token {
-	return s.concurrentLimiter.Get()
+	start := time.Now()
+	tok := s.concurrentLimiter.Get()
+	// Note that data smaller than one microsecond is ignored, because that case can be viewed as non-block.
+	metrics.GetTokenDurationHistogram.Observe(float64(time.Since(start).Nanoseconds() / 1e3))
+	return tok
 }
 
 func (s *Server) releaseToken(token *Token) {
 	s.concurrentLimiter.Put(token)
 }
 
-// Generate a random string using ASCII characters but avoid separator character.
-// See https://github.com/mysql/mysql-server/blob/5.7/mysys_ssl/crypt_genhash_impl.cc#L435
-func randomBuf(size int) []byte {
-	buf := make([]byte, size)
-	for i := 0; i < size; i++ {
-		buf[i] = byte(rand.Intn(127))
-		if buf[i] == 0 || buf[i] == byte('$') {
-			buf[i]++
-		}
-	}
-	return buf
-}
-
 // newConn creates a new *clientConn from a net.Conn.
 // It allocates a connection ID and random salt data for authentication.
 func (s *Server) newConn(conn net.Conn) *clientConn {
-	cc := &clientConn{
-		conn:         conn,
-		pkt:          newPacketIO(conn),
-		server:       s,
-		connectionID: atomic.AddUint32(&baseConnID, 1),
-		collation:    mysql.DefaultCollationID,
-		alloc:        arena.NewAllocator(32 * 1024),
+	cc := newClientConn(s)
+	if s.cfg.Performance.TCPKeepAlive {
+		if tcpConn, ok := conn.(*net.TCPConn); ok {
+			if err := tcpConn.SetKeepAlive(true); err != nil {
+				log.Error("failed to set tcp keep alive option:", err)
+			}
+		}
 	}
-	log.Infof("[%d] new connection %s", cc.connectionID, conn.RemoteAddr().String())
-	cc.salt = randomBuf(20)
+	cc.setConn(conn)
+	cc.salt = util.RandomBuf(20)
 	return cc
 }
 
 func (s *Server) skipAuth() bool {
-	return s.cfg.SkipAuth
+	return s.cfg.Socket != ""
 }
 
-const tokenLimit = 1000
-
 // NewServer creates a new Server.
-func NewServer(cfg *Config, driver IDriver) (*Server, error) {
+func NewServer(cfg *config.Config, driver IDriver) (*Server, error) {
 	s := &Server{
 		cfg:               cfg,
 		driver:            driver,
-		concurrentLimiter: NewTokenLimiter(tokenLimit),
+		concurrentLimiter: NewTokenLimiter(cfg.TokenLimit),
 		rwlock:            &sync.RWMutex{},
 		clients:           make(map[uint32]*clientConn),
+		stopListenerCh:    make(chan struct{}, 1),
+	}
+	s.loadTLSCertificates()
+
+	s.capability = defaultCapability
+	if s.tlsConfig != nil {
+		s.capability |= mysql.ClientSSL
 	}
 
 	var err error
 	if cfg.Socket != "" {
-		cfg.SkipAuth = true
-		s.listener, err = net.Listen("unix", cfg.Socket)
+		if s.listener, err = net.Listen("unix", cfg.Socket); err == nil {
+			log.Infof("Server is running MySQL Protocol through Socket [%s]", cfg.Socket)
+		}
 	} else {
-		s.listener, err = net.Listen("tcp", s.cfg.Addr)
+		addr := fmt.Sprintf("%s:%d", s.cfg.Host, s.cfg.Port)
+		if s.listener, err = net.Listen("tcp", addr); err == nil {
+			log.Infof("Server is running MySQL Protocol at [%s]", addr)
+		}
 	}
+
+	if cfg.ProxyProtocol.Networks != "" {
+		pplistener, errProxy := proxyprotocol.NewListener(s.listener, cfg.ProxyProtocol.Networks,
+			int(cfg.ProxyProtocol.HeaderTimeout))
+		if errProxy != nil {
+			log.Error("ProxyProtocol Networks parameter invalid")
+			return nil, errors.Trace(errProxy)
+		}
+		log.Infof("Server is running MySQL Protocol (through PROXY Protocol) at [%s]", s.cfg.Host)
+		s.listener = pplistener
+	}
+
 	if err != nil {
 		return nil, errors.Trace(err)
 	}
 
 	// Init rand seed for randomBuf()
 	rand.Seed(time.Now().UTC().UnixNano())
-	log.Infof("Server run MySQL Protocol Listen at [%s]", s.cfg.Addr)
 	return s, nil
+}
+
+func (s *Server) loadTLSCertificates() {
+	defer func() {
+		if s.tlsConfig != nil {
+			log.Infof("Secure connection is enabled (client verification enabled = %v)", len(variable.SysVars["ssl_ca"].Value) > 0)
+			variable.SysVars["have_openssl"].Value = "YES"
+			variable.SysVars["have_ssl"].Value = "YES"
+			variable.SysVars["ssl_cert"].Value = s.cfg.Security.SSLCert
+			variable.SysVars["ssl_key"].Value = s.cfg.Security.SSLKey
+		} else {
+			log.Warn("Secure connection is NOT ENABLED")
+		}
+	}()
+
+	if len(s.cfg.Security.SSLCert) == 0 || len(s.cfg.Security.SSLKey) == 0 {
+		s.tlsConfig = nil
+		return
+	}
+
+	tlsCert, err := tls.LoadX509KeyPair(s.cfg.Security.SSLCert, s.cfg.Security.SSLKey)
+	if err != nil {
+		log.Warn(errors.ErrorStack(err))
+		s.tlsConfig = nil
+		return
+	}
+
+	// Try loading CA cert.
+	clientAuthPolicy := tls.NoClientCert
+	var certPool *x509.CertPool
+	if len(s.cfg.Security.SSLCA) > 0 {
+		caCert, err := ioutil.ReadFile(s.cfg.Security.SSLCA)
+		if err != nil {
+			log.Warn(errors.ErrorStack(err))
+		} else {
+			certPool = x509.NewCertPool()
+			if certPool.AppendCertsFromPEM(caCert) {
+				clientAuthPolicy = tls.VerifyClientCertIfGiven
+			}
+			variable.SysVars["ssl_ca"].Value = s.cfg.Security.SSLCA
+		}
+	}
+	s.tlsConfig = &tls.Config{
+		Certificates: []tls.Certificate{tlsCert},
+		ClientCAs:    certPool,
+		ClientAuth:   clientAuthPolicy,
+		MinVersion:   0,
+	}
 }
 
 // Run runs the server.
 func (s *Server) Run() error {
+	metrics.ServerEventCounter.WithLabelValues(metrics.EventStart).Inc()
 
-	// Start http api to report tidb info such as tps.
-	if s.cfg.ReportStatus {
+	// Start HTTP API to report tidb info such as TPS.
+	if s.cfg.Status.ReportStatus {
 		s.startStatusHTTP()
 	}
-
 	for {
 		conn, err := s.listener.Accept()
 		if err != nil {
@@ -166,11 +246,39 @@ func (s *Server) Run() error {
 					return nil
 				}
 			}
+
+			// If we got PROXY protocol error, we should continue accept.
+			if proxyprotocol.IsProxyProtocolError(err) {
+				log.Errorf("PROXY protocol error: %s", err.Error())
+				continue
+			}
+
 			log.Errorf("accept error %s", err.Error())
 			return errors.Trace(err)
 		}
-
+		if s.shouldStopListener() {
+			err = conn.Close()
+			terror.Log(errors.Trace(err))
+			break
+		}
 		go s.onConn(conn)
+	}
+	err := s.listener.Close()
+	terror.Log(errors.Trace(err))
+	s.listener = nil
+	for {
+		metrics.ServerEventCounter.WithLabelValues(metrics.EventHang).Inc()
+		log.Errorf("listener stopped, waiting for manual kill.")
+		time.Sleep(time.Minute)
+	}
+}
+
+func (s *Server) shouldStopListener() bool {
+	select {
+	case <-s.stopListenerCh:
+		return true
+	default:
+		return false
 	}
 }
 
@@ -180,78 +288,118 @@ func (s *Server) Close() {
 	defer s.rwlock.Unlock()
 
 	if s.listener != nil {
-		s.listener.Close()
+		err := s.listener.Close()
+		terror.Log(errors.Trace(err))
 		s.listener = nil
 	}
+	if s.statusServer != nil {
+		err := s.statusServer.Close()
+		terror.Log(errors.Trace(err))
+		s.statusServer = nil
+	}
+	metrics.ServerEventCounter.WithLabelValues(metrics.EventClose).Inc()
 }
 
 // onConn runs in its own goroutine, handles queries from this connection.
 func (s *Server) onConn(c net.Conn) {
 	conn := s.newConn(c)
-	defer func() {
-		log.Infof("[%d] close connection", conn.connectionID)
-	}()
-
 	if err := conn.handshake(); err != nil {
 		// Some keep alive services will send request to TiDB and disconnect immediately.
-		// So we use info log level.
-		log.Infof("handshake error %s", errors.ErrorStack(err))
-		c.Close()
+		// So we only record metrics.
+		metrics.HandShakeErrorCounter.Inc()
+		err = c.Close()
+		terror.Log(errors.Trace(err))
 		return
 	}
-
+	log.Infof("con:%d new connection %s", conn.connectionID, c.RemoteAddr().String())
+	defer func() {
+		log.Infof("con:%d close connection", conn.connectionID)
+	}()
 	s.rwlock.Lock()
 	s.clients[conn.connectionID] = conn
 	connections := len(s.clients)
 	s.rwlock.Unlock()
-	connGauge.Set(float64(connections))
+	metrics.ConnGauge.Set(float64(connections))
 
 	conn.Run()
 }
 
-var once sync.Once
-
-const defaultStatusAddr = ":10080"
-
-func (s *Server) startStatusHTTP() {
-	once.Do(func() {
-		go func() {
-			http.HandleFunc("/status", func(w http.ResponseWriter, req *http.Request) {
-				w.Header().Set("Content-Type", "application/json")
-				s := status{
-					Connections: s.ConnectionCount(),
-					Version:     mysql.ServerVersion,
-					GitHash:     printer.TiDBGitHash,
-				}
-				js, err := json.Marshal(s)
-				if err != nil {
-					w.WriteHeader(http.StatusInternalServerError)
-					log.Error("Encode json error", err)
-				} else {
-					w.Write(js)
-				}
-
-			})
-			// HTTP path for prometheus.
-			http.Handle("/metrics", prometheus.Handler())
-			addr := s.cfg.StatusAddr
-			if len(addr) == 0 {
-				addr = defaultStatusAddr
-			}
-			log.Infof("Listening on %v for status and metrics report.", addr)
-			err := http.ListenAndServe(addr, nil)
-			if err != nil {
-				log.Fatal(err)
-			}
-		}()
-	})
+// ShowProcessList implements the SessionManager interface.
+func (s *Server) ShowProcessList() map[uint64]util.ProcessInfo {
+	s.rwlock.RLock()
+	rs := make(map[uint64]util.ProcessInfo, len(s.clients))
+	for _, client := range s.clients {
+		if atomic.LoadInt32(&client.status) == connStatusWaitShutdown {
+			continue
+		}
+		pi := client.ctx.ShowProcess()
+		rs[pi.ID] = pi
+	}
+	s.rwlock.RUnlock()
+	return rs
 }
 
-// TiDB status
-type status struct {
-	Connections int    `json:"connections"`
-	Version     string `json:"version"`
-	GitHash     string `json:"git_hash"`
+// Kill implements the SessionManager interface.
+func (s *Server) Kill(connectionID uint64, query bool) {
+	s.rwlock.Lock()
+	defer s.rwlock.Unlock()
+	log.Infof("[server] Kill connectionID %d, query %t]", connectionID, query)
+	metrics.ServerEventCounter.WithLabelValues(metrics.EventKill).Inc()
+
+	conn, ok := s.clients[uint32(connectionID)]
+	if !ok {
+		return
+	}
+
+	conn.mu.RLock()
+	cancelFunc := conn.mu.cancelFunc
+	conn.mu.RUnlock()
+	if cancelFunc != nil {
+		cancelFunc()
+	}
+
+	if !query {
+		// Mark the client connection status as WaitShutdown, when the goroutine detect
+		// this, it will end the dispatch loop and exit.
+		atomic.StoreInt32(&conn.status, connStatusWaitShutdown)
+	}
+}
+
+// GracefulDown waits all clients to close.
+func (s *Server) GracefulDown() {
+	log.Info("[server] graceful shutdown.")
+	metrics.ServerEventCounter.WithLabelValues(metrics.EventGracefulDown).Inc()
+
+	count := s.ConnectionCount()
+	for i := 0; count > 0; i++ {
+		time.Sleep(time.Second)
+		s.kickIdleConnection()
+
+		count = s.ConnectionCount()
+		// Print information for every 30s.
+		if i%30 == 0 {
+			log.Infof("graceful shutdown...connection count %d\n", count)
+		}
+	}
+}
+
+func (s *Server) kickIdleConnection() {
+	var conns []*clientConn
+	s.rwlock.RLock()
+	for _, cc := range s.clients {
+		if cc.ShutdownOrNotify() {
+			// Shutdowned conn will be closed by us, and notified conn will exist themselves.
+			conns = append(conns, cc)
+		}
+	}
+	s.rwlock.RUnlock()
+
+	for _, cc := range conns {
+		err := cc.Close()
+		if err != nil {
+			log.Error("close connection error:", err)
+		}
+	}
 }
 
 // Server error codes.
@@ -262,11 +410,13 @@ const (
 	codeInvalidType       = 4
 
 	codeNotAllowedCommand = 1148
+	codeAccessDenied      = mysql.ErrAccessDenied
 )
 
 func init() {
 	serverMySQLErrCodes := map[terror.ErrCode]uint16{
 		codeNotAllowedCommand: mysql.ErrNotAllowedCommand,
+		codeAccessDenied:      mysql.ErrAccessDenied,
 	}
 	terror.ErrClassToMySQLCodes[terror.ClassServer] = serverMySQLErrCodes
 }

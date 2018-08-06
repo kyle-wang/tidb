@@ -19,6 +19,8 @@ import (
 	"strings"
 	"unicode"
 	"unicode/utf8"
+
+	"github.com/pingcap/tidb/mysql"
 )
 
 var _ = yyLexer(&Scanner{})
@@ -38,13 +40,47 @@ type Scanner struct {
 	errs         []error
 	stmtStartPos int
 
-	// for scanning such kind of comment: /*! MySQL-specific code */
-	specialComment *specialCommentScanner
+	// For scanning such kind of comment: /*! MySQL-specific code */ or /*+ optimizer hint */
+	specialComment specialCommentScanner
+
+	sqlMode mysql.SQLMode
 }
 
-type specialCommentScanner struct {
+type specialCommentScanner interface {
+	scan() (tok int, pos Pos, lit string)
+}
+
+type mysqlSpecificCodeScanner struct {
 	*Scanner
 	Pos
+}
+
+func (s *mysqlSpecificCodeScanner) scan() (tok int, pos Pos, lit string) {
+	tok, pos, lit = s.Scanner.scan()
+	pos.Line += s.Pos.Line
+	pos.Col += s.Pos.Col
+	pos.Offset += s.Pos.Offset
+	return
+}
+
+type optimizerHintScanner struct {
+	*Scanner
+	Pos
+	end bool
+}
+
+func (s *optimizerHintScanner) scan() (tok int, pos Pos, lit string) {
+	tok, pos, lit = s.Scanner.scan()
+	pos.Line += s.Pos.Line
+	pos.Col += s.Pos.Col
+	pos.Offset += s.Pos.Offset
+	if tok == 0 {
+		if !s.end {
+			tok = hintEnd
+			s.end = true
+		}
+	}
+	return
 }
 
 // Errors returns the errors during a scan.
@@ -54,10 +90,11 @@ func (s *Scanner) Errors() []error {
 
 // reset resets the sql string to be scanned.
 func (s *Scanner) reset(sql string) {
-	s.r = reader{s: sql}
+	s.r = reader{s: sql, p: Pos{Line: 1}}
 	s.buf.Reset()
 	s.errs = s.errs[:0]
 	s.stmtStartPos = 0
+	s.specialComment = nil
 }
 
 func (s *Scanner) stmtText() string {
@@ -100,9 +137,22 @@ func (s *Scanner) Lex(v *yySymType) int {
 		tok = handleIdent(v)
 	}
 	if tok == identifier {
-		if tok1 := isTokenIdentifier(lit, &s.buf); tok1 != 0 {
+		if tok1 := s.isTokenIdentifier(lit, pos.Offset); tok1 != 0 {
 			tok = tok1
 		}
+	}
+	if s.sqlMode.HasANSIQuotesMode() &&
+		tok == stringLit &&
+		s.r.s[v.offset] == '"' {
+		tok = identifier
+	}
+
+	if tok == pipes && !(s.sqlMode.HasPipesAsConcatMode()) {
+		return pipesAsOr
+	}
+
+	if tok == not && s.sqlMode.HasHighNotPrecedenceMode() {
+		return not2
 	}
 
 	switch tok {
@@ -116,7 +166,7 @@ func (s *Scanner) Lex(v *yySymType) int {
 		return toHex(s, v, lit)
 	case bitLit:
 		return toBit(s, v, lit)
-	case userVar, sysVar, cast, curDate, extract:
+	case singleAtIdentifier, doubleAtIdentifier, cast, extract:
 		v.item = lit
 		return tok
 	case null:
@@ -130,6 +180,16 @@ func (s *Scanner) Lex(v *yySymType) int {
 	return tok
 }
 
+// SetSQLMode sets the SQL mode for scanner.
+func (s *Scanner) SetSQLMode(mode mysql.SQLMode) {
+	s.sqlMode = mode
+}
+
+// GetSQLMode return the SQL mode of scanner.
+func (s *Scanner) GetSQLMode() mysql.SQLMode {
+	return s.sqlMode
+}
+
 // NewScanner returns a new scanner object.
 func NewScanner(s string) *Scanner {
 	return &Scanner{r: reader{s: s}}
@@ -141,15 +201,12 @@ func (s *Scanner) skipWhitespace() rune {
 
 func (s *Scanner) scan() (tok int, pos Pos, lit string) {
 	if s.specialComment != nil {
-		// enter specialComment scan mode.
+		// Enter specialComment scan mode.
 		// for scanning such kind of comment: /*! MySQL-specific code */
 		specialComment := s.specialComment
 		tok, pos, lit = specialComment.scan()
 		if tok != 0 {
 			// return the specialComment scan result as the result
-			pos.Line += s.specialComment.Line
-			pos.Col += s.specialComment.Col
-			pos.Offset += s.specialComment.Offset
 			return
 		}
 		// leave specialComment scan mode after all stream consumed.
@@ -208,7 +265,21 @@ func startWithXx(s *Scanner) (tok int, pos Pos, lit string) {
 	return
 }
 
-func startWithb(s *Scanner) (tok int, pos Pos, lit string) {
+func startWithNn(s *Scanner) (tok int, pos Pos, lit string) {
+	tok, pos, lit = scanIdentifier(s)
+	// The National Character Set, N'some text' or n'some test'.
+	// See https://dev.mysql.com/doc/refman/5.7/en/string-literals.html
+	// and https://dev.mysql.com/doc/refman/5.7/en/charset-national.html
+	if lit == "N" || lit == "n" {
+		if s.r.peek() == '\'' {
+			tok = underscoreCS
+			lit = "utf8"
+		}
+	}
+	return
+}
+
+func startWithBb(s *Scanner) (tok int, pos Pos, lit string) {
 	pos = s.r.pos()
 	s.r.inc()
 	if s.r.peek() == '\'' {
@@ -236,17 +307,26 @@ func startWithSharp(s *Scanner) (tok int, pos Pos, lit string) {
 
 func startWithDash(s *Scanner) (tok int, pos Pos, lit string) {
 	pos = s.r.pos()
-	if !strings.HasPrefix(s.r.s[pos.Offset:], "-- ") {
-		tok = int('-')
-		s.r.inc()
+	if strings.HasPrefix(s.r.s[pos.Offset:], "-- ") {
+		s.r.incN(3)
+		s.r.incAsLongAs(func(ch rune) bool {
+			return ch != '\n'
+		})
+		return s.scan()
+	}
+	if strings.HasPrefix(s.r.s[pos.Offset:], "->>") {
+		tok = juss
+		s.r.incN(3)
 		return
 	}
-
-	s.r.incN(3)
-	s.r.incAsLongAs(func(ch rune) bool {
-		return ch != '\n'
-	})
-	return s.scan()
+	if strings.HasPrefix(s.r.s[pos.Offset:], "->") {
+		tok = jss
+		s.r.incN(2)
+		return
+	}
+	tok = int('-')
+	s.r.inc()
+	return
 }
 
 func startWithSlash(s *Scanner) (tok int, pos Pos, lit string) {
@@ -255,23 +335,51 @@ func startWithSlash(s *Scanner) (tok int, pos Pos, lit string) {
 	ch0 := s.r.peek()
 	if ch0 == '*' {
 		s.r.inc()
+		startWithAsterisk := false
 		for {
 			ch0 = s.r.readByte()
+			if startWithAsterisk && ch0 == '/' {
+				// Meets */, means comment end.
+				break
+			} else if ch0 == '*' {
+				startWithAsterisk = true
+			} else {
+				startWithAsterisk = false
+			}
+
 			if ch0 == unicode.ReplacementChar && s.r.eof() {
-				tok = unicode.ReplacementChar
+				// unclosed comment
+				s.errs = append(s.errs, ParseErrorWith(s.r.data(&pos), s.r.p.Line))
 				return
 			}
-			if ch0 == '*' && s.r.readByte() == '/' {
-				break
+
+		}
+
+		comment := s.r.data(&pos)
+
+		// See https://dev.mysql.com/doc/refman/5.7/en/optimizer-hints.html
+		if strings.HasPrefix(comment, "/*+") {
+			begin := sqlOffsetInComment(comment)
+			end := len(comment) - 2
+			sql := comment[begin:end]
+			s.specialComment = &optimizerHintScanner{
+				Scanner: NewScanner(sql),
+				Pos: Pos{
+					pos.Line,
+					pos.Col,
+					pos.Offset + begin,
+				},
 			}
+
+			tok = hintBegin
+			return
 		}
 
 		// See http://dev.mysql.com/doc/refman/5.7/en/comments.html
 		// Convert "/*!VersionNumber MySQL-specific-code */" to "MySQL-specific-code".
-		comment := s.r.data(&pos)
 		if strings.HasPrefix(comment, "/*!") {
-			sql := specCodePattern.ReplaceAllStringFunc(comment, trimComment)
-			s.specialComment = &specialCommentScanner{
+			sql := specCodePattern.ReplaceAllStringFunc(comment, TrimComment)
+			s.specialComment = &mysqlSpecificCodeScanner{
 				Scanner: NewScanner(sql),
 				Pos: Pos{
 					pos.Line,
@@ -309,9 +417,27 @@ func startWithAt(s *Scanner) (tok int, pos Pos, lit string) {
 	pos = s.r.pos()
 	s.r.inc()
 	ch1 := s.r.peek()
-	if isIdentFirstChar(ch1) {
-		s.r.incAsLongAs(isIdentChar)
-		tok, lit = userVar, s.r.data(&pos)
+	if ch1 == '\'' || ch1 == '"' {
+		nTok, nPos, nLit := startString(s)
+		if nTok == stringLit {
+			tok = singleAtIdentifier
+			pos = nPos
+			lit = nLit
+		} else {
+			tok = int('@')
+		}
+	} else if ch1 == '`' {
+		nTok, nPos, nLit := scanQuotedIdent(s)
+		if nTok == quotedIdentifier {
+			tok = singleAtIdentifier
+			pos = nPos
+			lit = nLit
+		} else {
+			tok = int('@')
+		}
+	} else if isUserVarChar(ch1) {
+		s.r.incAsLongAs(isUserVarChar)
+		tok, lit = singleAtIdentifier, s.r.data(&pos)
 	} else if ch1 == '@' {
 		s.r.inc()
 		stream := s.r.s[pos.Offset+2:]
@@ -325,9 +451,9 @@ func startWithAt(s *Scanner) (tok int, pos Pos, lit string) {
 			}
 		}
 		s.r.incAsLongAs(isIdentChar)
-		tok, lit = sysVar, s.r.data(&pos)
+		tok, lit = doubleAtIdentifier, s.r.data(&pos)
 	} else {
-		tok = at
+		tok, lit = singleAtIdentifier, s.r.data(&pos)
 	}
 	return
 }
@@ -366,17 +492,7 @@ func scanQuotedIdent(s *Scanner) (tok int, pos Pos, lit string) {
 }
 
 func startString(s *Scanner) (tok int, pos Pos, lit string) {
-	tok, pos, lit = s.scanString()
-
-	// Quoted strings placed next to each other are concatenated to a single string.
-	// See http://dev.mysql.com/doc/refman/5.7/en/string-literals.html
-	ch := s.skipWhitespace()
-	for ch == '\'' || ch == '"' {
-		_, _, lit1 := s.scanString()
-		lit = lit + lit1
-		ch = s.skipWhitespace()
-	}
-	return
+	return s.scanString()
 }
 
 // lazyBuf is used to avoid allocation if possible.
@@ -433,13 +549,15 @@ func (s *Scanner) scanString() (tok int, pos Pos, lit string) {
 			}
 			str := mb.r.data(&pos)
 			mb.setUseBuf(str[1 : len(str)-1])
-		} else if ch0 == '\\' {
+		} else if ch0 == '\\' && !s.sqlMode.HasNoBackslashEscapesMode() {
 			mb.setUseBuf(mb.r.data(&pos)[1:])
 			ch0 = handleEscape(s)
 		}
 		mb.writeRune(ch0, s.r.w)
-		s.r.inc()
-		ch0 = s.r.peek()
+		if !s.r.eof() {
+			s.r.inc()
+			ch0 = s.r.peek()
+		}
 	}
 
 	tok = unicode.ReplacementChar
@@ -522,7 +640,7 @@ func startWithDot(s *Scanner) (tok int, pos Pos, lit string) {
 	save := s.r.pos()
 	if isDigit(s.r.peek()) {
 		tok, _, lit = s.scanFloat(&pos)
-		if s.r.eof() || unicode.IsSpace(s.r.peek()) {
+		if s.r.eof() || !isIdentChar(s.r.peek()) {
 			return
 		}
 		// Fail to parse a float, reset to dot.

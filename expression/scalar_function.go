@@ -18,66 +18,95 @@ import (
 	"fmt"
 
 	"github.com/juju/errors"
-	"github.com/pingcap/tidb/context"
+	"github.com/pingcap/tidb/ast"
 	"github.com/pingcap/tidb/model"
+	"github.com/pingcap/tidb/mysql"
+	"github.com/pingcap/tidb/sessionctx"
+	"github.com/pingcap/tidb/sessionctx/stmtctx"
+	"github.com/pingcap/tidb/terror"
+	"github.com/pingcap/tidb/types"
+	"github.com/pingcap/tidb/types/json"
+	"github.com/pingcap/tidb/util/chunk"
 	"github.com/pingcap/tidb/util/codec"
-	"github.com/pingcap/tidb/util/types"
+	"github.com/pingcap/tidb/util/hack"
 )
 
 // ScalarFunction is the function that returns a value.
 type ScalarFunction struct {
-	args     []Expression
 	FuncName model.CIStr
+	// RetType is the type that ScalarFunction returns.
 	// TODO: Implement type inference here, now we use ast's return type temporarily.
-	RetType   *types.FieldType
-	Function  BuiltinFunc
-	ArgValues []types.Datum
+	RetType  *types.FieldType
+	Function builtinFunc
+	hashcode []byte
 }
 
 // GetArgs gets arguments of function.
 func (sf *ScalarFunction) GetArgs() []Expression {
-	return sf.args
+	return sf.Function.getArgs()
+}
+
+// GetCtx gets the context of function.
+func (sf *ScalarFunction) GetCtx() sessionctx.Context {
+	return sf.Function.getCtx()
 }
 
 // String implements fmt.Stringer interface.
 func (sf *ScalarFunction) String() string {
-	result := sf.FuncName.L + "("
+	var buffer bytes.Buffer
+	fmt.Fprintf(&buffer, "%s(", sf.FuncName.L)
 	for i, arg := range sf.GetArgs() {
-		result += arg.String()
-		if i+1 != len(sf.args) {
-			result += ", "
+		buffer.WriteString(arg.String())
+		if i+1 != len(sf.GetArgs()) {
+			buffer.WriteString(", ")
 		}
 	}
-	result += ")"
-	return result
+	buffer.WriteString(")")
+	return buffer.String()
 }
 
 // MarshalJSON implements json.Marshaler interface.
 func (sf *ScalarFunction) MarshalJSON() ([]byte, error) {
-	buffer := bytes.NewBufferString(fmt.Sprintf("\"%s\"", sf))
-	return buffer.Bytes(), nil
+	return []byte(fmt.Sprintf("\"%s\"", sf)), nil
 }
 
 // NewFunction creates a new scalar function or constant.
-func NewFunction(funcName string, retType *types.FieldType, args ...Expression) (Expression, error) {
-	f, ok := Funcs[funcName]
-	if !ok {
-		return nil, errFunctionNotExists.GenByArgs(funcName)
+func NewFunction(ctx sessionctx.Context, funcName string, retType *types.FieldType, args ...Expression) (Expression, error) {
+	if retType == nil {
+		return nil, errors.Errorf("RetType cannot be nil for ScalarFunction.")
 	}
-	if len(args) < f.MinArgs || (f.MaxArgs != -1 && len(args) > f.MaxArgs) {
-		return nil, errIncorrectParameterCount.GenByArgs(funcName)
+	if funcName == ast.Cast {
+		return BuildCastFunction(ctx, args[0], retType), nil
+	}
+	fc, ok := funcs[funcName]
+	if !ok {
+		return nil, errFunctionNotExists.GenByArgs("FUNCTION", funcName)
 	}
 	funcArgs := make([]Expression, len(args))
 	copy(funcArgs, args)
-	return &ScalarFunction{
-		args:      funcArgs,
-		FuncName:  model.NewCIStr(funcName),
-		RetType:   retType,
-		Function:  f.F,
-		ArgValues: make([]types.Datum, len(funcArgs))}, nil
+	f, err := fc.getFunction(ctx, funcArgs)
+	if err != nil {
+		return nil, errors.Trace(err)
+	}
+	if builtinRetTp := f.getRetTp(); builtinRetTp.Tp != mysql.TypeUnspecified || retType.Tp == mysql.TypeUnspecified {
+		retType = builtinRetTp
+	}
+	sf := &ScalarFunction{
+		FuncName: model.NewCIStr(funcName),
+		RetType:  retType,
+		Function: f,
+	}
+	return FoldConstant(sf), nil
 }
 
-//ScalarFuncs2Exprs converts []*ScalarFunction to []Expression.
+// NewFunctionInternal is similar to NewFunction, but do not returns error, should only be used internally.
+func NewFunctionInternal(ctx sessionctx.Context, funcName string, retType *types.FieldType, args ...Expression) Expression {
+	expr, err := NewFunction(ctx, funcName, retType, args...)
+	terror.Log(errors.Trace(err))
+	return expr
+}
+
+// ScalarFuncs2Exprs converts []*ScalarFunction to []Expression.
 func ScalarFuncs2Exprs(funcs []*ScalarFunction) []Expression {
 	result := make([]Expression, 0, len(funcs))
 	for _, col := range funcs {
@@ -88,16 +117,12 @@ func ScalarFuncs2Exprs(funcs []*ScalarFunction) []Expression {
 
 // Clone implements Expression interface.
 func (sf *ScalarFunction) Clone() Expression {
-	newFunc := &ScalarFunction{
-		FuncName:  sf.FuncName,
-		Function:  sf.Function,
-		RetType:   sf.RetType,
-		ArgValues: make([]types.Datum, len(sf.args))}
-	newFunc.args = make([]Expression, 0, len(sf.args))
-	for _, arg := range sf.args {
-		newFunc.args = append(newFunc.args, arg.Clone())
+	return &ScalarFunction{
+		FuncName: sf.FuncName,
+		RetType:  sf.RetType,
+		Function: sf.Function.Clone(),
+		hashcode: sf.hashcode,
 	}
-	return newFunc
 }
 
 // GetType implements Expression interface.
@@ -106,7 +131,7 @@ func (sf *ScalarFunction) GetType() *types.FieldType {
 }
 
 // Equal implements Expression interface.
-func (sf *ScalarFunction) Equal(e Expression, ctx context.Context) bool {
+func (sf *ScalarFunction) Equal(ctx sessionctx.Context, e Expression) bool {
 	fun, ok := e.(*ScalarFunction)
 	if !ok {
 		return false
@@ -114,15 +139,7 @@ func (sf *ScalarFunction) Equal(e Expression, ctx context.Context) bool {
 	if sf.FuncName.L != fun.FuncName.L {
 		return false
 	}
-	if len(sf.args) != len(fun.args) {
-		return false
-	}
-	for i, argX := range sf.args {
-		if !argX.Equal(fun.args[i], ctx) {
-			return false
-		}
-	}
-	return true
+	return sf.Function.equal(fun.Function)
 }
 
 // IsCorrelated implements Expression interface.
@@ -136,42 +153,107 @@ func (sf *ScalarFunction) IsCorrelated() bool {
 }
 
 // Decorrelate implements Expression interface.
-func (sf *ScalarFunction) Decorrelate(schema Schema) Expression {
+func (sf *ScalarFunction) Decorrelate(schema *Schema) Expression {
 	for i, arg := range sf.GetArgs() {
-		sf.args[i] = arg.Decorrelate(schema)
+		sf.GetArgs()[i] = arg.Decorrelate(schema)
 	}
 	return sf
 }
 
 // Eval implements Expression interface.
-func (sf *ScalarFunction) Eval(row []types.Datum, ctx context.Context) (types.Datum, error) {
-	var err error
-	for i, arg := range sf.GetArgs() {
-		sf.ArgValues[i], err = arg.Eval(row, ctx)
-		if err != nil {
-			return types.Datum{}, errors.Trace(err)
+func (sf *ScalarFunction) Eval(row chunk.Row) (d types.Datum, err error) {
+	var (
+		res    interface{}
+		isNull bool
+	)
+	switch tp, evalType := sf.GetType(), sf.GetType().EvalType(); evalType {
+	case types.ETInt:
+		var intRes int64
+		intRes, isNull, err = sf.EvalInt(sf.GetCtx(), row)
+		if mysql.HasUnsignedFlag(tp.Flag) {
+			res = uint64(intRes)
+		} else {
+			res = intRes
 		}
+	case types.ETReal:
+		res, isNull, err = sf.EvalReal(sf.GetCtx(), row)
+	case types.ETDecimal:
+		res, isNull, err = sf.EvalDecimal(sf.GetCtx(), row)
+	case types.ETDatetime, types.ETTimestamp:
+		res, isNull, err = sf.EvalTime(sf.GetCtx(), row)
+	case types.ETDuration:
+		res, isNull, err = sf.EvalDuration(sf.GetCtx(), row)
+	case types.ETJson:
+		res, isNull, err = sf.EvalJSON(sf.GetCtx(), row)
+	case types.ETString:
+		res, isNull, err = sf.EvalString(sf.GetCtx(), row)
 	}
-	return sf.Function(sf.ArgValues, ctx)
+
+	if isNull || err != nil {
+		d.SetValue(nil)
+		return d, errors.Trace(err)
+	}
+	d.SetValue(res)
+	return
+}
+
+// EvalInt implements Expression interface.
+func (sf *ScalarFunction) EvalInt(ctx sessionctx.Context, row chunk.Row) (int64, bool, error) {
+	return sf.Function.evalInt(row)
+}
+
+// EvalReal implements Expression interface.
+func (sf *ScalarFunction) EvalReal(ctx sessionctx.Context, row chunk.Row) (float64, bool, error) {
+	return sf.Function.evalReal(row)
+}
+
+// EvalDecimal implements Expression interface.
+func (sf *ScalarFunction) EvalDecimal(ctx sessionctx.Context, row chunk.Row) (*types.MyDecimal, bool, error) {
+	return sf.Function.evalDecimal(row)
+}
+
+// EvalString implements Expression interface.
+func (sf *ScalarFunction) EvalString(ctx sessionctx.Context, row chunk.Row) (string, bool, error) {
+	return sf.Function.evalString(row)
+}
+
+// EvalTime implements Expression interface.
+func (sf *ScalarFunction) EvalTime(ctx sessionctx.Context, row chunk.Row) (types.Time, bool, error) {
+	return sf.Function.evalTime(row)
+}
+
+// EvalDuration implements Expression interface.
+func (sf *ScalarFunction) EvalDuration(ctx sessionctx.Context, row chunk.Row) (types.Duration, bool, error) {
+	return sf.Function.evalDuration(row)
+}
+
+// EvalJSON implements Expression interface.
+func (sf *ScalarFunction) EvalJSON(ctx sessionctx.Context, row chunk.Row) (json.BinaryJSON, bool, error) {
+	return sf.Function.evalJSON(row)
 }
 
 // HashCode implements Expression interface.
-func (sf *ScalarFunction) HashCode() []byte {
-	var bytes []byte
-	v := make([]types.Datum, 0, len(sf.args)+1)
-	bytes, _ = codec.EncodeValue(bytes, types.NewStringDatum(sf.FuncName.L))
-	v = append(v, types.NewBytesDatum(bytes))
-	for _, arg := range sf.GetArgs() {
-		v = append(v, types.NewBytesDatum(arg.HashCode()))
+func (sf *ScalarFunction) HashCode(sc *stmtctx.StatementContext) []byte {
+	if len(sf.hashcode) > 0 {
+		return sf.hashcode
 	}
-	bytes = bytes[:0]
-	bytes, _ = codec.EncodeValue(bytes, v...)
-	return bytes
+	sf.hashcode = append(sf.hashcode, scalarFunctionFlag)
+	sf.hashcode = codec.EncodeCompactBytes(sf.hashcode, hack.Slice(sf.FuncName.L))
+	for _, arg := range sf.GetArgs() {
+		sf.hashcode = append(sf.hashcode, arg.HashCode(sc)...)
+	}
+	return sf.hashcode
 }
 
 // ResolveIndices implements Expression interface.
-func (sf *ScalarFunction) ResolveIndices(schema Schema) {
-	for _, arg := range sf.args {
-		arg.ResolveIndices(schema)
+func (sf *ScalarFunction) ResolveIndices(schema *Schema) Expression {
+	newSf := sf.Clone()
+	newSf.resolveIndices(schema)
+	return newSf
+}
+
+func (sf *ScalarFunction) resolveIndices(schema *Schema) {
+	for _, arg := range sf.GetArgs() {
+		arg.resolveIndices(schema)
 	}
 }

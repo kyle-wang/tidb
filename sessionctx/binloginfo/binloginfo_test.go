@@ -16,29 +16,36 @@ package binloginfo_test
 import (
 	"net"
 	"os"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
 
-	"github.com/ngaut/log"
+	"github.com/juju/errors"
 	. "github.com/pingcap/check"
-	"github.com/pingcap/tidb"
-	"github.com/pingcap/tidb/context"
 	"github.com/pingcap/tidb/ddl"
+	"github.com/pingcap/tidb/domain"
 	"github.com/pingcap/tidb/kv"
+	"github.com/pingcap/tidb/session"
 	"github.com/pingcap/tidb/sessionctx"
 	"github.com/pingcap/tidb/sessionctx/binloginfo"
-	"github.com/pingcap/tidb/store/tikv"
+	"github.com/pingcap/tidb/store/mockstore"
+	"github.com/pingcap/tidb/terror"
+	"github.com/pingcap/tidb/types"
 	"github.com/pingcap/tidb/util/codec"
+	"github.com/pingcap/tidb/util/logutil"
 	"github.com/pingcap/tidb/util/testkit"
-	"github.com/pingcap/tidb/util/types"
-	"github.com/pingcap/tipb/go-binlog"
-	goctx "golang.org/x/net/context"
+	binlog "github.com/pingcap/tipb/go-binlog"
+	"golang.org/x/net/context"
 	"google.golang.org/grpc"
 )
 
 func TestT(t *testing.T) {
 	CustomVerboseFlag = true
+	logLevel := os.Getenv("log_level")
+	logutil.InitLogger(&logutil.LogConfig{
+		Level: logLevel,
+	})
 	TestingT(t)
 }
 
@@ -46,44 +53,49 @@ type mockBinlogPump struct {
 	mu struct {
 		sync.Mutex
 		payloads [][]byte
+		mockFail bool
 	}
 }
 
-func (p *mockBinlogPump) WriteBinlog(ctx goctx.Context, req *binlog.WriteBinlogReq) (*binlog.WriteBinlogResp, error) {
+func (p *mockBinlogPump) WriteBinlog(ctx context.Context, req *binlog.WriteBinlogReq) (*binlog.WriteBinlogResp, error) {
 	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if p.mu.mockFail {
+		return &binlog.WriteBinlogResp{}, errors.New("mock fail")
+	}
 	p.mu.payloads = append(p.mu.payloads, req.Payload)
-	p.mu.Unlock()
 	return &binlog.WriteBinlogResp{}, nil
 }
 
 // PullBinlogs implements PumpServer interface.
-func (p *mockBinlogPump) PullBinlogs(ctx goctx.Context, req *binlog.PullBinlogReq) (*binlog.PullBinlogResp, error) {
-	return &binlog.PullBinlogResp{}, nil
+func (p *mockBinlogPump) PullBinlogs(req *binlog.PullBinlogReq, srv binlog.Pump_PullBinlogsServer) error {
+	return nil
 }
 
 var _ = Suite(&testBinlogSuite{})
 
 type testBinlogSuite struct {
 	store    kv.Storage
+	domain   *domain.Domain
 	unixFile string
 	serv     *grpc.Server
 	pump     *mockBinlogPump
-	tk       *testkit.TestKit
+	client   binlog.PumpClient
 	ddl      ddl.DDL
 }
 
+const maxRecvMsgSize = 64 * 1024
+
 func (s *testBinlogSuite) SetUpSuite(c *C) {
-	logLevel := os.Getenv("log_level")
-	log.SetLevelByString(logLevel)
-	store, err := tikv.NewMockTikvStore()
+	store, err := mockstore.NewMockTikvStore()
 	c.Assert(err, IsNil)
 	s.store = store
-	tidb.SetSchemaLease(0)
-	s.unixFile = "/tmp/mock-binlog-pump"
-	os.Remove(s.unixFile)
+	session.SetSchemaLease(0)
+	s.unixFile = "/tmp/mock-binlog-pump" + strconv.FormatInt(time.Now().UnixNano(), 10)
 	l, err := net.Listen("unix", s.unixFile)
 	c.Assert(err, IsNil)
-	s.serv = grpc.NewServer()
+	s.serv = grpc.NewServer(grpc.MaxRecvMsgSize(maxRecvMsgSize))
 	s.pump = new(mockBinlogPump)
 	binlog.RegisterPumpServer(s.serv, s.pump)
 	go s.serv.Serve(l)
@@ -93,35 +105,44 @@ func (s *testBinlogSuite) SetUpSuite(c *C) {
 	clientCon, err := grpc.Dial(s.unixFile, opt, grpc.WithInsecure())
 	c.Assert(err, IsNil)
 	c.Assert(clientCon, NotNil)
-	binloginfo.PumpClient = binlog.NewPumpClient(clientCon)
-	s.tk = testkit.NewTestKit(c, s.store)
-	s.tk.MustExec("use test")
-	domain := sessionctx.GetDomain(s.tk.Se.(context.Context))
-	s.ddl = domain.DDL()
+	tk := testkit.NewTestKit(c, s.store)
+	s.domain, err = session.BootstrapSession(store)
+	c.Assert(err, IsNil)
+	tk.MustExec("use test")
+	sessionDomain := domain.GetDomain(tk.Se.(sessionctx.Context))
+	s.ddl = sessionDomain.DDL()
+
+	s.client = binlog.NewPumpClient(clientCon)
+	s.ddl.SetBinlogClient(s.client)
 }
 
 func (s *testBinlogSuite) TearDownSuite(c *C) {
 	s.ddl.Stop()
-	binloginfo.PumpClient = nil
 	s.serv.Stop()
 	os.Remove(s.unixFile)
 	s.store.Close()
+	s.domain.Close()
 }
 
 func (s *testBinlogSuite) TestBinlog(c *C) {
-	tk := s.tk
+	tk := testkit.NewTestKit(c, s.store)
+	tk.MustExec("use test")
+	tk.Se.GetSessionVars().BinlogClient = s.client
 	pump := s.pump
 	tk.MustExec("drop table if exists local_binlog")
-	ddlQuery := "create table local_binlog (id int primary key, name varchar(10))"
+	ddlQuery := "create table local_binlog (id int primary key, name varchar(10)) shard_row_id_bits=1"
+	binlogDDLQuery := "create table local_binlog (id int primary key, name varchar(10)) /*!90000 shard_row_id_bits=1 */"
 	tk.MustExec(ddlQuery)
 	var matched bool // got matched pre DDL and commit DDL
 	for i := 0; i < 10; i++ {
-		preDDL, commitDDL := getLatestDDLBinlog(c, pump, ddlQuery)
-		if preDDL.DdlJobId == commitDDL.DdlJobId {
-			c.Assert(commitDDL.StartTs, Equals, preDDL.StartTs)
-			c.Assert(commitDDL.CommitTs, Greater, commitDDL.StartTs)
-			matched = true
-			break
+		preDDL, commitDDL := getLatestDDLBinlog(c, pump, binlogDDLQuery)
+		if preDDL != nil && commitDDL != nil {
+			if preDDL.DdlJobId == commitDDL.DdlJobId {
+				c.Assert(commitDDL.StartTs, Equals, preDDL.StartTs)
+				c.Assert(commitDDL.CommitTs, Greater, commitDDL.StartTs)
+				matched = true
+				break
+			}
 		}
 		time.Sleep(time.Millisecond * 10)
 	}
@@ -140,42 +161,64 @@ func (s *testBinlogSuite) TestBinlog(c *C) {
 
 	tk.MustExec("update local_binlog set name = 'xyz' where id = 2")
 	prewriteVal = getLatestBinlogPrewriteValue(c, pump)
-	expected = [][]types.Datum{
+	oldRow := [][]types.Datum{
+		{types.NewIntDatum(2), types.NewStringDatum("cde")},
+	}
+	newRow := [][]types.Datum{
 		{types.NewIntDatum(2), types.NewStringDatum("xyz")},
 	}
-	gotRows = mutationRowsToRows(c, prewriteVal.Mutations[0].UpdatedRows, 2, 4)
-	c.Assert(gotRows, DeepEquals, expected)
+	gotRows = mutationRowsToRows(c, prewriteVal.Mutations[0].UpdatedRows, 1, 3)
+	c.Assert(gotRows, DeepEquals, oldRow)
+
+	gotRows = mutationRowsToRows(c, prewriteVal.Mutations[0].UpdatedRows, 5, 7)
+	c.Assert(gotRows, DeepEquals, newRow)
 
 	tk.MustExec("delete from local_binlog where id = 1")
 	prewriteVal = getLatestBinlogPrewriteValue(c, pump)
-	c.Assert(prewriteVal.Mutations[0].DeletedIds, DeepEquals, []int64{1})
+	gotRows = mutationRowsToRows(c, prewriteVal.Mutations[0].DeletedRows, 1, 3)
+	expected = [][]types.Datum{
+		{types.NewIntDatum(1), types.NewStringDatum("abc")},
+	}
+	c.Assert(gotRows, DeepEquals, expected)
 
 	// Test table primary key is not integer.
 	tk.MustExec("create table local_binlog2 (name varchar(64) primary key, age int)")
 	tk.MustExec("insert local_binlog2 values ('abc', 16), ('def', 18)")
 	tk.MustExec("delete from local_binlog2 where name = 'def'")
 	prewriteVal = getLatestBinlogPrewriteValue(c, pump)
-	c.Assert(prewriteVal.Mutations[0].Sequence[0], Equals, binlog.MutationType_DeletePK)
-	_, deletedPK, _ := codec.DecodeOne(prewriteVal.Mutations[0].DeletedPks[0])
-	c.Assert(deletedPK.GetString(), Equals, "def")
+	c.Assert(prewriteVal.Mutations[0].Sequence[0], Equals, binlog.MutationType_DeleteRow)
+
+	expected = [][]types.Datum{
+		{types.NewStringDatum("def"), types.NewIntDatum(18), types.NewIntDatum(-1), types.NewIntDatum(2)},
+	}
+	gotRows = mutationRowsToRows(c, prewriteVal.Mutations[0].DeletedRows, 1, 3, 4, 5)
+	c.Assert(gotRows, DeepEquals, expected)
 
 	// Test Table don't have primary key.
 	tk.MustExec("create table local_binlog3 (c1 int, c2 int)")
 	tk.MustExec("insert local_binlog3 values (1, 2), (1, 3), (2, 3)")
 	tk.MustExec("update local_binlog3 set c1 = 3 where c1 = 2")
 	prewriteVal = getLatestBinlogPrewriteValue(c, pump)
-	gotRows = mutationRowsToRows(c, prewriteVal.Mutations[0].UpdatedRows, 5, 7)
+
+	// The encoded update row is [oldColID1, oldColVal1, oldColID2, oldColVal2, -1, handle,
+	// 		newColID1, newColVal2, newColID2, newColVal2, -1, handle]
+	gotRows = mutationRowsToRows(c, prewriteVal.Mutations[0].UpdatedRows, 7, 9)
 	expected = [][]types.Datum{
 		{types.NewIntDatum(3), types.NewIntDatum(3)},
 	}
+	c.Assert(gotRows, DeepEquals, expected)
+	expected = [][]types.Datum{
+		{types.NewIntDatum(-1), types.NewIntDatum(3), types.NewIntDatum(-1), types.NewIntDatum(3)},
+	}
+	gotRows = mutationRowsToRows(c, prewriteVal.Mutations[0].UpdatedRows, 4, 5, 10, 11)
 	c.Assert(gotRows, DeepEquals, expected)
 
 	tk.MustExec("delete from local_binlog3 where c1 = 3 and c2 = 3")
 	prewriteVal = getLatestBinlogPrewriteValue(c, pump)
 	c.Assert(prewriteVal.Mutations[0].Sequence[0], Equals, binlog.MutationType_DeleteRow)
-	gotRows = mutationRowsToRows(c, prewriteVal.Mutations[0].DeletedRows, 1, 3)
+	gotRows = mutationRowsToRows(c, prewriteVal.Mutations[0].DeletedRows, 1, 3, 4, 5)
 	expected = [][]types.Datum{
-		{types.NewIntDatum(3), types.NewIntDatum(3)},
+		{types.NewIntDatum(3), types.NewIntDatum(3), types.NewIntDatum(-1), types.NewIntDatum(3)},
 	}
 	c.Assert(gotRows, DeepEquals, expected)
 
@@ -189,9 +232,22 @@ func (s *testBinlogSuite) TestBinlog(c *C) {
 	tk.MustExec("commit")
 	prewriteVal = getLatestBinlogPrewriteValue(c, pump)
 	c.Assert(prewriteVal.Mutations[0].Sequence, DeepEquals, []binlog.MutationType{
-		binlog.MutationType_DeleteID,
+		binlog.MutationType_DeleteRow,
 		binlog.MutationType_Insert,
 		binlog.MutationType_Update,
+	})
+
+	// Test statement rollback.
+	tk.MustExec("create table local_binlog5 (c1 int primary key)")
+	tk.MustExec("begin")
+	tk.MustExec("insert into local_binlog5 value (1)")
+	// This statement execute fail and should not write binlog.
+	_, err := tk.Exec("insert into local_binlog5 value (4),(3),(1),(2)")
+	c.Assert(err, NotNil)
+	tk.MustExec("commit")
+	prewriteVal = getLatestBinlogPrewriteValue(c, pump)
+	c.Assert(prewriteVal.Mutations[0].Sequence, DeepEquals, []binlog.MutationType{
+		binlog.MutationType_Insert,
 	})
 
 	checkBinlogCount(c, pump)
@@ -205,6 +261,19 @@ func (s *testBinlogSuite) TestBinlog(c *C) {
 	newBinlogLen := len(pump.mu.payloads)
 	pump.mu.Unlock()
 	c.Assert(newBinlogLen, Equals, originBinlogLen)
+}
+
+func (s *testBinlogSuite) TestMaxRecvSize(c *C) {
+	info := &binloginfo.BinlogInfo{
+		Data: &binlog.Binlog{
+			Tp:            binlog.BinlogType_Prewrite,
+			PrewriteValue: make([]byte, maxRecvMsgSize+1),
+		},
+		Client: s.client,
+	}
+	err := info.WriteBinlog(1)
+	c.Assert(err, NotNil)
+	c.Assert(terror.ErrCritical.Equal(err), IsFalse, Commentf("%v", err))
 }
 
 func getLatestBinlogPrewriteValue(c *C, pump *mockBinlogPump) *binlog.PrewriteValue {
@@ -283,22 +352,46 @@ func checkBinlogCount(c *C, pump *mockBinlogPump) {
 	c.Assert(match, IsTrue)
 }
 
-func mutationRowsToRows(c *C, mutationRows [][]byte, firstColumn, secondColumn int) [][]types.Datum {
-	var rows [][]types.Datum
+func mutationRowsToRows(c *C, mutationRows [][]byte, columnValueOffsets ...int) [][]types.Datum {
+	var rows = make([][]types.Datum, 0)
 	for _, mutationRow := range mutationRows {
 		datums, err := codec.Decode(mutationRow, 5)
 		c.Assert(err, IsNil)
 		for i := range datums {
-			if i != firstColumn && i != secondColumn {
-				// Column ID or handle
-				c.Assert(datums[i].GetInt64(), Greater, int64(0))
-			}
 			if datums[i].Kind() == types.KindBytes {
 				datums[i].SetBytesAsString(datums[i].GetBytes())
 			}
 		}
-		row := []types.Datum{datums[firstColumn], datums[secondColumn]}
+		row := make([]types.Datum, 0, len(columnValueOffsets))
+		for _, colOff := range columnValueOffsets {
+			row = append(row, datums[colOff])
+		}
 		rows = append(rows, row)
 	}
 	return rows
+}
+
+// Sometimes this test doesn't clean up fail, let the function name begin with 'Z'
+// so it runs last and would not disrupt other tests.
+func (s *testBinlogSuite) TestZIgnoreError(c *C) {
+	tk := testkit.NewTestKit(c, s.store)
+	tk.MustExec("use test")
+	tk.Se.GetSessionVars().BinlogClient = s.client
+	tk.MustExec("drop table if exists ignore_error")
+	tk.MustExec("create table t (id int)")
+
+	binloginfo.SetIgnoreError(true)
+	s.pump.mu.Lock()
+	s.pump.mu.mockFail = true
+	s.pump.mu.Unlock()
+
+	tk.MustExec("insert into t values (1)")
+	tk.MustExec("insert into t values (1)")
+
+	// Clean up.
+	s.pump.mu.Lock()
+	s.pump.mu.mockFail = false
+	s.pump.mu.Unlock()
+	binloginfo.DisableSkipBinlogFlag()
+	binloginfo.SetIgnoreError(false)
 }

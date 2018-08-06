@@ -14,42 +14,110 @@
 package expression
 
 import (
-	"github.com/ngaut/log"
-	"github.com/pingcap/tidb/context"
-	"github.com/pingcap/tidb/util/types"
+	"github.com/pingcap/tidb/ast"
+	"github.com/pingcap/tidb/util/chunk"
+	log "github.com/sirupsen/logrus"
 )
 
-// FoldConstant does constant folding optimization on an expression.
-func FoldConstant(ctx context.Context, expr Expression) Expression {
-	scalarFunc, ok := expr.(*ScalarFunction)
-	if !ok {
-		return expr
+// specialFoldHandler stores functions for special UDF to constant fold
+var specialFoldHandler = map[string]func(*ScalarFunction) (Expression, bool){}
+
+func init() {
+	specialFoldHandler = map[string]func(*ScalarFunction) (Expression, bool){
+		ast.If:     ifFoldHandler,
+		ast.Ifnull: ifNullFoldHandler,
 	}
-	if _, isDynamic := DynamicFuncs[scalarFunc.FuncName.L]; isDynamic {
-		return expr
+}
+
+// FoldConstant does constant folding optimization on an expression excluding deferred ones.
+func FoldConstant(expr Expression) Expression {
+	e, _ := foldConstant(expr)
+	return e
+}
+
+func ifFoldHandler(expr *ScalarFunction) (Expression, bool) {
+	args := expr.GetArgs()
+	foldedArg0, _ := foldConstant(args[0])
+	if constArg, isConst := foldedArg0.(*Constant); isConst {
+		arg0, isNull0, err := constArg.EvalInt(expr.Function.getCtx(), chunk.Row{})
+		if err != nil {
+			log.Warnf("fold constant %s: %s", expr.ExplainInfo(), err.Error())
+			return expr, false
+		}
+		if !isNull0 && arg0 != 0 {
+			return foldConstant(args[1])
+		}
+		return foldConstant(args[2])
 	}
-	args := scalarFunc.GetArgs()
-	datums := make([]types.Datum, 0, len(args))
-	canFold := true
-	for i := 0; i < len(args); i++ {
-		foldedArg := FoldConstant(ctx, args[i])
-		scalarFunc.GetArgs()[i] = foldedArg
-		if con, ok := foldedArg.(*Constant); ok {
-			datums = append(datums, con.Value)
-		} else {
-			canFold = false
+	var isDeferred, isDeferredConst bool
+	expr.GetArgs()[1], isDeferred = foldConstant(args[1])
+	isDeferredConst = isDeferredConst || isDeferred
+	expr.GetArgs()[2], isDeferred = foldConstant(args[2])
+	isDeferredConst = isDeferredConst || isDeferred
+	return expr, isDeferredConst
+}
+
+func ifNullFoldHandler(expr *ScalarFunction) (Expression, bool) {
+	args := expr.GetArgs()
+	foldedArg0, _ := foldConstant(args[0])
+	if constArg, isConst := foldedArg0.(*Constant); isConst {
+		_, isNull0, err := constArg.EvalInt(expr.Function.getCtx(), chunk.Row{})
+		if err != nil {
+			log.Warnf("fold constant %s: %s", expr.ExplainInfo(), err.Error())
+			return expr, false
+		}
+		if isNull0 == true {
+			return foldConstant(args[1])
 		}
 	}
-	if !canFold {
-		return expr
+	isDeferredConst := false
+	expr.GetArgs()[1], isDeferredConst = foldConstant(args[1])
+	return expr, isDeferredConst
+}
+
+func foldConstant(expr Expression) (Expression, bool) {
+	switch x := expr.(type) {
+	case *ScalarFunction:
+		if _, ok := unFoldableFunctions[x.FuncName.L]; ok {
+			return expr, false
+		}
+		if function := specialFoldHandler[x.FuncName.L]; function != nil {
+			return function(x)
+		}
+
+		args := x.GetArgs()
+		canFold := true
+		isDeferredConst := false
+		for i := 0; i < len(args); i++ {
+			foldedArg, isDeferred := foldConstant(args[i])
+			x.GetArgs()[i] = foldedArg
+			_, conOK := foldedArg.(*Constant)
+			if !conOK {
+				canFold = false
+			}
+			isDeferredConst = isDeferredConst || isDeferred
+		}
+		if !canFold {
+			return expr, isDeferredConst
+		}
+		value, err := x.Eval(chunk.Row{})
+		if err != nil {
+			log.Warnf("fold constant %s: %s", x.ExplainInfo(), err.Error())
+			return expr, isDeferredConst
+		}
+		if isDeferredConst {
+			return &Constant{Value: value, RetType: x.RetType, DeferredExpr: x}, true
+		}
+		return &Constant{Value: value, RetType: x.RetType}, false
+	case *Constant:
+		if x.DeferredExpr != nil {
+			value, err := x.DeferredExpr.Eval(chunk.Row{})
+			if err != nil {
+				log.Warnf("fold constant %s: %s", x.ExplainInfo(), err.Error())
+				return expr, true
+			}
+			return &Constant{Value: value, RetType: x.RetType, DeferredExpr: x.DeferredExpr}, true
+		}
 	}
-	value, err := scalarFunc.Function(datums, ctx)
-	if err != nil {
-		log.Warnf("There may exist an error during constant folding. The function name is %s, args are %s", scalarFunc.FuncName, args)
-		return expr
-	}
-	return &Constant{
-		Value:   value,
-		RetType: scalarFunc.RetType,
-	}
+	return expr, false
 }

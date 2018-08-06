@@ -20,6 +20,7 @@ import (
 	"github.com/pingcap/tidb/model"
 	"github.com/pingcap/tidb/util/mock"
 	"github.com/pingcap/tidb/util/testleak"
+	"golang.org/x/net/context"
 )
 
 var _ = Suite(&testStatSuite{})
@@ -27,29 +28,37 @@ var _ = Suite(&testStatSuite{})
 type testStatSuite struct {
 }
 
+func (s *testStatSuite) SetUpSuite(c *C) {
+	testleak.BeforeTest()
+}
+
+func (s *testStatSuite) TearDownSuite(c *C) {
+	testleak.AfterTest(c)()
+}
+
 func (s *testStatSuite) getDDLSchemaVer(c *C, d *ddl) int64 {
-	m, err := d.Stats()
+	m, err := d.Stats(nil)
 	c.Assert(err, IsNil)
 	v := m[ddlSchemaVersion]
 	return v.(int64)
 }
 
 func (s *testStatSuite) TestStat(c *C) {
-	defer testleak.AfterTest(c)()
 	store := testCreateStore(c, "test_stat")
 	defer store.Close()
 
-	d := newDDL(store, nil, nil, testLease)
-	defer d.close()
+	d := testNewDDL(context.Background(), nil, store, nil, nil, testLease)
+	defer d.Stop()
 
 	time.Sleep(testLease)
 
 	dbInfo := testSchemaInfo(c, d, "test")
 	testCreateSchema(c, testNewContext(d), d, dbInfo)
 
-	m, err := d.Stats()
-	c.Assert(err, IsNil)
-	c.Assert(m[ddlOwnerID], Equals, d.uuid)
+	// TODO: Get this information from etcd.
+	//	m, err := d.Stats(nil)
+	//	c.Assert(err, IsNil)
+	//	c.Assert(m[ddlOwnerID], Equals, d.uuid)
 
 	job := &model.Job{
 		SchemaID:   dbInfo.ID,
@@ -75,12 +84,13 @@ LOOP:
 		case <-ticker.C:
 			d.close()
 			c.Assert(s.getDDLSchemaVer(c, d), GreaterEqual, ver)
-			d.start()
+			d.start(context.Background(), nil)
+			time.Sleep(time.Millisecond * 20)
 		case err := <-done:
 			c.Assert(err, IsNil)
-			m, err := d.Stats()
-			c.Assert(err, IsNil)
-			c.Assert(m[bgOwnerID], Equals, d.uuid)
+			// TODO: Get this information from etcd.
+			// m, err := d.Stats(nil)
+			// c.Assert(err, IsNil)
 			break LOOP
 		}
 	}

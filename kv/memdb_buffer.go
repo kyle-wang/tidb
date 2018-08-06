@@ -16,6 +16,8 @@
 package kv
 
 import (
+	"sync/atomic"
+
 	"github.com/juju/errors"
 	"github.com/pingcap/goleveldb/leveldb"
 	"github.com/pingcap/goleveldb/leveldb/comparer"
@@ -25,20 +27,11 @@ import (
 	"github.com/pingcap/tidb/terror"
 )
 
-// Those limits is enforced to make sure the transaction can be well handled by TiKV.
-const (
-	// The limit of single entry size (len(key) + len(value)).
-	EntrySizeLimit = 6 * 1024 * 1024
-	// The limit of number of entries in the MemBuffer.
-	BufferLenLimit = 100 * 1000
-	// The limit of the sum of all entry size.
-	BufferSizeLimit = 100 * 1024 * 1024
-)
-
+// memDbBuffer implements the MemBuffer interface.
 type memDbBuffer struct {
 	db              *memdb.DB
 	entrySizeLimit  int
-	bufferLenLimit  int
+	bufferLenLimit  uint64
 	bufferSizeLimit int
 }
 
@@ -48,12 +41,12 @@ type memDbIter struct {
 }
 
 // NewMemDbBuffer creates a new memDbBuffer.
-func NewMemDbBuffer() MemBuffer {
+func NewMemDbBuffer(cap int) MemBuffer {
 	return &memDbBuffer{
-		db:              memdb.New(comparer.DefaultComparer, 4*1024),
-		entrySizeLimit:  EntrySizeLimit,
-		bufferLenLimit:  BufferLenLimit,
-		bufferSizeLimit: BufferSizeLimit,
+		db:              memdb.New(comparer.DefaultComparer, cap),
+		entrySizeLimit:  TxnEntrySizeLimit,
+		bufferLenLimit:  atomic.LoadUint64(&TxnEntryCountLimit),
+		bufferSizeLimit: TxnTotalSizeLimit,
 	}
 }
 
@@ -65,8 +58,15 @@ func (m *memDbBuffer) Seek(k Key) (Iterator, error) {
 	} else {
 		i = &memDbIter{iter: m.db.NewIterator(&util.Range{Start: []byte(k)}), reverse: false}
 	}
-	i.Next()
+	err := i.Next()
+	if err != nil {
+		return nil, errors.Trace(err)
+	}
 	return i, nil
+}
+
+func (m *memDbBuffer) SetCap(cap int) {
+
 }
 
 func (m *memDbBuffer) SeekReverse(k Key) (Iterator, error) {
@@ -102,7 +102,7 @@ func (m *memDbBuffer) Set(k Key, v []byte) error {
 	if m.Size() > m.bufferSizeLimit {
 		return ErrTxnTooLarge.Gen("transaction too large, size:%d", m.Size())
 	}
-	if m.Len() > m.bufferLenLimit {
+	if m.Len() > int(m.bufferLenLimit) {
 		return ErrTxnTooLarge.Gen("transaction too large, len:%d", m.Len())
 	}
 	return errors.Trace(err)
@@ -122,6 +122,11 @@ func (m *memDbBuffer) Size() int {
 // Len returns the number of entries in the DB.
 func (m *memDbBuffer) Len() int {
 	return m.db.Len()
+}
+
+// Reset cleanup the MemBuffer.
+func (m *memDbBuffer) Reset() {
+	m.db.Reset()
 }
 
 // Next implements the Iterator Next.
@@ -152,4 +157,25 @@ func (i *memDbIter) Value() []byte {
 // Close Implements the Iterator Close.
 func (i *memDbIter) Close() {
 	i.iter.Release()
+}
+
+// WalkMemBuffer iterates all buffered kv pairs in memBuf
+func WalkMemBuffer(memBuf MemBuffer, f func(k Key, v []byte) error) error {
+	iter, err := memBuf.Seek(nil)
+	if err != nil {
+		return errors.Trace(err)
+	}
+
+	defer iter.Close()
+	for iter.Valid() {
+		if err = f(iter.Key(), iter.Value()); err != nil {
+			return errors.Trace(err)
+		}
+		err = iter.Next()
+		if err != nil {
+			return errors.Trace(err)
+		}
+	}
+
+	return nil
 }

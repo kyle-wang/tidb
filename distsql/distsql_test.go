@@ -1,4 +1,4 @@
-// Copyright 2016 PingCAP, Inc.
+// Copyright 2018 PingCAP, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,101 +14,274 @@
 package distsql
 
 import (
-	"bytes"
-	"errors"
-	"io"
-	"io/ioutil"
-	"runtime"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/juju/errors"
 	. "github.com/pingcap/check"
-	"github.com/pingcap/tidb/model"
+	"github.com/pingcap/tidb/kv"
 	"github.com/pingcap/tidb/mysql"
-	"github.com/pingcap/tidb/util/testleak"
-	"github.com/pingcap/tidb/util/types"
+	"github.com/pingcap/tidb/sessionctx/stmtctx"
+	"github.com/pingcap/tidb/sessionctx/variable"
+	"github.com/pingcap/tidb/statistics"
+	"github.com/pingcap/tidb/types"
+	"github.com/pingcap/tidb/util/charset"
+	"github.com/pingcap/tidb/util/chunk"
+	"github.com/pingcap/tidb/util/codec"
 	"github.com/pingcap/tipb/go-tipb"
+	"golang.org/x/net/context"
 )
 
-func TestT(t *testing.T) {
-	CustomVerboseFlag = true
-	TestingT(t)
-}
+func (s *testSuite) TestSelectNormal(c *C) {
+	request, err := (&RequestBuilder{}).SetKeyRanges(nil).
+		SetDAGRequest(&tipb.DAGRequest{}).
+		SetDesc(false).
+		SetKeepOrder(false).
+		SetFromSessionVars(variable.NewSessionVars()).
+		Build()
+	c.Assert(err, IsNil)
 
-var _ = Suite(&testTableCodecSuite{})
-
-type testTableCodecSuite struct{}
-
-// TODO: add more tests.
-func (s *testTableCodecSuite) TestColumnToProto(c *C) {
-	defer testleak.AfterTest(c)()
-	// Make sure the Flag is set in tipb.ColumnInfo
-	tp := types.NewFieldType(mysql.TypeLong)
-	tp.Flag = 10
-	col := &model.ColumnInfo{
-		FieldType: *tp,
+	/// 4 int64 types.
+	colTypes := []*types.FieldType{
+		{
+			Tp:      mysql.TypeLonglong,
+			Flen:    mysql.MaxIntWidth,
+			Decimal: 0,
+			Flag:    mysql.BinaryFlag,
+			Charset: charset.CharsetBin,
+			Collate: charset.CollationBin,
+		},
 	}
-	pc := columnToProto(col)
-	c.Assert(pc.GetFlag(), Equals, int32(10))
-}
+	colTypes = append(colTypes, colTypes[0])
+	colTypes = append(colTypes, colTypes[0])
+	colTypes = append(colTypes, colTypes[0])
 
-// For issue 1791
-func (s *testTableCodecSuite) TestGoroutineLeak(c *C) {
-	var sr SelectResult
-	countBefore := runtime.NumGoroutine()
+	// Test Next.
+	response, err := Select(context.TODO(), s.sctx, request, colTypes, statistics.NewQueryFeedback(0, nil, 0, false))
+	c.Assert(err, IsNil)
+	result, ok := response.(*selectResult)
+	c.Assert(ok, IsTrue)
+	c.Assert(result.label, Equals, "dag")
+	c.Assert(result.rowLen, Equals, len(colTypes))
 
-	sr = &selectResult{
-		resp:    &mockResponse{},
-		results: make(chan resultWithErr, 5),
-		closed:  make(chan struct{}),
-	}
-	go sr.Fetch()
+	response.Fetch(context.TODO())
+
+	// Test Next.
+	chk := chunk.NewChunkWithCapacity(colTypes, 32)
+	numAllRows := 0
 	for {
-		// mock test will generate some partial result then return error
-		_, err := sr.Next()
-		if err != nil {
-			// close selectResult on error, partialResult's fetch goroutine may leak
-			sr.Close()
+		err = response.Next(context.TODO(), chk)
+		c.Assert(err, IsNil)
+		numAllRows += chk.NumRows()
+		if chk.NumRows() == 0 {
 			break
 		}
 	}
+	c.Assert(numAllRows, Equals, 2)
+	err = response.Close()
+	c.Assert(err, IsNil)
+}
 
-	tick := 10 * time.Millisecond
-	totalSleep := time.Duration(0)
-	for totalSleep < 3*time.Second {
-		time.Sleep(tick)
-		totalSleep += tick
-		countAfter := runtime.NumGoroutine()
+func (s *testSuite) TestSelectStreaming(c *C) {
+	request, err := (&RequestBuilder{}).SetKeyRanges(nil).
+		SetDAGRequest(&tipb.DAGRequest{}).
+		SetDesc(false).
+		SetKeepOrder(false).
+		SetFromSessionVars(variable.NewSessionVars()).
+		SetStreaming(true).
+		Build()
+	c.Assert(err, IsNil)
 
-		if countAfter-countBefore < 5 {
-			return
+	/// 4 int64 types.
+	colTypes := []*types.FieldType{
+		{
+			Tp:      mysql.TypeLonglong,
+			Flen:    mysql.MaxIntWidth,
+			Decimal: 0,
+			Flag:    mysql.BinaryFlag,
+			Charset: charset.CharsetBin,
+			Collate: charset.CollationBin,
+		},
+	}
+	colTypes = append(colTypes, colTypes[0])
+	colTypes = append(colTypes, colTypes[0])
+	colTypes = append(colTypes, colTypes[0])
+
+	s.sctx.GetSessionVars().EnableStreaming = true
+
+	// Test Next.
+	response, err := Select(context.TODO(), s.sctx, request, colTypes, statistics.NewQueryFeedback(0, nil, 0, false))
+	c.Assert(err, IsNil)
+	result, ok := response.(*streamResult)
+	c.Assert(ok, IsTrue)
+	c.Assert(result.rowLen, Equals, len(colTypes))
+
+	response.Fetch(context.TODO())
+
+	// Test Next.
+	chk := chunk.NewChunkWithCapacity(colTypes, 32)
+	numAllRows := 0
+	for {
+		err = response.Next(context.TODO(), chk)
+		c.Assert(err, IsNil)
+		numAllRows += chk.NumRows()
+		if chk.NumRows() == 0 {
+			break
 		}
 	}
-
-	c.Error("distsql goroutine leak!")
+	c.Assert(numAllRows, Equals, 2)
+	err = response.Close()
+	c.Assert(err, IsNil)
 }
 
+func (s *testSuite) TestAnalyze(c *C) {
+	request, err := (&RequestBuilder{}).SetKeyRanges(nil).
+		SetAnalyzeRequest(&tipb.AnalyzeReq{}).
+		SetKeepOrder(true).
+		Build()
+	c.Assert(err, IsNil)
+
+	response, err := Analyze(context.TODO(), s.sctx.GetClient(), request, kv.DefaultVars)
+	c.Assert(err, IsNil)
+
+	result, ok := response.(*selectResult)
+	c.Assert(ok, IsTrue)
+	c.Assert(result.label, Equals, "analyze")
+
+	response.Fetch(context.TODO())
+
+	bytes, err := response.NextRaw(context.TODO())
+	c.Assert(err, IsNil)
+	c.Assert(len(bytes), Equals, 16)
+
+	err = response.Close()
+	c.Assert(err, IsNil)
+}
+
+// mockResponse implements kv.Response interface.
+// Used only for test.
 type mockResponse struct {
 	count int
+	sync.Mutex
 }
 
-func (resp *mockResponse) Next() (io.ReadCloser, error) {
-	resp.count++
-	if resp.count == 100 {
-		return nil, errors.New("error happend")
-	}
-	return mockReaderCloser(), nil
-}
-
+// Close implements kv.Response interface.
 func (resp *mockResponse) Close() error {
+	resp.Lock()
+	defer resp.Unlock()
+
+	resp.count = 0
 	return nil
 }
 
-func mockReaderCloser() io.ReadCloser {
-	resp := new(tipb.SelectResponse)
-	b, err := resp.Marshal()
+// Next implements kv.Response interface.
+func (resp *mockResponse) Next(ctx context.Context) (kv.ResultSubset, error) {
+	resp.Lock()
+	defer resp.Unlock()
+
+	if resp.count == 2 {
+		return nil, nil
+	}
+	defer func() { resp.count++ }()
+
+	datum := types.NewIntDatum(1)
+	bytes := make([]byte, 0, 100)
+	bytes, _ = codec.EncodeValue(nil, bytes, datum, datum, datum, datum)
+
+	respPB := &tipb.SelectResponse{
+		Chunks:       []tipb.Chunk{{RowsData: bytes}},
+		OutputCounts: []int64{1},
+	}
+	respBytes, err := respPB.Marshal()
 	if err != nil {
 		panic(err)
 	}
-	return ioutil.NopCloser(bytes.NewBuffer(b))
+	return &mockResultSubset{respBytes}, nil
+}
+
+// mockResultSubset implements kv.ResultSubset interface.
+// Used only for test.
+type mockResultSubset struct{ data []byte }
+
+// GetData implements kv.Response interface.
+func (r *mockResultSubset) GetData() []byte { return r.data }
+
+// GetStartKey implements kv.Response interface.
+func (r *mockResultSubset) GetStartKey() kv.Key { return nil }
+
+func populateBuffer() []byte {
+	numCols := 4
+	numRows := 1024
+	buffer := make([]byte, 0, 1024)
+	sc := &stmtctx.StatementContext{TimeZone: time.Local}
+
+	for rowOrdinal := 0; rowOrdinal < numRows; rowOrdinal++ {
+		for colOrdinal := 0; colOrdinal < numCols; colOrdinal++ {
+			buffer, _ = codec.EncodeValue(sc, buffer, types.NewIntDatum(123))
+		}
+	}
+
+	return buffer
+}
+
+func mockReadRowsData(buffer []byte, colTypes []*types.FieldType, chk *chunk.Chunk) (err error) {
+	chk.Reset()
+	numCols := 4
+	numRows := 1024
+
+	decoder := codec.NewDecoder(chk, time.Local)
+	for rowOrdinal := 0; rowOrdinal < numRows; rowOrdinal++ {
+		for colOrdinal := 0; colOrdinal < numCols; colOrdinal++ {
+			buffer, err = decoder.DecodeOne(buffer, colOrdinal, colTypes[colOrdinal])
+			if err != nil {
+				return errors.Trace(err)
+			}
+		}
+	}
+
+	return nil
+}
+
+func BenchmarkReadRowsData(b *testing.B) {
+	numCols := 4
+	numRows := 1024
+
+	colTypes := make([]*types.FieldType, numCols)
+	for i := 0; i < numCols; i++ {
+		colTypes[i] = &types.FieldType{Tp: mysql.TypeLonglong}
+	}
+	chk := chunk.NewChunkWithCapacity(colTypes, numRows)
+
+	buffer := populateBuffer()
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		mockReadRowsData(buffer, colTypes, chk)
+	}
+}
+
+func BenchmarkDecodeToChunk(b *testing.B) {
+	numCols := 4
+	numRows := 1024
+
+	colTypes := make([]*types.FieldType, numCols)
+	for i := 0; i < numCols; i++ {
+		colTypes[i] = &types.FieldType{Tp: mysql.TypeLonglong}
+	}
+	chk := chunk.NewChunkWithCapacity(colTypes, numRows)
+
+	for rowOrdinal := 0; rowOrdinal < numRows; rowOrdinal++ {
+		for colOrdinal := 0; colOrdinal < numCols; colOrdinal++ {
+			chk.AppendInt64(colOrdinal, 123)
+		}
+	}
+
+	codec := chunk.NewCodec(colTypes)
+	buffer := codec.Encode(chk)
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		codec.DecodeToChunk(buffer, chk)
+	}
 }

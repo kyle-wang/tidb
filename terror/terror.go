@@ -20,34 +20,37 @@ import (
 	"strconv"
 
 	"github.com/juju/errors"
-	"github.com/ngaut/log"
 	"github.com/pingcap/tidb/mysql"
+	log "github.com/sirupsen/logrus"
 )
 
-// Common base error instances.
+// Global error instances.
 var (
-	CommitNotInTransaction   = ClassExecutor.New(CodeCommitNotInTransaction, "commit not in transaction")
-	RollbackNotInTransaction = ClassExecutor.New(CodeRollbackNotInTransaction, "rollback not in transaction")
-	ExecResultIsEmpty        = ClassExecutor.New(CodeExecResultIsEmpty, "exec result is empty")
-
-	MissConnectionID = ClassExpression.New(CodeMissConnectionID, "miss connection id information")
+	ErrCritical           = ClassGlobal.New(CodeExecResultIsEmpty, "critical error %v")
+	ErrResultUndetermined = ClassGlobal.New(CodeResultUndetermined, "execution result undetermined")
 )
 
 // ErrCode represents a specific error type in a error class.
 // Same error code can be used in different error classes.
 type ErrCode int
 
-// Executor error codes.
 const (
-	CodeUnknown                  ErrCode = -1
-	CodeCommitNotInTransaction           = 1
-	CodeRollbackNotInTransaction         = 2
-	CodeExecResultIsEmpty                = 3
-)
+	// Executor error codes.
 
-// Expression error codes.
-const (
-	CodeMissConnectionID ErrCode = iota + 1
+	// CodeUnknown is for errors of unknown reason.
+	CodeUnknown ErrCode = -1
+	// CodeExecResultIsEmpty indicates execution result is empty.
+	CodeExecResultIsEmpty ErrCode = 3
+
+	// Expression error codes.
+
+	// CodeMissConnectionID indicates connection id is missing.
+	CodeMissConnectionID ErrCode = 1
+
+	// Special error codes.
+
+	// CodeResultUndetermined indicates the sql execution result is undetermined.
+	CodeResultUndetermined ErrCode = 2
 )
 
 // ErrClass represents a class of errors.
@@ -61,11 +64,10 @@ const (
 	ClassEvaluator
 	ClassExecutor
 	ClassExpression
-	ClassInspectkv
+	ClassAdmin
 	ClassKV
 	ClassMeta
 	ClassOptimizer
-	ClassOptimizerPlan
 	ClassParser
 	ClassPerfSchema
 	ClassPrivilege
@@ -76,48 +78,44 @@ const (
 	ClassXEval
 	ClassTable
 	ClassTypes
+	ClassGlobal
+	ClassMockTikv
+	ClassJSON
+	ClassTiKV
+	ClassSession
 	// Add more as needed.
 )
 
+var errClz2Str = map[ErrClass]string{
+	ClassAutoid:     "autoid",
+	ClassDDL:        "ddl",
+	ClassDomain:     "domain",
+	ClassExecutor:   "executor",
+	ClassExpression: "expression",
+	ClassAdmin:      "admin",
+	ClassMeta:       "meta",
+	ClassKV:         "kv",
+	ClassOptimizer:  "planner",
+	ClassParser:     "parser",
+	ClassPerfSchema: "perfschema",
+	ClassPrivilege:  "privilege",
+	ClassSchema:     "schema",
+	ClassServer:     "server",
+	ClassStructure:  "structure",
+	ClassVariable:   "variable",
+	ClassTable:      "table",
+	ClassTypes:      "types",
+	ClassGlobal:     "global",
+	ClassMockTikv:   "mocktikv",
+	ClassJSON:       "json",
+	ClassTiKV:       "tikv",
+	ClassSession:    "session",
+}
+
 // String implements fmt.Stringer interface.
 func (ec ErrClass) String() string {
-	switch ec {
-	case ClassAutoid:
-		return "autoid"
-	case ClassDDL:
-		return "ddl"
-	case ClassDomain:
-		return "domain"
-	case ClassExecutor:
-		return "executor"
-	case ClassExpression:
-		return "expression"
-	case ClassInspectkv:
-		return "inspectkv"
-	case ClassMeta:
-		return "meta"
-	case ClassKV:
-		return "kv"
-	case ClassOptimizer:
-		return "optimizer"
-	case ClassParser:
-		return "parser"
-	case ClassPerfSchema:
-		return "perfschema"
-	case ClassPrivilege:
-		return "privilege"
-	case ClassSchema:
-		return "schema"
-	case ClassServer:
-		return "server"
-	case ClassStructure:
-		return "structure"
-	case ClassVariable:
-		return "variable"
-	case ClassTable:
-		return "table"
-	case ClassTypes:
-		return "types"
+	if s, exists := errClz2Str[ec]; exists {
+		return s
 	}
 	return strconv.Itoa(int(ec))
 }
@@ -251,6 +249,10 @@ func (e *Error) Equal(err error) bool {
 	if originErr == nil {
 		return false
 	}
+
+	if error(e) == originErr {
+		return true
+	}
 	inErr, ok := originErr.(*Error)
 	return ok && e.class == inErr.class && e.code == inErr.code
 }
@@ -263,7 +265,7 @@ func (e *Error) NotEqual(err error) bool {
 // ToSQLError convert Error to mysql.SQLError.
 func (e *Error) ToSQLError() *mysql.SQLError {
 	code := e.getMySQLErrorCode()
-	return mysql.NewErrf(code, e.getMsg())
+	return mysql.NewErrf(code, "%s", e.getMsg())
 }
 
 var defaultMySQLErrorCode uint16
@@ -276,7 +278,7 @@ func (e *Error) getMySQLErrorCode() uint16 {
 	}
 	code, ok := codeMap[e.code]
 	if !ok {
-		log.Warnf("Unknown error class: %v code: %v", e.class, e.code)
+		log.Debugf("Unknown error class: %v code: %v", e.class, e.code)
 		return defaultMySQLErrorCode
 	}
 	return code
@@ -284,11 +286,11 @@ func (e *Error) getMySQLErrorCode() uint16 {
 
 var (
 	// ErrClassToMySQLCodes is the map of ErrClass to code-map.
-	ErrClassToMySQLCodes map[ErrClass](map[ErrCode]uint16)
+	ErrClassToMySQLCodes map[ErrClass]map[ErrCode]uint16
 )
 
 func init() {
-	ErrClassToMySQLCodes = make(map[ErrClass](map[ErrCode]uint16))
+	ErrClassToMySQLCodes = make(map[ErrClass]map[ErrCode]uint16)
 	defaultMySQLErrorCode = mysql.ErrUnknown
 }
 
@@ -317,4 +319,29 @@ func ErrorEqual(err1, err2 error) bool {
 // ErrorNotEqual returns a boolean indicating whether err1 isn't equal to err2.
 func ErrorNotEqual(err1, err2 error) bool {
 	return !ErrorEqual(err1, err2)
+}
+
+// MustNil cleans up and fatals if err is not nil.
+func MustNil(err error, closeFuns ...func()) {
+	if err != nil {
+		for _, f := range closeFuns {
+			f()
+		}
+		log.Fatalf(errors.ErrorStack(err))
+	}
+}
+
+// Call executes a function and checks the returned err.
+func Call(fn func() error) {
+	err := fn()
+	if err != nil {
+		log.Error(errors.ErrorStack(err))
+	}
+}
+
+// Log logs the error if it is not nil.
+func Log(err error) {
+	if err != nil {
+		log.Error(errors.ErrorStack(err))
+	}
 }
